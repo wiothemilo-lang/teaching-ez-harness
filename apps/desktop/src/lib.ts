@@ -1,9 +1,30 @@
+import type { AppMode } from "./types";
+
 export const STRATEGY_LABELS: Record<string, string> = {
   socratic: "Gợi mở từng bước",
   coach: "Luyện và sửa trực tiếp",
+  assistant: "Trợ lý tổng quát",
 };
 
+export const MODE_LABELS: Record<AppMode, string> = {
+  chat: "Chat",
+  code: "Code",
+};
+
+export const CHAT_SUGGESTIONS = [
+  "Tóm tắt giúp mình một chủ đề bất kỳ",
+  "Lên kế hoạch học tập cho tuần này",
+  "Giải thích một khái niệm khó bằng ví dụ đời thường",
+];
+
+export const CODE_SUGGESTIONS = [
+  "Đọc cấu trúc dự án và tóm tắt kiến trúc",
+  "Tìm nguyên nhân lỗi build gần nhất",
+  "Thêm test cho hàm quan trọng nhất",
+];
+
 export const SUBJECT_HINTS: Record<string, string> = {
+  general: "Hỏi bất cứ điều gì — không giới hạn môn học…",
   math: "Hỏi về một bài Toán, dán đề hoặc lời giải…",
   physics: "Hỏi về một bài Vật lý, dán đề hoặc công thức…",
   chemistry: "Hỏi về một bài Hóa học, dán phương trình…",
@@ -11,6 +32,7 @@ export const SUBJECT_HINTS: Record<string, string> = {
 };
 
 export const SUBJECT_SUGGESTIONS: Record<string, string[]> = {
+  general: CHAT_SUGGESTIONS,
   math: [
     "Giải thích đạo hàm bằng một ví dụ thực tế",
     "Kiểm tra lời giải phương trình này từng bước",
@@ -43,6 +65,7 @@ export const PROVIDER_LABELS: Record<string, string> = {
 };
 
 export const SUBJECT_LABELS: Record<string, string> = {
+  general: "Tổng quát",
   math: "Toán",
   physics: "Vật lý",
   chemistry: "Hóa học",
@@ -54,8 +77,18 @@ export function subjectLabel(id: string): string {
 }
 
 export function subjectName(subjects: { id: string; name: string }[], id: string | null): string {
-  if (!id) return "Buổi học";
+  if (!id) return "Hội thoại";
   return subjects.find((subject) => subject.id === id)?.name ?? id;
+}
+
+export function suggestionsFor(subjectId: string, mode: AppMode): string[] {
+  if (mode === "code") return CODE_SUGGESTIONS;
+  return SUBJECT_SUGGESTIONS[subjectId] ?? CHAT_SUGGESTIONS;
+}
+
+export function placeholderFor(subjectId: string, mode: AppMode): string {
+  if (mode === "code") return "Mô tả thay đổi, lỗi cần sửa hoặc câu hỏi về code…";
+  return SUBJECT_HINTS[subjectId] ?? "Hỏi bất cứ điều gì…";
 }
 
 export function subjectTone(id: string): string {

@@ -14,6 +14,7 @@ use tez_auth::Vault;
 use tez_core::agent::Agent;
 use tez_core::context::{ContextBuilder, ContextInput};
 use tez_core::mcp;
+use tez_core::modes::{self, Mode};
 use tez_core::plugins;
 use tez_core::skills::{self, SkillRegistry};
 use tez_core::subjects::{self, SubjectPack};
@@ -26,7 +27,7 @@ use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::ToolRegistry;
+use tez_core::tools::{code_registry, ToolRegistry};
 use tez_llm::{LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
@@ -49,8 +50,10 @@ enum Commands {
     Connect(ConnectArgs),
     /// Kiểm tra provider/model/key đã lưu bằng một prompt ngắn.
     Test,
-    /// Chat với tutor agent.
+    /// Chat hoặc làm việc với code agent.
     Chat(ChatArgs),
+    /// Kiểm tra bản cập nhật mới trên GitHub Releases.
+    Update(UpdateArgs),
     /// Xem các môn học và tool được phép.
     Subject {
         #[command(subcommand)]
@@ -129,9 +132,15 @@ struct ConnectArgs {
 
 #[derive(Args)]
 struct ChatArgs {
-    /// Môn học: math, physics, chemistry, english (hoặc Toán, Lý, Hóa, Anh).
-    #[arg(long, default_value = "math")]
+    /// Môn học tùy chọn: math, physics, chemistry, english. Bỏ trống = tổng quát.
+    #[arg(long, default_value = "general")]
     subject: String,
+    /// Chế độ: chat (mặc định) hoặc code.
+    #[arg(long, default_value = "chat")]
+    mode: String,
+    /// Thư mục làm việc cho chế độ code (mặc định: thư mục hiện tại).
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     #[arg(long, default_value = "10")]
     grade: String,
     /// Ghi đè provider đã lưu.
@@ -157,6 +166,16 @@ struct ChatArgs {
 struct SessionsArgs {
     #[arg(long, default_value_t = 20)]
     limit: usize,
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    /// Chỉ kiểm tra, không tải.
+    #[arg(long, default_value_t = false)]
+    check_only: bool,
+    /// Tải asset phù hợp vào thư mục dữ liệu.
+    #[arg(long, default_value_t = false)]
+    download: bool,
 }
 
 #[derive(Subcommand)]
@@ -271,6 +290,17 @@ fn full_registry() -> ToolRegistry {
 
 fn registry_for(pack: &SubjectPack) -> ToolRegistry {
     full_registry().filtered(pack.tools)
+}
+
+fn registry_for_mode(
+    pack: &SubjectPack,
+    mode: Mode,
+    workspace: &Path,
+) -> anyhow::Result<ToolRegistry> {
+    match mode {
+        Mode::Chat => Ok(registry_for(pack)),
+        Mode::Code => Ok(code_registry(workspace)?),
+    }
 }
 
 fn resolve_subject(input: &str) -> anyhow::Result<&'static SubjectPack> {
@@ -577,6 +607,8 @@ struct TurnContext<'a> {
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
     skills: SkillRegistry,
+    mode: Mode,
+    workspace: &'a Path,
 }
 
 impl TurnContext<'_> {
@@ -587,7 +619,12 @@ impl TurnContext<'_> {
         prompt: &str,
     ) -> anyhow::Result<String> {
         let store = Store::open(self.dir.join("tez.db"))?;
-        let hits = store.search_chunks(prompt, Some(self.pack.id), 4)?;
+        let subject_filter = if self.pack.is_general() {
+            None
+        } else {
+            Some(self.pack.id)
+        };
+        let hits = store.search_chunks(prompt, subject_filter, 4)?;
         let excerpts: Vec<String> = hits
             .iter()
             .map(|hit| format!("[{}] {}", hit.title, hit.snippet))
@@ -616,6 +653,7 @@ impl TurnContext<'_> {
             matched.iter().map(|skill| skills::render(skill)).collect();
 
         let objectives: Vec<String> = Vec::new();
+        let workspace_label = self.workspace.display().to_string();
         let messages = ContextBuilder.build(ContextInput {
             subject: self.pack,
             grade: self.grade,
@@ -625,6 +663,8 @@ impl TurnContext<'_> {
             state: "practice",
             recent: &recent,
             skills: &skill_snippets,
+            mode: self.mode,
+            workspace: Some(&workspace_label),
         });
 
         let agent = Agent::new(Arc::clone(&self.provider), self.tools.clone());
@@ -682,7 +722,13 @@ impl TurnContext<'_> {
 async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
     let book = providers::load(&dir)?;
-    let pack = resolve_subject(&args.subject)?;
+    let mode = Mode::parse(&args.mode);
+    let pack = subjects::resolve_or_general(&args.subject);
+    let workspace = match args.workspace.clone() {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+    let workspace = workspace.canonicalize().unwrap_or(workspace);
     let connection = resolve_chat_connection(&args, &book, &dir)?;
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -705,7 +751,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             (id.to_string(), conversation)
         }
         None => (
-            store.create_session("default", None, Some(pack.id))?,
+            store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
             Vec::new(),
         ),
     };
@@ -717,7 +763,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         &connection.api_key,
     ));
 
-    let mut tools = registry_for(pack);
+    let mut tools = registry_for_mode(pack, mode, &workspace)?;
     let discovery = mcp::discover(&dir).await?;
     let mcp_count = discovery.tools.len();
     for server in &discovery.servers {
@@ -750,6 +796,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         provider,
         tools,
         skills,
+        mode,
+        workspace: &workspace,
     };
 
     let interactive = args.prompt.is_none() && std::io::stdin().is_terminal();
@@ -761,10 +809,24 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         }
         last_summary = turn.run_turn(&mut conversation, prompt).await?;
     } else if interactive {
-        println!(
-            "Gia sư {} (lớp {}) — session {}",
-            pack.name, args.grade, session_id
-        );
+        match mode {
+            Mode::Code => {
+                println!("tez code — workspace {}", workspace.display());
+                println!("session {session_id}");
+            }
+            Mode::Chat => {
+                println!(
+                    "{} (lớp {}) — session {}",
+                    if pack.is_general() {
+                        "Trợ lý tổng quát".to_string()
+                    } else {
+                        format!("Gia sư {}", pack.name)
+                    },
+                    args.grade,
+                    session_id
+                );
+            }
+        }
         println!("Gõ câu hỏi, :help để xem lệnh, :q để thoát.\n");
         loop {
             print!("tez> ");
@@ -821,9 +883,56 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     )?;
 
     eprintln!(
-        "[session] {session_id} | {} | {} | chat tiếp: tez chat --session {session_id}",
-        pack.id, connection.model
+        "[session] {session_id} | {} | {} | {} | tiếp tục: tez chat --session {session_id}",
+        mode.as_str(),
+        pack.id,
+        connection.model
     );
+    Ok(())
+}
+
+async fn update(args: UpdateArgs) -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("tez {current} · đang kiểm tra GitHub Releases…");
+    let info = match tez_update::check(current).await {
+        Ok(info) => info,
+        Err(tez_update::UpdateError::NotFound(repo)) => {
+            println!("Repo '{repo}' chưa có bản phát hành nào.");
+            println!("Nếu bạn dùng bản fork, đặt biến môi trường TEZ_GITHUB_REPO=owner/name.");
+            println!("Hoặc tải thủ công tại https://github.com/{repo}/releases");
+            return Ok(());
+        }
+        Err(error) => {
+            println!("Không kiểm tra được cập nhật: {error}");
+            println!("Bạn vẫn có thể tải bản mới nhất thủ công từ trang Releases của repo.");
+            return Ok(());
+        }
+    };
+
+    if info.available {
+        println!("Có bản mới: {} (hiện tại {})", info.latest, info.current);
+        println!("Trang tải: {}", info.url);
+        if !info.notes.trim().is_empty() {
+            println!("\nGhi chú phát hành:\n{}", info.notes.trim());
+        }
+    } else {
+        println!("Bạn đang dùng bản mới nhất ({}).", info.current);
+    }
+
+    if args.download && !args.check_only {
+        if let Some(asset) = tez_update::pick_asset(&info, std::env::consts::OS) {
+            let dir = data_dir()?.join("updates");
+            println!("\nĐang tải {}…", asset.name);
+            let path = tez_update::download(asset, &dir).await?;
+            println!("Đã tải: {}", path.display());
+            println!(
+                "Mở file trên để cài đặt (Windows: chạy installer; Linux: cài gói tương ứng)."
+            );
+        } else {
+            println!("Bản phát hành không có asset phù hợp; mở trang tải ở trên.");
+        }
+    }
+
     Ok(())
 }
 
@@ -881,6 +990,7 @@ fn doctor() -> anyhow::Result<()> {
         );
     }
 
+    println!("modes: chat (tổng quát) · code (workspace tools)");
     println!(
         "subjects: {}",
         subjects::ALL
@@ -889,6 +999,7 @@ fn doctor() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    println!("code tools: {}", modes::CODE_TOOLS.join(", "));
     println!("tools: {}", full_registry().names().join(", "));
     let skills = SkillRegistry::load_with_plugins(&dir)?;
     println!(
@@ -936,15 +1047,16 @@ fn sessions(args: SessionsArgs) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<38} {:<10} {:<8} {:<6} BẮT ĐẦU / TÓM TẮT",
-        "ID", "MÔN", "TRẠNG THÁI", "TIN"
+        "{:<38} {:<8} {:<10} {:<8} {:<6} BẮT ĐẦU / TÓM TẮT",
+        "ID", "CHẾ ĐỘ", "MÔN", "TRẠNG THÁI", "TIN"
     );
     for row in rows {
         let summary = row.summary.unwrap_or_default();
         let summary: String = summary.chars().take(60).collect();
         println!(
-            "{:<38} {:<10} {:<8} {:<6} {}  {}",
+            "{:<38} {:<8} {:<10} {:<8} {:<6} {}  {}",
             row.id,
+            row.mode,
             row.subject.unwrap_or_else(|| "-".to_string()),
             row.state,
             row.messages,
@@ -1120,6 +1232,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Connect(args) => connect(args).await,
         Commands::Test => test_connection().await,
         Commands::Chat(args) => chat(args).await,
+        Commands::Update(args) => update(args).await,
         Commands::Subject { command } => match command {
             SubjectCommand::List => {
                 subject_list();

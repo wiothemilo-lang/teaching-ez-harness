@@ -154,6 +154,9 @@ tez auth logout groq work
 tez models
 tez chat --subject math --lesson <id>
 tez chat --no-tools
+tez chat --mode code --workspace ~/du-an
+tez update
+tez update --download
 tez tools list
 tez tools test calculate --args '{"expression":"2+2"}'
 tez provider list
@@ -186,7 +189,8 @@ tez serve
 | Màn hình | Chức năng |
 |---|---|
 | Onboarding | Chọn provider, connect, chọn model |
-| Chat / Tutor | Streaming, tool cards, citations, state |
+| **Chat** | Trợ lý tổng quát (không bắt chọn môn), preset môn/lớp tùy chọn, tool trace, token usage |
+| **Code** | Workspace chip, `read_file`/`write_file`/`list_files`/`run_command`, tool trace |
 | Lessons | Tạo/sửa bài, objectives, tài liệu, ingest |
 | Tools | Danh sách tool theo môn, bật/tắt, test |
 | Context | Xem section/token/bị cắt |
@@ -194,6 +198,7 @@ tez serve
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
 | Settings → MCP | Server stdio, env, cwd, test, danh sách tool |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
+| Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
 | Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục |
 | Settings → Models | Model mặc định theo task |
 | Usage | Token/latency/chi phí ước tính |

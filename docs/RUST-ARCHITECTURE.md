@@ -302,6 +302,24 @@ Gateway khai báo capability `tool_calling: native | prompted | none`.
 
 ---
 
+### 5.5 Chế độ Code — workspace tools
+
+`crates/tez-core/src/tools/workspace.rs` cung cấp bốn tool gắn với một `Workspace`
+(root đã canonicalize):
+
+| Tool | Việc |
+|---|---|
+| `read_file` | đọc text ≤ 256 KB |
+| `write_file` | ghi đè toàn bộ nội dung, tạo thư mục cha |
+| `list_files` | liệt kê ≤ 300 entry, 1–4 tầng, bỏ `node_modules`/`target`/`.git` |
+| `run_command` | `sh -c` (`cmd /C` trên Windows), timeout 1–120 s, cwd trong workspace |
+
+`Workspace::resolve` ghép path tương đối với root, chuẩn hóa `.`/`..`, rồi
+canonicalize phần đã tồn tại để chặn symlink trỏ ra ngoài. Đây là giới hạn ở
+tầng ứng dụng, không phải sandbox OS. `tools::code_registry(root)` đăng ký cả
+bốn tool; `Mode::Code` trong `crates/tez-core/src/modes.rs` chọn prompt system
+gắn workspace và registry này.
+
 ## 6. Subject packs
 
 Mỗi môn là một gói cấu hình + code tool, không phải app riêng.
@@ -309,6 +327,11 @@ Mỗi môn là một gói cấu hình + code tool, không phải app riêng.
 > **MVP hiện tại:** pack được compile-time trong `crates/tez-core/src/subjects.rs`
 > (`SubjectPack` gồm id, tên, alias, strategy, prompt, allowlist tool). Bản load
 > `subject.toml` từ thư mục `subjects/` sẽ thêm khi cần giáo viên sửa không build lại.
+
+> **Pack `general` là mặc định.** Nó không gắn với môn nào, chỉ có prompt trợ lý
+> tổng quát + tool `calculate`. `subjects::resolve_or_general` không bao giờ lỗi:
+> chuỗi rỗng hoặc id lạ đều rơi về `general`, nên chat tự do không bị chặn bởi
+> danh sách môn. Bốn pack môn học chỉ còn là preset tùy chọn.
 
 ```
 subjects/math/

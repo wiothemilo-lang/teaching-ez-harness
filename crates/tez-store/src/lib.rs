@@ -47,6 +47,7 @@ pub struct UsageRecord<'a> {
 pub struct SessionRow {
     pub id: String,
     pub subject: Option<String>,
+    pub mode: String,
     pub state: String,
     pub summary: Option<String>,
     pub started_at: String,
@@ -129,6 +130,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     lesson_id TEXT,
     profile_id TEXT NOT NULL,
     subject TEXT,
+    mode TEXT NOT NULL DEFAULT 'chat',
     state TEXT NOT NULL DEFAULT 'intake',
     summary TEXT,
     started_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -215,6 +217,7 @@ CREATE INDEX IF NOT EXISTS idx_document_chunks_doc ON document_chunks(document_i
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
 "#;
 
 impl Store {
@@ -239,6 +242,7 @@ impl Store {
     fn migrate(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(SCHEMA)?;
         self.add_column_if_missing("sessions", "subject", "TEXT")?;
+        self.add_column_if_missing("sessions", "mode", "TEXT NOT NULL DEFAULT 'chat'")?;
         self.ensure_fts_schema()?;
         Ok(())
     }
@@ -345,10 +349,22 @@ impl Store {
         lesson_id: Option<&str>,
         subject: Option<&str>,
     ) -> Result<String, StoreError> {
+        self.create_session_mode(profile_id, lesson_id, subject, "chat")
+    }
+
+    /// Tạo session kèm chế độ (`chat` hoặc `code`).
+    pub fn create_session_mode(
+        &self,
+        profile_id: &str,
+        lesson_id: Option<&str>,
+        subject: Option<&str>,
+        mode: &str,
+    ) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO sessions (id, lesson_id, profile_id, subject) VALUES (?1, ?2, ?3, ?4)",
-            params![id, lesson_id, profile_id, subject],
+            "INSERT INTO sessions (id, lesson_id, profile_id, subject, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, lesson_id, profile_id, subject, mode],
         )?;
         Ok(id)
     }
@@ -626,7 +642,7 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT s.id, s.subject, s.state, s.summary, s.started_at, s.ended_at,
+            "SELECT s.id, s.subject, s.mode, s.state, s.summary, s.started_at, s.ended_at,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
              FROM sessions s
              ORDER BY s.started_at DESC, s.rowid DESC
@@ -636,11 +652,12 @@ impl Store {
             Ok(SessionRow {
                 id: row.get(0)?,
                 subject: row.get(1)?,
-                state: row.get(2)?,
-                summary: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                messages: row.get(6)?,
+                mode: row.get(2)?,
+                state: row.get(3)?,
+                summary: row.get(4)?,
+                started_at: row.get(5)?,
+                ended_at: row.get(6)?,
+                messages: row.get(7)?,
             })
         })?;
 
@@ -771,7 +788,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
 
         store.ensure_profile("p1", "Học sinh").unwrap();
 
@@ -842,11 +859,31 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].messages, 2);
         assert_eq!(sessions[0].state, "ended");
+        assert_eq!(sessions[0].mode, "chat");
 
         let usage = store.usage_summary().unwrap();
         assert_eq!(usage.requests, 1);
         assert_eq!(usage.tokens_in, 12);
         assert_eq!(usage.tokens_out, 4);
+    }
+
+    #[test]
+    fn stores_session_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+
+        let chat = store
+            .create_session("default", None, Some("general"))
+            .unwrap();
+        let code = store
+            .create_session_mode("default", None, Some("general"), "code")
+            .unwrap();
+
+        let sessions = store.list_sessions(10).unwrap();
+        let by_id = |id: &str| sessions.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(by_id(&chat).mode, "chat");
+        assert_eq!(by_id(&code).mode, "code");
     }
 
     #[test]

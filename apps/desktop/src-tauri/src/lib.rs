@@ -8,6 +8,7 @@ use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
 use tez_core::agent::Agent;
 use tez_core::context::{ContextBuilder, ContextInput};
 use tez_core::mcp::{self, McpServerConfig};
+use tez_core::modes::Mode;
 use tez_core::plugins;
 use tez_core::skills::{self, SkillRegistry};
 use tez_core::subjects::{self, SubjectPack};
@@ -20,7 +21,7 @@ use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::ToolRegistry;
+use tez_core::tools::{code_registry, ToolRegistry};
 use tez_llm::{LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
@@ -111,17 +112,24 @@ struct AppStatus {
     subjects: Vec<SubjectInfo>,
     sessions: i64,
     data_dir: String,
+    default_workspace: String,
     version: &'static str,
     extensions: ExtensionSummary,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
+    #[serde(default)]
     subject: String,
+    #[serde(default)]
     grade: String,
     message: String,
     session_id: Option<String>,
     provider_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +180,7 @@ struct ChatReply {
 struct SessionInfo {
     id: String,
     subject: Option<String>,
+    mode: String,
     state: String,
     messages: i64,
     started_at: String,
@@ -234,12 +243,52 @@ struct McpTest {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct DownloadUpdateResult {
+    path: String,
+    version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceInfo {
+    path: String,
+    exists: bool,
+}
+
 fn data_dir() -> anyhow::Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "teaching-ez", "teaching-ez")
         .ok_or_else(|| anyhow::anyhow!("không xác định được thư mục dữ liệu"))?;
     let dir = dirs.data_dir().to_path_buf();
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+fn default_workspace() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("workspaces").join("default"))
+}
+
+/// Chuẩn hóa workspace cho chế độ Code; tạo thư mục nếu chưa có.
+fn resolve_workspace(input: Option<&str>) -> anyhow::Result<PathBuf> {
+    let path = match input.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => PathBuf::from(value),
+        None => default_workspace()?,
+    };
+    std::fs::create_dir_all(&path)?;
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
+fn open_path_in_os(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let opener = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+
+    std::process::Command::new(opener)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 fn resolve_connection(dir: &Path, id: Option<&str>) -> anyhow::Result<ResolvedConnection> {
@@ -348,9 +397,15 @@ fn app_status() -> Result<AppStatus, String> {
     let sessions = Store::open(dir.join("tez.db"))
         .and_then(|store| store.session_count())
         .unwrap_or(0);
-    let skills = SkillRegistry::load_with_plugins(&dir).map(|registry| registry.all().len()).unwrap_or(0);
-    let mcp_servers = mcp::load_servers(&dir).map(|servers| servers.len()).unwrap_or(0);
-    let plugins = plugins::load_all(&dir).map(|items| items.len()).unwrap_or(0);
+    let skills = SkillRegistry::load_with_plugins(&dir)
+        .map(|registry| registry.all().len())
+        .unwrap_or(0);
+    let mcp_servers = mcp::load_servers(&dir)
+        .map(|servers| servers.len())
+        .unwrap_or(0);
+    let plugins = plugins::load_all(&dir)
+        .map(|items| items.len())
+        .unwrap_or(0);
 
     Ok(AppStatus {
         connection,
@@ -358,6 +413,9 @@ fn app_status() -> Result<AppStatus, String> {
         subjects: subject_infos(),
         sessions,
         data_dir: dir.display().to_string(),
+        default_workspace: default_workspace()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
         version: env!("CARGO_PKG_VERSION"),
         extensions: ExtensionSummary {
             skills,
@@ -629,6 +687,7 @@ fn list_sessions(limit: Option<usize>) -> Result<Vec<SessionInfo>, String> {
         .map(|row| SessionInfo {
             id: row.id,
             subject: row.subject,
+            mode: row.mode,
             state: row.state,
             messages: row.messages,
             started_at: row.started_at,
@@ -671,8 +730,12 @@ async fn chat(request: ChatRequest) -> Result<ChatReply, String> {
 
 async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     let dir = data_dir()?;
-    let pack = subjects::resolve(&request.subject)
-        .ok_or_else(|| anyhow::anyhow!("môn không hỗ trợ: {}", request.subject))?;
+    let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
+    let pack = subjects::resolve_or_general(&request.subject);
+    let workspace = match mode {
+        Mode::Code => Some(resolve_workspace(request.workspace.as_deref())?),
+        Mode::Chat => None,
+    };
     let connection = resolve_connection(&dir, request.provider_id.as_deref())?;
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -696,12 +759,17 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
             (id.to_string(), history)
         }
         None => (
-            store.create_session("default", None, Some(pack.id))?,
+            store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
             Vec::new(),
         ),
     };
 
-    let hits = store.search_chunks(&request.message, Some(pack.id), 4)?;
+    let subject_filter = if pack.is_general() {
+        None
+    } else {
+        Some(pack.id)
+    };
+    let hits = store.search_chunks(&request.message, subject_filter, 4)?;
     let excerpts: Vec<String> = hits
         .iter()
         .map(|hit| format!("[{}] {}", hit.title, hit.snippet))
@@ -725,6 +793,10 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
 
     let objectives: Vec<String> = Vec::new();
+    let workspace_label = workspace
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
     let messages = ContextBuilder.build(ContextInput {
         subject: pack,
         grade: &request.grade,
@@ -734,6 +806,8 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         state: "practice",
         recent: &recent,
         skills: &skill_snippets,
+        mode,
+        workspace: Some(&workspace_label),
     });
 
     let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatible::new(
@@ -742,7 +816,10 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         &connection.api_key,
     ));
 
-    let mut tools = registry_for(pack);
+    let mut tools = match (&mode, workspace.as_deref()) {
+        (Mode::Code, Some(root)) => code_registry(root)?,
+        _ => registry_for(pack),
+    };
     let discovery = mcp::discover(&dir).await?;
     for tool in discovery.tools {
         tools.register(tool);
@@ -777,7 +854,7 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         connection_id: Some(&connection.id),
         provider_id: &connection.provider_id,
         model_id: &connection.model,
-        task: "chat",
+        task: mode.as_str(),
         tokens_in: outcome.usage.input_tokens,
         tokens_out: outcome.usage.output_tokens,
         latency_ms: Some(latency_ms),
@@ -807,6 +884,63 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     })
 }
 
+#[tauri::command]
+async fn check_update() -> Result<tez_update::UpdateInfo, String> {
+    tez_update::check(env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn download_update() -> Result<DownloadUpdateResult, String> {
+    let info = tez_update::check(env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|error| error.to_string())?;
+    if !info.available {
+        return Err("Bạn đang dùng bản mới nhất.".into());
+    }
+    let asset = tez_update::pick_asset(&info, std::env::consts::OS)
+        .ok_or_else(|| "Bản phát hành không có file phù hợp với hệ điều hành này.".to_string())?;
+    let dir = data_dir().map_err(friendly)?.join("updates");
+    let path = tez_update::download(asset, &dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(DownloadUpdateResult {
+        path: path.display().to_string(),
+        version: info.latest,
+    })
+}
+
+#[tauri::command]
+fn launch_update(path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    if !path.exists() {
+        return Err(format!(
+            "không tìm thấy file cập nhật: {path}",
+            path = path.display()
+        ));
+    }
+    open_path_in_os(&path).map_err(|error| format!("không mở được bản cập nhật: {error}"))
+}
+
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("chỉ hỗ trợ liên kết http(s)".into());
+    }
+    open_path_in_os(Path::new(&url)).map_err(|error| format!("không mở được liên kết: {error}"))
+}
+
+#[tauri::command]
+fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
+    let resolved = resolve_workspace(path.as_deref()).map_err(friendly)?;
+    open_path_in_os(&resolved).map_err(|error| format!("không mở được workspace: {error}"))?;
+    Ok(WorkspaceInfo {
+        path: resolved.display().to_string(),
+        exists: true,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -826,7 +960,12 @@ pub fn run() {
             delete_mcp_server,
             test_mcp_server,
             install_sample_plugin,
-            open_extension_path
+            open_extension_path,
+            check_update,
+            download_update,
+            launch_update,
+            open_external,
+            open_workspace
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

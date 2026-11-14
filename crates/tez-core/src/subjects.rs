@@ -15,14 +15,36 @@ pub struct SubjectPack {
 }
 
 impl SubjectPack {
+    /// Pack tổng quát, không gắn với môn học nào.
+    pub fn is_general(&self) -> bool {
+        self.id == GENERAL.id
+    }
+
     /// Prompt system đầy đủ cho môn này.
     pub fn system_prompt(&self) -> String {
+        if self.is_general() {
+            return self.tutor_prompt.to_string();
+        }
         format!(
             "Bạn là gia sư môn {}. Chiến lược dạy: {}.\n{}",
             self.name, self.strategy, self.tutor_prompt
         )
     }
 }
+
+/// Pack mặc định: trợ lý tổng quát, không giới hạn môn học.
+pub const GENERAL: SubjectPack = SubjectPack {
+    id: "general",
+    name: "Tổng quát",
+    aliases: &["chung", "general", "assistant", "tro ly", "trợ lý", "any"],
+    strategy: "assistant",
+    tutor_prompt: "Bạn là trợ lý AI local-first, thân thiện và thẳng thắn. \
+        Trả lời bằng tiếng Việt trừ khi người dùng dùng ngôn ngữ khác. \
+        Không giả định người dùng là học sinh hay đang học môn nào: hãy thích nghi với câu hỏi. \
+        Khi câu hỏi cần tính toán, tra cứu hoặc kiểm tra, dùng tool thay vì đoán. \
+        Nếu không chắc, nói rõ mức độ chắc chắn. Không bịa nguồn hoặc số liệu.",
+    tools: &["calculate"],
+};
 
 pub const MATH: SubjectPack = SubjectPack {
     id: "math",
@@ -75,7 +97,11 @@ pub const ENGLISH: SubjectPack = SubjectPack {
     tools: &["check_grammar", "readability"],
 };
 
-pub const ALL: &[SubjectPack] = &[MATH, PHYSICS, CHEMISTRY, ENGLISH];
+/// Mọi pack có sẵn. `GENERAL` đứng đầu và là lựa chọn mặc định.
+pub const ALL: &[SubjectPack] = &[GENERAL, MATH, PHYSICS, CHEMISTRY, ENGLISH];
+
+/// Các pack môn học (không gồm pack tổng quát).
+pub const SUBJECTS: &[SubjectPack] = &[MATH, PHYSICS, CHEMISTRY, ENGLISH];
 
 /// Chuẩn hóa chuỗi để so khớp: chữ thường, bỏ khoảng trắng thừa.
 fn normalize(input: &str) -> String {
@@ -96,6 +122,15 @@ pub fn get(id: &str) -> Option<&'static SubjectPack> {
     ALL.iter().find(|pack| pack.id == normalize(id))
 }
 
+/// Như [`resolve`] nhưng không bao giờ lỗi: chuỗi rỗng hoặc không khớp trả về
+/// pack tổng quát. Dùng cho chat tự do để người dùng không bị gò bó vào môn học.
+pub fn resolve_or_general(input: &str) -> &'static SubjectPack {
+    if input.trim().is_empty() {
+        return &GENERAL;
+    }
+    resolve(input).unwrap_or(&GENERAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,8 +146,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_subject_is_none() {
+    fn unknown_subject_is_none_but_falls_back_to_general() {
         assert!(resolve("sinh học").is_none());
+        assert_eq!(resolve_or_general("sinh học").id, "general");
+        assert_eq!(resolve_or_general("").id, "general");
+        assert_eq!(resolve_or_general("math").id, "math");
+    }
+
+    #[test]
+    fn general_is_the_default_pack() {
+        assert_eq!(ALL[0].id, "general");
+        assert!(GENERAL.is_general());
+        assert!(!MATH.is_general());
+        assert!(!GENERAL.system_prompt().contains("gia sư môn"));
     }
 
     #[test]
