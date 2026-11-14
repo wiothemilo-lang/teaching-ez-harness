@@ -3,7 +3,7 @@
 [![CodeRabbit Reviews](https://img.shields.io/badge/CodeRabbit-reviewed-FF570A?logo=coderabbit&logoColor=white)](https://coderabbit.ai)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)](#build--test)
+[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen)](#build--test)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
 [![Local-first](https://img.shields.io/badge/local--first-BYOK-2F7D5B)](docs/DESKTOP-CLI.md)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20AppImage-lightgrey?logo=linux&logoColor=black)](#desktop-tauri)
@@ -12,10 +12,10 @@
 Harness local-first để biến model AI của bạn thành **gia sư có tool, context, memory và policy** — không chỉ là chatbot.
 
 - **CLI:** `tez`
-- **Desktop:** Tauri 2 + React (chat, cài đặt provider, lịch sử phiên)
+- **Desktop:** Tauri 2 + React — bàn học local-first, quản lý nhiều provider, skills, MCP, plugin
 - **Core:** Rust workspace, SQLite, credential vault
 - **Môn:** Toán, Vật lý, Hóa học, Tiếng Anh
-- **Provider:** mọi endpoint OpenAI-compatible (Groq, OpenRouter, OpenAI, Gemini, Ollama, custom)
+- **Provider:** mọi endpoint OpenAI-compatible (Groq, OpenRouter, OpenAI, Gemini, Ollama, custom), lưu nhiều kết nối và chuyển active
 
 ## Cài đặt (Linux)
 
@@ -63,14 +63,18 @@ Dữ liệu học tập nằm ở `~/.local/share/teaching-ez/`; xóa thêm thư
 | 4 subject pack + allowlist tool theo môn | ✅ |
 | 9 tool: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
 | SQLite: session, message, tool call, token usage | ✅ |
+| Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
+| Skills Markdown: 4 built-in, khớp môn + từ khóa, chèn vào context | ✅ |
+| MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace | ✅ |
+| Plugin `plugin.json`: gói skills + MCP server, plugin mẫu | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
 | Vault AES-256-GCM cho API key | ✅ |
-| `tez connect`, `test`, `chat`, `doctor`, `subject`, `sessions`, `usage`, `doc`, `tools` | ✅ |
+| `tez connect`, `test`, `chat`, `doctor`, `subject`, `sessions`, `usage`, `doc`, `tools`, `provider`, `skills`, `mcp`, `plugins` | ✅ |
 | Disk quota + cleanup (`scripts/disk-guard.sh`) | ✅ |
 | RAG PDF/DOCX, context inspector | ⏳ |
-| Tauri desktop: chat, chọn môn/lớp, tool trace | ✅ |
-| Desktop: cài đặt provider trong app, kiểm tra kết nối, lịch sử phiên | ✅ |
+| Tauri desktop: chat, chọn môn/lớp, tool trace, lịch sử phiên | ✅ |
+| Desktop: quản lý provider, kiểm tra kết nối, skills/MCP/plugin, dữ liệu | ✅ |
 | Đóng gói AppImage (`scripts/desktop.sh appimage`) | ✅ |
 
 ## Build & test
@@ -119,6 +123,21 @@ Binary: `target/debug/tez`
 
 `--subject` nhận cả id (`math`, `physics`, `chemistry`, `english`) và tên tiếng Việt (`Toán`, `Lý`, `Hóa`, `Anh`).
 
+### Nhiều provider
+
+`tez connect` thêm một kết nối vào sổ provider thay vì ghi đè kết nối cũ. Mỗi provider có key mã hóa riêng; chỉ một provider đang active tại một thời điểm.
+
+```bash
+./target/debug/tez provider list
+./target/debug/tez provider use groq-a1b2c3d4
+./target/debug/tez provider remove ollama-e5f6a7b8
+
+# Thêm provider thứ hai
+./target/debug/tez connect --provider ollama --model qwen3:4b
+```
+
+Desktop dùng cùng sổ provider: **Cài đặt → Nhà cung cấp** để thêm, sửa, kiểm tra, chuyển hoặc xóa.
+
 ### Tài liệu (RAG)
 
 `tez chat` tự tìm 4 đoạn liên quan nhất trong kho tài liệu của môn đang học và chèn vào context (có nhãn `<doc>` + tiêu đề để trích dẫn).
@@ -150,6 +169,29 @@ Hiện hỗ trợ UTF-8 `.txt`/`.md`. PDF/DOCX sẽ thêm ở bước sau (cần
   --args '{"expression":"x^2 - 2*x + 1","x_min":-2,"x_max":4}' --subject math
 ```
 
+### Skills, MCP và plugin
+
+```bash
+# Skill Markdown trong ~/.local/share/teaching-ez/skills/
+./target/debug/tez skills list
+./target/debug/tez skills show step-by-step
+
+# MCP server stdio trong mcp.json hoặc từ plugin
+./target/debug/tez mcp list
+./target/debug/tez mcp test study
+
+# Plugin local trong ~/.local/share/teaching-ez/plugins/
+./target/debug/tez plugins
+```
+
+- **Skill** là prompt pack, được khớp theo môn + từ khóa và chèn vào system prompt (tối đa 2 skill/lượt).
+- **MCP** là tool ngoài qua stdio JSON-RPC; tên tool có dạng `mcp__<server>__<tool>`.
+- **Plugin** là gói `plugin.json` chứa skills + MCP server, không chạy code tùy ý.
+
+Plugin mẫu nằm ở `examples/plugins/study-toolkit/` (skill phòng thi + MCP `echo`/`add`). Trong desktop bấm **Cài đặt → Plugin → Cài plugin mẫu**.
+
+Chi tiết định dạng file và bảo mật: [docs/EXTENSIONS.md](docs/EXTENSIONS.md).
+
 ### Subject pack
 
 ```bash
@@ -164,20 +206,26 @@ Mỗi pack khai báo prompt sư phạm, chiến lược dạy và **allowlist to
 ```
 crates/
   tez-llm/      provider trait + OpenAI-compatible adapter
-  tez-core/     agent loop, context builder, subject packs, tools
+  tez-core/     agent loop, context builder, subject packs, tools, skills, MCP, plugin
   tez-store/    SQLite schema + session/usage/document repositories
-  tez-auth/     AES-256-GCM vault
+  tez-auth/     AES-256-GCM vault + sổ nhiều provider
   tez-cli/      binary `tez`
 apps/
   desktop/      React + Vite + Tauri 2
-docs/           kế hoạch, kiến trúc, provider auth, disk policy
+examples/
+  plugins/      plugin mẫu (skills + MCP server)
+docs/           kế hoạch, kiến trúc, provider auth, extensions, disk policy
 scripts/        disk guard, build/test/desktop/install wrappers
 ```
 
 Dữ liệu người dùng nằm ở `~/.local/share/teaching-ez/`:
 
 - `tez.db` — session, message, tool call, usage, tài liệu + FTS5 index
-- `connection.json` — provider + key đã mã hóa
+- `providers.json` — sổ nhiều provider + provider đang dùng
+- `connection.json` — bản đồng bộ của provider active (tương thích CLI cũ)
+- `mcp.json` — cấu hình MCP server
+- `skills/` — skill Markdown của user
+- `plugins/` — plugin local
 - `master.key` — khóa vault (quyền 0600)
 
 ## Dung lượng
@@ -208,20 +256,27 @@ scripts/desktop.sh appimage        # đóng gói AppImage (release)
 scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 ```
 
-**Sử dụng:** mở **tez — Gia sư AI** từ menu → bấm **Cài đặt** → chọn provider → dán API key (để trống nếu dùng Ollama) → **Lưu & kiểm tra** → chọn môn/lớp và nhập câu hỏi.
+**Sử dụng:** mở **tez — Gia sư AI** từ menu → **Cài đặt → Nhà cung cấp** → chọn preset (Groq, Gemini, OpenRouter, OpenAI, Ollama) hoặc Custom → dán API key (để trống nếu endpoint không cần key) → **Lưu nhà cung cấp** → **Kiểm tra**. Sau đó chọn môn/lớp và nhập câu hỏi.
 
-Giao diện hiện có: chọn môn/lớp, chat nhiều lượt, xem tool call (args/kết quả/thời gian), session mới, **lịch sử phiên** (bấm để tải lại), **cài đặt provider** (Groq, Gemini, OpenRouter, OpenAI, Ollama, custom) kèm nút lưu + kiểm tra kết nối.
+Giao diện theo hướng bàn học editorial: nền giấy ấm, chữ serif cho tiêu đề, màu xanh rừng + đất nung, icon SVG tự vẽ, không gradient/pill/emoji. Các khu vực:
 
-AppImage debug đã build thử tại:
+- **Chat:** chọn môn/lớp, phiên mới, tải lại lịch sử, tool trace có args/kết quả/thời gian, token usage.
+- **Cài đặt → Nhà cung cấp:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
+- **Cài đặt → Kỹ năng:** xem skill, môn, từ khóa, nội dung Markdown, mở thư mục.
+- **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool.
+- **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục.
+- **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình.
+
+AppImage release được build bởi `scripts/install-local.sh` tại:
 
 ```
-apps/desktop/src-tauri/target/debug/bundle/appimage/tez_0.1.0_amd64.AppImage
+apps/desktop/src-tauri/target/release/bundle/appimage/tez_0.1.0_amd64.AppImage
 ```
 
 Chạy không cần FUSE:
 
 ```bash
-./apps/desktop/src-tauri/target/debug/bundle/appimage/tez_0.1.0_amd64.AppImage --appimage-extract-and-run
+./apps/desktop/src-tauri/target/release/bundle/appimage/tez_0.1.0_amd64.AppImage --appimage-extract-and-run
 ```
 
 ## Giới hạn hiện tại
@@ -229,7 +284,10 @@ Chạy không cần FUSE:
 - Chưa streaming; câu trả lời hiện về một lần.
 - RAG chỉ nhận `.txt`/`.md`; PDF/DOCX/OCR chưa có.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
-- AppImage mới build ở bản debug để kiểm tra; installer release cho từng OS sẽ làm sau.
+- MCP chỉ hỗ trợ stdio; server spawn mỗi lượt chat, timeout 20 giây, chưa sandbox.
+- Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.
+- Skill khớp từ khóa đơn giản, tối đa 2 skill mỗi lượt.
+- AppImage release cho Linux đã đóng gói; installer cho Windows/macOS sẽ làm sau.
 - Chưa có sync đa máy; dữ liệu nằm trên máy bạn.
 
 ## Tài liệu
@@ -238,6 +296,7 @@ Chạy không cần FUSE:
 - [Kiến trúc Rust + Agent](docs/RUST-ARCHITECTURE.md)
 - [Desktop app + CLI](docs/DESKTOP-CLI.md)
 - [Kết nối AI (BYOK)](docs/PROVIDER-AUTH.md)
+- [Skills, MCP và plugin](docs/EXTENSIONS.md)
 - [Chính sách dung lượng](docs/DISK-POLICY.md)
 
 ## Roadmap gần

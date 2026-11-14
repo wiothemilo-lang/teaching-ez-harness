@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod providers;
 
 use std::path::{Path, PathBuf};
 

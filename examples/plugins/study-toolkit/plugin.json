@@ -1,0 +1,14 @@
+{
+  "id": "study-toolkit",
+  "name": "Study Toolkit",
+  "version": "0.1.0",
+  "description": "Skill chiến lược phòng thi + MCP demo (echo, add). Dùng để thử hệ thống plugin.",
+  "skills": ["skills/exam-strategy"],
+  "mcpServers": {
+    "study": {
+      "command": "python3",
+      "args": ["server.py"],
+      "enabled": true
+    }
+  }
+}

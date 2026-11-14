@@ -14,9 +14,9 @@
       {
         "title": "tez — Gia sư AI",
         "width": 1120,
-        "height": 780,
+        "height": 740,
         "minWidth": 820,
-        "minHeight": 600,
+        "minHeight": 580,
         "resizable": true,
         "center": true
       }

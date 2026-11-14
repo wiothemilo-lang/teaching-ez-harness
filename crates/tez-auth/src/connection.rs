@@ -28,8 +28,23 @@ pub enum ConnectionError {
     Vault(#[from] VaultError),
     #[error("provider 'custom' cần base_url")]
     MissingBaseUrl,
+    #[error("provider '{0}' không tồn tại")]
+    ProviderNotFound(String),
     #[error("API key đã lưu không phải UTF-8")]
     InvalidKeyEncoding,
+}
+
+/// Tên hiển thị mặc định cho từng loại provider.
+pub fn display_name(provider: &str) -> &'static str {
+    match provider {
+        "groq" => "Groq",
+        "openrouter" => "OpenRouter",
+        "openai" => "OpenAI",
+        "gemini" => "Google Gemini",
+        "ollama" => "Ollama (local)",
+        "custom" => "Custom OpenAI-compatible",
+        _ => "Provider",
+    }
 }
 
 /// Endpoint mặc định cho các provider OpenAI-compatible.

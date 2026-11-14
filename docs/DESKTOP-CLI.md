@@ -52,10 +52,11 @@
 
 **Process model:**
 
-> **MVP hiện tại:** desktop gọi Tauri commands in-process (`app_status`, `chat`, `list_sessions`, `load_session`, `save_connection`, `test_connection`), dùng chung crate và DB với CLI; chưa có `tez-server`. Khi cần streaming/SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
+> **MVP hiện tại:** desktop gọi Tauri commands in-process (`app_status`, `chat`, `list_sessions`, `load_session`, `list_providers`, `save_provider`, `delete_provider`, `activate_provider`, `test_provider`, `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `open_extension_path`), dùng chung crate và DB với CLI; chưa có `tez-server`. Khi cần streaming/SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
 
-- Cài đặt provider trong desktop dùng chung `tez_auth::connection` với CLI: cùng `connection.json`, cùng vault, cùng preset model/base URL.
+- Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
+- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp môn/từ khóa và đăng ký tool MCP vào cùng registry với tool built-in.
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
 - Local server là chủ sở hữu duy nhất của DB, vault, provider calls.
 - Tauri shell khởi động server in-process (tokio) và inject `{ url, token }` cho frontend.
@@ -91,7 +92,7 @@ subjects/
 |---|---|---|
 | Ngôn ngữ | **Rust** | Core/CLI/desktop backend một ngôn ngữ; an toàn, nhanh. |
 | Desktop shell | **Tauri 2** | Binary nhỏ, dùng webview hệ thống; Rust backend. |
-| Frontend | **React + Vite + Tailwind + shadcn/ui** | Không cần SSR; build nhanh. |
+| Frontend | **React + Vite + CSS design system** | Không cần SSR; build nhanh; giao diện editorial tự viết, không phụ thuộc UI kit. |
 | Local server | **axum + tokio + tower-http** | SSE/streaming tốt, hệ sinh thái mạnh. |
 | HTTP client | **reqwest + rustls + eventsource-stream** | Provider streaming. |
 | DB | **SQLite + rusqlite (bundled) + refinery** | Local, zero cost, migration. |
@@ -155,6 +156,13 @@ tez chat --subject math --lesson <id>
 tez chat --no-tools
 tez tools list
 tez tools test calculate --args '{"expression":"2+2"}'
+tez provider list
+tez provider use <id>
+tez skills list
+tez skills show <id>
+tez mcp list
+tez mcp test [server]
+tez plugins
 tez context inspect --session <id>
 tez trace <session-id>
 tez lesson list
@@ -182,7 +190,11 @@ tez serve
 | Lessons | Tạo/sửa bài, objectives, tài liệu, ingest |
 | Tools | Danh sách tool theo môn, bật/tắt, test |
 | Context | Xem section/token/bị cắt |
-| Settings → Connections | Account, test, active, xóa |
+| Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
+| Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
+| Settings → MCP | Server stdio, env, cwd, test, danh sách tool |
+| Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
+| Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục |
 | Settings → Models | Model mặc định theo task |
 | Usage | Token/latency/chi phí ước tính |
 | About/Doctor | Version, log, health |

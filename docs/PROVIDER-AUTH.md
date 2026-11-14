@@ -5,6 +5,20 @@
 
 ---
 
+## 0. MVP đã triển khai: sổ nhiều provider
+
+Bản desktop/CLI hiện tại dùng `tez_auth::providers` thay cho một `connection.json` duy nhất:
+
+- `providers.json` giữ danh sách provider: `id`, `name`, `provider`, `base_url`, `model`, `encrypted_key`; trường `active` trỏ provider đang dùng.
+- `connection.json` vẫn được ghi đồng bộ với provider active để CLI/bản desktop cũ đọc được; lần đầu chạy sẽ migrate file cũ thành một entry.
+- Mỗi provider có key ciphertext riêng trong cùng vault AES-256-GCM. Sửa provider mà để trống API key sẽ giữ key cũ; xóa provider active sẽ fallback sang provider đầu tiên còn lại.
+- CLI: `tez connect` thêm/cập nhật entry và đặt active; `tez provider list|use|remove` quản lý sổ.
+- Desktop: tab **Nhà cung cấp** trong Cài đặt hỗ trợ thêm/sửa/xóa/kiểm tra/chuyển active, với preset Groq, Gemini, OpenRouter, OpenAI, Ollama và custom endpoint.
+
+Phần còn lại của tài liệu mô tả kiến trúc đích (local server, OAuth, keychain); các mục chưa có trong MVP được đánh dấu ở README.
+
+---
+
 ## 1. Quyết định cốt lõi
 
 Harness **không bán model** và **không bắt buộc dùng key của mình**. Nó là lớp trung gian:

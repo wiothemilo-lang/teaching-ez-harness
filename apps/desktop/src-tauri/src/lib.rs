@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tez_auth::connection;
+use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
 use tez_core::agent::Agent;
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::mcp::{self, McpServerConfig};
+use tez_core::plugins;
+use tez_core::skills::{self, SkillRegistry};
 use tez_core::subjects::{self, SubjectPack};
 use tez_core::tools::balance_equation::BalanceEquation;
 use tez_core::tools::calculator::Calculator;
@@ -20,16 +24,46 @@ use tez_core::tools::ToolRegistry;
 use tez_llm::{LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
+const SAMPLE_PLUGIN_JSON: &str =
+    include_str!("../../../../examples/plugins/study-toolkit/plugin.json");
+const SAMPLE_PLUGIN_SERVER: &str =
+    include_str!("../../../../examples/plugins/study-toolkit/server.py");
+const SAMPLE_PLUGIN_SKILL: &str =
+    include_str!("../../../../examples/plugins/study-toolkit/skills/exam-strategy/SKILL.md");
+
 #[derive(Debug, Deserialize)]
-struct SaveConnectionRequest {
+struct SaveProviderRequest {
+    id: Option<String>,
+    name: String,
     provider: String,
     base_url: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
+    #[serde(default)]
+    set_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveMcpRequest {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 struct ResolvedConnection {
+    id: String,
     provider_id: String,
+    provider_name: String,
     base_url: String,
     model: String,
     api_key: String,
@@ -45,18 +79,40 @@ struct SubjectInfo {
 
 #[derive(Debug, Serialize)]
 struct ConnectionInfo {
+    id: String,
+    name: String,
     provider: String,
     model: String,
     base_url: String,
 }
 
 #[derive(Debug, Serialize)]
+struct ProviderInfo {
+    id: String,
+    name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    has_key: bool,
+    active: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtensionSummary {
+    skills: usize,
+    mcp_servers: usize,
+    plugins: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct AppStatus {
     connection: Option<ConnectionInfo>,
+    providers: Vec<ProviderInfo>,
     subjects: Vec<SubjectInfo>,
     sessions: i64,
     data_dir: String,
     version: &'static str,
+    extensions: ExtensionSummary,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +121,7 @@ struct ChatRequest {
     grade: String,
     message: String,
     session_id: Option<String>,
+    provider_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +164,8 @@ struct ChatReply {
     tools: Vec<ToolTrace>,
     input_tokens: u64,
     output_tokens: u64,
+    provider: String,
+    model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +178,62 @@ struct SessionInfo {
     summary: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SkillInfo {
+    id: String,
+    name: String,
+    description: String,
+    subjects: Vec<String>,
+    triggers: Vec<String>,
+    body: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpServerInfo {
+    name: String,
+    source: String,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: HashMap<String, String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginInfo {
+    id: String,
+    name: String,
+    version: String,
+    description: String,
+    path: String,
+    skills: usize,
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtensionPaths {
+    data_dir: String,
+    skills_dir: String,
+    plugins_dir: String,
+    mcp_config: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExtensionsInfo {
+    skills: Vec<SkillInfo>,
+    mcp: Vec<McpServerInfo>,
+    plugins: Vec<PluginInfo>,
+    paths: ExtensionPaths,
+}
+
+#[derive(Debug, Serialize)]
+struct McpTest {
+    ok: bool,
+    tools: Vec<String>,
+    error: Option<String>,
+}
+
 fn data_dir() -> anyhow::Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "teaching-ez", "teaching-ez")
         .ok_or_else(|| anyhow::anyhow!("không xác định được thư mục dữ liệu"))?;
@@ -127,16 +242,25 @@ fn data_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-fn resolve_connection(dir: &Path) -> anyhow::Result<ResolvedConnection> {
-    let saved = connection::load(dir)?.ok_or_else(|| {
-        anyhow::anyhow!("Chưa kết nối provider. Mở Cài đặt để thêm API key hoặc chạy: tez connect --provider groq")
-    })?;
-    let api_key = connection::decrypt_key(dir, &saved)?;
+fn resolve_connection(dir: &Path, id: Option<&str>) -> anyhow::Result<ResolvedConnection> {
+    let book = providers::load(dir)?;
+    let entry = match id {
+        Some(id) => book
+            .find(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("provider '{id}' không tồn tại"))?,
+        None => book.active().cloned().ok_or_else(|| {
+            anyhow::anyhow!("Chưa kết nối provider. Mở Cài đặt để thêm API key hoặc chạy: tez connect --provider groq")
+        })?,
+    };
+    let api_key = providers::decrypt_key(dir, &entry)?;
 
     Ok(ResolvedConnection {
-        provider_id: saved.provider,
-        base_url: saved.base_url,
-        model: saved.model,
+        id: entry.id,
+        provider_id: entry.provider,
+        provider_name: entry.name,
+        base_url: entry.base_url,
+        model: entry.model,
         api_key,
     })
 }
@@ -175,28 +299,321 @@ fn friendly(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+fn provider_info(dir: &Path, book: &ProviderBook, entry: &ProviderEntry) -> ProviderInfo {
+    let has_key = providers::decrypt_key(dir, entry)
+        .map(|key| !key.is_empty())
+        .unwrap_or(false);
+    ProviderInfo {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        provider: entry.provider.clone(),
+        base_url: entry.base_url.clone(),
+        model: entry.model.clone(),
+        has_key,
+        active: book.active.as_deref() == Some(entry.id.as_str()),
+    }
+}
+
+fn plugin_info(plugin: &plugins::Plugin) -> PluginInfo {
+    let mut mcp_servers: Vec<String> = plugin.manifest.mcp_servers.keys().cloned().collect();
+    mcp_servers.sort();
+    PluginInfo {
+        id: plugin.manifest.id.clone(),
+        name: plugin.manifest.name.clone(),
+        version: plugin.manifest.version.clone(),
+        description: plugin.manifest.description.clone(),
+        path: plugin.dir.display().to_string(),
+        skills: plugin.manifest.skills.len(),
+        mcp_servers,
+    }
+}
+
 #[tauri::command]
 fn app_status() -> Result<AppStatus, String> {
     let dir = data_dir().map_err(friendly)?;
-    let connection = connection::load(&dir)
-        .map_err(|error| error.to_string())?
-        .map(|saved| ConnectionInfo {
-            provider: saved.provider,
-            model: saved.model,
-            base_url: saved.base_url,
-        });
+    let book = providers::load(&dir).map_err(|error| error.to_string())?;
+    let connection = book.active().map(|entry| ConnectionInfo {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        provider: entry.provider.clone(),
+        model: entry.model.clone(),
+        base_url: entry.base_url.clone(),
+    });
+    let providers = book
+        .providers
+        .iter()
+        .map(|entry| provider_info(&dir, &book, entry))
+        .collect();
 
     let sessions = Store::open(dir.join("tez.db"))
         .and_then(|store| store.session_count())
         .unwrap_or(0);
+    let skills = SkillRegistry::load_with_plugins(&dir).map(|registry| registry.all().len()).unwrap_or(0);
+    let mcp_servers = mcp::load_servers(&dir).map(|servers| servers.len()).unwrap_or(0);
+    let plugins = plugins::load_all(&dir).map(|items| items.len()).unwrap_or(0);
 
     Ok(AppStatus {
         connection,
+        providers,
         subjects: subject_infos(),
         sessions,
         data_dir: dir.display().to_string(),
         version: env!("CARGO_PKG_VERSION"),
+        extensions: ExtensionSummary {
+            skills,
+            mcp_servers,
+            plugins,
+        },
     })
+}
+
+#[tauri::command]
+fn list_providers() -> Result<Vec<ProviderInfo>, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let book = providers::load(&dir).map_err(|error| error.to_string())?;
+    Ok(book
+        .providers
+        .iter()
+        .map(|entry| provider_info(&dir, &book, entry))
+        .collect())
+}
+
+#[tauri::command]
+fn save_provider(request: SaveProviderRequest) -> Result<ProviderInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = providers::upsert(
+        &dir,
+        ProviderInput {
+            id: request.id.as_deref(),
+            name: &request.name,
+            provider: &request.provider,
+            base_url: request.base_url.as_deref(),
+            model: request.model.as_deref(),
+            api_key: request.api_key.as_deref(),
+            set_active: request.set_active,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    let store = Store::open(dir.join("tez.db")).map_err(|error| error.to_string())?;
+    store
+        .ensure_profile("default", "Học sinh")
+        .map_err(|error| error.to_string())?;
+
+    let book = providers::load(&dir).map_err(|error| error.to_string())?;
+    Ok(provider_info(&dir, &book, &entry))
+}
+
+#[tauri::command]
+fn delete_provider(id: String) -> Result<bool, String> {
+    let dir = data_dir().map_err(friendly)?;
+    providers::remove(&dir, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn activate_provider(id: String) -> Result<ProviderInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = providers::set_active(&dir, &id).map_err(|error| error.to_string())?;
+    let book = providers::load(&dir).map_err(|error| error.to_string())?;
+    Ok(provider_info(&dir, &book, &entry))
+}
+
+#[tauri::command]
+async fn test_provider(id: Option<String>) -> Result<ConnectionTest, String> {
+    test_provider_inner(id.as_deref()).await.map_err(friendly)
+}
+
+async fn test_provider_inner(id: Option<&str>) -> anyhow::Result<ConnectionTest> {
+    let dir = data_dir()?;
+    let saved = resolve_connection(&dir, id)?;
+    let provider = OpenAiCompatible::new(&saved.provider_id, &saved.base_url, &saved.api_key);
+    let started = Instant::now();
+    let message = tez_llm::ping(&provider, &saved.model).await?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    Ok(ConnectionTest {
+        ok: true,
+        message: message.trim().to_string(),
+        latency_ms,
+    })
+}
+
+#[tauri::command]
+async fn test_connection() -> Result<ConnectionTest, String> {
+    test_provider(None).await
+}
+
+#[tauri::command]
+fn list_extensions() -> Result<ExtensionsInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let registry = SkillRegistry::load_with_plugins(&dir).map_err(|error| error.to_string())?;
+    let skills = registry
+        .all()
+        .iter()
+        .map(|skill| SkillInfo {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            subjects: skill.subjects.clone(),
+            triggers: skill.triggers.clone(),
+            body: skill.body.clone(),
+            source: skill.source.clone(),
+        })
+        .collect();
+
+    let mcp = mcp::load_servers(&dir)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|entry| McpServerInfo {
+            name: entry.name,
+            source: entry.source,
+            command: entry.config.command,
+            args: entry.config.args,
+            cwd: entry.config.cwd,
+            env: entry.config.env,
+            enabled: entry.config.enabled,
+        })
+        .collect();
+
+    let plugins = plugins::load_all(&dir)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(plugin_info)
+        .collect();
+
+    Ok(ExtensionsInfo {
+        skills,
+        mcp,
+        plugins,
+        paths: ExtensionPaths {
+            data_dir: dir.display().to_string(),
+            skills_dir: dir.join("skills").display().to_string(),
+            plugins_dir: dir.join("plugins").display().to_string(),
+            mcp_config: mcp::config_path(&dir).display().to_string(),
+        },
+    })
+}
+
+#[tauri::command]
+fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
+    if request.name.trim().is_empty() {
+        return Err("Tên MCP server không được để trống.".into());
+    }
+    if request.command.trim().is_empty() {
+        return Err("Command không được để trống.".into());
+    }
+
+    let dir = data_dir().map_err(friendly)?;
+    let mut config = mcp::load_config(&dir).map_err(|error| error.to_string())?;
+    config.servers.insert(
+        request.name.trim().to_string(),
+        McpServerConfig {
+            command: request.command.trim().to_string(),
+            args: request.args,
+            env: request.env,
+            cwd: request.cwd.filter(|value| !value.trim().is_empty()),
+            enabled: request.enabled,
+        },
+    );
+    mcp::save_config(&dir, &config).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn delete_mcp_server(name: String) -> Result<bool, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let mut config = mcp::load_config(&dir).map_err(|error| error.to_string())?;
+    if config.servers.remove(&name).is_none() {
+        return Ok(false);
+    }
+    mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn test_mcp_server(name: String) -> Result<McpTest, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let servers = mcp::load_servers(&dir).map_err(|error| error.to_string())?;
+    let entry = servers
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| format!("MCP server '{name}' không tồn tại"))?;
+
+    match mcp::McpClient::connect(&entry.name, &entry.config).await {
+        Ok((_client, tools)) => Ok(McpTest {
+            ok: true,
+            tools: tools.into_iter().map(|tool| tool.name).collect(),
+            error: None,
+        }),
+        Err(error) => Ok(McpTest {
+            ok: false,
+            tools: Vec::new(),
+            error: Some(error.to_string()),
+        }),
+    }
+}
+
+#[tauri::command]
+fn install_sample_plugin() -> Result<PluginInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let root = dir.join("plugins").join("study-toolkit");
+    std::fs::create_dir_all(root.join("skills").join("exam-strategy"))
+        .map_err(|error| error.to_string())?;
+    std::fs::write(root.join("plugin.json"), SAMPLE_PLUGIN_JSON)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(root.join("server.py"), SAMPLE_PLUGIN_SERVER)
+        .map_err(|error| error.to_string())?;
+    std::fs::write(
+        root.join("skills").join("exam-strategy").join("SKILL.md"),
+        SAMPLE_PLUGIN_SKILL,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let plugins = plugins::load_all(&dir).map_err(|error| error.to_string())?;
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.manifest.id == "study-toolkit")
+        .ok_or_else(|| "không nạp được plugin mẫu".to_string())?;
+    Ok(plugin_info(plugin))
+}
+
+#[tauri::command]
+fn open_extension_path(kind: String) -> Result<String, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let path = match kind.as_str() {
+        "skills" => {
+            let path = dir.join("skills");
+            std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+            path
+        }
+        "plugins" => {
+            let path = dir.join("plugins");
+            std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+            path
+        }
+        "data" => dir.clone(),
+        "mcp" => {
+            let path = mcp::config_path(&dir);
+            if !path.exists() {
+                mcp::save_config(&dir, &mcp::McpConfig::default())
+                    .map_err(|error| error.to_string())?;
+            }
+            path
+        }
+        _ => return Err(format!("loại đường dẫn không hỗ trợ: {kind}")),
+    };
+
+    #[cfg(target_os = "linux")]
+    let opener = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+
+    std::process::Command::new(opener)
+        .arg(&path)
+        .spawn()
+        .map_err(|error| format!("không mở được {}: {error}", path.display()))?;
+    Ok(path.display().to_string())
 }
 
 #[tauri::command]
@@ -248,72 +665,6 @@ fn load_session(request: SessionRequest) -> Result<SessionDetail, String> {
 }
 
 #[tauri::command]
-fn save_connection(request: SaveConnectionRequest) -> Result<ConnectionInfo, String> {
-    let dir = data_dir().map_err(friendly)?;
-    let provider = request.provider.trim().to_lowercase();
-    let typed_key = request
-        .api_key
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty());
-
-    let api_key = match typed_key {
-        Some(key) => key,
-        None => {
-            let existing = connection::load(&dir).map_err(|error| error.to_string())?;
-            match existing.filter(|saved| saved.provider == provider) {
-                Some(saved) => {
-                    connection::decrypt_key(&dir, &saved).map_err(|error| error.to_string())?
-                }
-                None if provider == "ollama" || provider == "custom" => String::new(),
-                None => {
-                    return Err("API key không được để trống với provider này.".into());
-                }
-            }
-        }
-    };
-
-    let saved = connection::save(
-        &dir,
-        &provider,
-        request.base_url.as_deref(),
-        request.model.as_deref(),
-        &api_key,
-    )
-    .map_err(|error| error.to_string())?;
-
-    let store = Store::open(dir.join("tez.db")).map_err(|error| error.to_string())?;
-    store
-        .ensure_profile("default", "Học sinh")
-        .map_err(|error| error.to_string())?;
-
-    Ok(ConnectionInfo {
-        provider: saved.provider,
-        model: saved.model,
-        base_url: saved.base_url,
-    })
-}
-
-#[tauri::command]
-async fn test_connection() -> Result<ConnectionTest, String> {
-    test_connection_inner().await.map_err(friendly)
-}
-
-async fn test_connection_inner() -> anyhow::Result<ConnectionTest> {
-    let dir = data_dir()?;
-    let saved = resolve_connection(&dir)?;
-    let provider = OpenAiCompatible::new(&saved.provider_id, &saved.base_url, &saved.api_key);
-    let started = Instant::now();
-    let message = tez_llm::ping(&provider, &saved.model).await?;
-    let latency_ms = started.elapsed().as_millis() as u64;
-
-    Ok(ConnectionTest {
-        ok: true,
-        message: message.trim().to_string(),
-        latency_ms,
-    })
-}
-
-#[tauri::command]
 async fn chat(request: ChatRequest) -> Result<ChatReply, String> {
     chat_inner(request).await.map_err(friendly)
 }
@@ -322,7 +673,7 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     let dir = data_dir()?;
     let pack = subjects::resolve(&request.subject)
         .ok_or_else(|| anyhow::anyhow!("môn không hỗ trợ: {}", request.subject))?;
-    let connection = resolve_connection(&dir)?;
+    let connection = resolve_connection(&dir, request.provider_id.as_deref())?;
 
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
@@ -369,6 +720,10 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     let mut recent = history;
     recent.push(Message::user(request.message.clone()));
 
+    let registry = SkillRegistry::load_with_plugins(&dir)?;
+    let matched = registry.matching(pack.id, &request.message, 2);
+    let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
+
     let objectives: Vec<String> = Vec::new();
     let messages = ContextBuilder.build(ContextInput {
         subject: pack,
@@ -378,6 +733,7 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         student_summary: None,
         state: "practice",
         recent: &recent,
+        skills: &skill_snippets,
     });
 
     let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatible::new(
@@ -385,7 +741,14 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         &connection.base_url,
         &connection.api_key,
     ));
-    let agent = Agent::new(provider, registry_for(pack));
+
+    let mut tools = registry_for(pack);
+    let discovery = mcp::discover(&dir).await?;
+    for tool in discovery.tools {
+        tools.register(tool);
+    }
+
+    let agent = Agent::new(provider, tools);
     let started = Instant::now();
     let outcome = agent.run(&connection.model, messages).await?;
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -411,7 +774,7 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     }
     store.record_usage(UsageRecord {
         profile_id: "default",
-        connection_id: None,
+        connection_id: Some(&connection.id),
         provider_id: &connection.provider_id,
         model_id: &connection.model,
         task: "chat",
@@ -439,6 +802,8 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
             .collect(),
         input_tokens: outcome.usage.input_tokens,
         output_tokens: outcome.usage.output_tokens,
+        provider: connection.provider_name,
+        model: connection.model,
     })
 }
 
@@ -450,8 +815,18 @@ pub fn run() {
             chat,
             list_sessions,
             load_session,
-            save_connection,
-            test_connection
+            list_providers,
+            save_provider,
+            delete_provider,
+            activate_provider,
+            test_provider,
+            test_connection,
+            list_extensions,
+            save_mcp_server,
+            delete_mcp_server,
+            test_mcp_server,
+            install_sample_plugin,
+            open_extension_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

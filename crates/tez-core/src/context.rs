@@ -11,6 +11,8 @@ pub struct ContextInput<'a> {
     pub student_summary: Option<&'a str>,
     pub state: &'a str,
     pub recent: &'a [Message],
+    /// Skill đã render sẵn (xem [`crate::skills::render`]).
+    pub skills: &'a [String],
 }
 
 /// Build messages theo cấu trúc: system + context + recent turns.
@@ -43,6 +45,14 @@ impl ContextBuilder {
 
         if let Some(summary) = input.student_summary {
             system.push_str(&format!("\nHồ sơ học sinh:\n{summary}\n"));
+        }
+
+        if !input.skills.is_empty() {
+            system.push_str("\nKỹ năng đang bật (là chỉ dẫn sư phạm, hãy áp dụng khi phù hợp):\n");
+            for skill in input.skills {
+                system.push_str(skill);
+                system.push('\n');
+            }
         }
 
         if !input.excerpts.is_empty() {
@@ -83,6 +93,7 @@ mod tests {
             student_summary: Some("Mastery 0.4"),
             state: "practice",
             recent: &recent,
+            skills: &["<skill name=\"test\">step</skill>".to_string()],
         });
 
         assert_eq!(messages.len(), 2);
@@ -91,6 +102,7 @@ mod tests {
         assert!(system.contains("Pythagore"));
         assert!(system.contains("a^2 + b^2 = c^2"));
         assert!(system.contains("socratic"));
+        assert!(system.contains("<skill name=\"test\">"));
         assert_eq!(messages[1].role, "user");
     }
 }

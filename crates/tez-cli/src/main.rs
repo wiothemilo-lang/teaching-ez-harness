@@ -8,10 +8,14 @@ use clap::{Args, Parser, Subcommand};
 use dialoguer::Password;
 use directories::ProjectDirs;
 use serde_json::Value;
-use tez_auth::connection::{self, ConnectionFile};
+use tez_auth::connection;
+use tez_auth::providers::{self, ProviderBook, ProviderInput};
 use tez_auth::Vault;
 use tez_core::agent::Agent;
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::mcp;
+use tez_core::plugins;
+use tez_core::skills::{self, SkillRegistry};
 use tez_core::subjects::{self, SubjectPack};
 use tez_core::tools::balance_equation::BalanceEquation;
 use tez_core::tools::calculator::Calculator;
@@ -66,6 +70,45 @@ enum Commands {
         #[command(subcommand)]
         command: ToolsCommand,
     },
+    /// Quản lý nhiều provider đã lưu.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+    /// Liệt kê skill Markdown.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+    /// Liệt kê/test MCP server.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// Liệt kê plugin local.
+    Plugins,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    /// Xem các provider đã lưu và provider đang dùng.
+    List,
+    /// Chuyển provider đang dùng.
+    Use { id: String },
+    /// Xóa một provider đã lưu.
+    Remove { id: String },
+}
+
+#[derive(Subcommand)]
+enum SkillsCommand {
+    List,
+    Show { id: String },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    List,
+    Test { name: Option<String> },
 }
 
 #[derive(Args)]
@@ -251,12 +294,17 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             .interact()?,
     };
 
-    let saved = connection::save(
+    let saved = providers::upsert(
         &dir,
-        &args.provider,
-        args.base_url.as_deref(),
-        args.model.as_deref(),
-        &api_key,
+        ProviderInput {
+            id: None,
+            name: "",
+            provider: &args.provider,
+            base_url: args.base_url.as_deref(),
+            model: args.model.as_deref(),
+            api_key: Some(&api_key),
+            set_active: true,
+        },
     )?;
     let vault = Vault::load_or_create(&dir)?;
 
@@ -264,8 +312,14 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
 
-    println!("Đã kết nối. Cấu hình: {}", connection::path(&dir).display());
-    println!("Provider: {} · model: {}", saved.provider, saved.model);
+    println!(
+        "Đã kết nối. Sổ provider: {}",
+        providers::path(&dir).display()
+    );
+    println!(
+        "Provider: {} · model: {} · id: {}",
+        saved.provider, saved.model, saved.id
+    );
     println!(
         "Key được mã hóa bằng vault tại: {}",
         vault.key_path().display()
@@ -276,10 +330,10 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
 
 async fn test_connection() -> anyhow::Result<()> {
     let dir = data_dir()?;
-    let saved = connection::load(&dir)?.ok_or_else(|| {
+    let saved = providers::active(&dir)?.ok_or_else(|| {
         anyhow::anyhow!("Chưa kết nối provider. Chạy: tez connect --provider groq")
     })?;
-    let api_key = connection::decrypt_key(&dir, &saved)?;
+    let api_key = providers::decrypt_key(&dir, &saved)?;
     let provider = OpenAiCompatible::new(&saved.provider, &saved.base_url, &api_key);
 
     let started = Instant::now();
@@ -294,6 +348,166 @@ async fn test_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn provider_list() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let book = providers::load(&dir)?;
+    if book.providers.is_empty() {
+        println!("Chưa có provider nào. Chạy: tez connect --provider groq");
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<18} {:<12} {:<28} ĐANG DÙNG",
+        "ID", "TÊN", "LOẠI", "MODEL"
+    );
+    for entry in &book.providers {
+        let active = if book.active.as_deref() == Some(entry.id.as_str()) {
+            "*"
+        } else {
+            ""
+        };
+        println!(
+            "{:<26} {:<18} {:<12} {:<28} {}",
+            entry.id, entry.name, entry.provider, entry.model, active
+        );
+    }
+    Ok(())
+}
+
+fn provider_use(id: &str) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let entry = providers::set_active(&dir, id)?;
+    println!(
+        "Đang dùng: {} ({}) · {}",
+        entry.name, entry.provider, entry.model
+    );
+    Ok(())
+}
+
+fn provider_remove(id: &str) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    if providers::remove(&dir, id)? {
+        println!("Đã xóa provider {id}.");
+    } else {
+        println!("Không tìm thấy provider {id}.");
+    }
+    Ok(())
+}
+
+fn skills_list() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let registry = SkillRegistry::load_with_plugins(&dir)?;
+    if registry.all().is_empty() {
+        println!("Chưa có skill nào.");
+        return Ok(());
+    }
+    println!("{:<24} {:<28} {:<20} NGUỒN", "ID", "TÊN", "MÔN");
+    for skill in registry.all() {
+        let subjects = if skill.subjects.is_empty() {
+            "all".to_string()
+        } else {
+            skill.subjects.join(",")
+        };
+        println!(
+            "{:<24} {:<28} {:<20} {}",
+            skill.id, skill.name, subjects, skill.source
+        );
+    }
+    Ok(())
+}
+
+fn skills_show(id: &str) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let registry = SkillRegistry::load_with_plugins(&dir)?;
+    let skill = registry
+        .find(id)
+        .ok_or_else(|| anyhow::anyhow!("không tìm thấy skill '{id}'"))?;
+    println!("{} ({})", skill.name, skill.id);
+    println!("nguồn: {}", skill.source);
+    if !skill.description.is_empty() {
+        println!("mô tả: {}", skill.description);
+    }
+    println!("\n{}", skill.body);
+    Ok(())
+}
+
+fn mcp_list() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let servers = mcp::load_servers(&dir)?;
+    if servers.is_empty() {
+        println!(
+            "Chưa có MCP server. Tạo {} hoặc cài plugin.",
+            mcp::config_path(&dir).display()
+        );
+        return Ok(());
+    }
+    for entry in servers {
+        let status = if entry.config.enabled {
+            "bật"
+        } else {
+            "tắt"
+        };
+        println!(
+            "{:<16} {:<10} {:<8} {} {}",
+            entry.name,
+            entry.source,
+            status,
+            entry.config.command,
+            entry.config.args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+async fn mcp_test(name: Option<String>) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let servers = mcp::load_servers(&dir)?;
+    let selected: Vec<_> = servers
+        .into_iter()
+        .filter(|entry| entry.config.enabled)
+        .filter(|entry| name.as_deref().is_none_or(|value| entry.name == value))
+        .collect();
+    if selected.is_empty() {
+        println!("Không có MCP server phù hợp.");
+        return Ok(());
+    }
+    for entry in selected {
+        match mcp::McpClient::connect(&entry.name, &entry.config).await {
+            Ok((_client, tools)) => {
+                println!("{}: OK · {} tool", entry.name, tools.len());
+                for tool in tools {
+                    println!("  - {}: {}", tool.name, tool.description);
+                }
+            }
+            Err(error) => println!("{}: LỖI · {error}", entry.name),
+        }
+    }
+    Ok(())
+}
+
+fn plugins_list() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let plugins = plugins::load_all(&dir)?;
+    if plugins.is_empty() {
+        println!(
+            "Chưa có plugin. Thư mục: {}",
+            plugins::plugins_dir(&dir).display()
+        );
+        return Ok(());
+    }
+    for plugin in plugins {
+        println!(
+            "{} v{} · {} · {} skill, {} MCP server",
+            plugin.manifest.name,
+            plugin.manifest.version,
+            plugin.manifest.description,
+            plugin.manifest.skills.len(),
+            plugin.manifest.mcp_servers.len()
+        );
+        println!("  {}", plugin.dir.display());
+    }
+    Ok(())
+}
+
 struct ResolvedConnection {
     provider_id: String,
     base_url: String,
@@ -303,31 +517,37 @@ struct ResolvedConnection {
 
 fn resolve_chat_connection(
     args: &ChatArgs,
-    saved: Option<&ConnectionFile>,
+    book: &ProviderBook,
     dir: &Path,
 ) -> anyhow::Result<ResolvedConnection> {
-    let provider_id = args
+    let selected = args
         .provider
-        .clone()
-        .or_else(|| saved.map(|c| c.provider.clone()))
-        .unwrap_or_else(|| "groq".to_string());
-    let saved_for_provider = saved.filter(|c| c.provider == provider_id);
+        .as_deref()
+        .and_then(|value| {
+            book.find(value)
+                .or_else(|| book.providers.iter().find(|entry| entry.provider == value))
+        })
+        .or_else(|| book.active());
 
+    let provider_id = selected
+        .map(|entry| entry.provider.clone())
+        .or_else(|| args.provider.clone())
+        .unwrap_or_else(|| "groq".to_string());
     let base_url = args
         .base_url
         .clone()
-        .or_else(|| saved_for_provider.map(|c| c.base_url.clone()))
+        .or_else(|| selected.map(|entry| entry.base_url.clone()))
         .unwrap_or_else(|| connection::default_base_url(&provider_id).to_string());
     let model = args
         .model
         .clone()
-        .or_else(|| saved_for_provider.map(|c| c.model.clone()))
+        .or_else(|| selected.map(|entry| entry.model.clone()))
         .unwrap_or_else(|| connection::default_model(&provider_id).to_string());
 
     let api_key = if let Some(key) = args.api_key.clone() {
         key
-    } else if let Some(saved) = saved_for_provider {
-        connection::decrypt_key(dir, saved)?
+    } else if let Some(entry) = selected {
+        providers::decrypt_key(dir, entry)?
     } else if let Some(key) = env_api_key(&provider_id) {
         key
     } else if provider_id == "ollama" {
@@ -355,6 +575,8 @@ struct TurnContext<'a> {
     model: &'a str,
     provider_id: &'a str,
     provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    skills: SkillRegistry,
 }
 
 impl TurnContext<'_> {
@@ -389,6 +611,10 @@ impl TurnContext<'_> {
         let mut recent = conversation.clone();
         recent.push(Message::user(prompt));
 
+        let matched = self.skills.matching(self.pack.id, prompt, 2);
+        let skill_snippets: Vec<String> =
+            matched.iter().map(|skill| skills::render(skill)).collect();
+
         let objectives: Vec<String> = Vec::new();
         let messages = ContextBuilder.build(ContextInput {
             subject: self.pack,
@@ -398,9 +624,10 @@ impl TurnContext<'_> {
             student_summary: None,
             state: "practice",
             recent: &recent,
+            skills: &skill_snippets,
         });
 
-        let agent = Agent::new(Arc::clone(&self.provider), registry_for(self.pack));
+        let agent = Agent::new(Arc::clone(&self.provider), self.tools.clone());
         let started = Instant::now();
         let outcome = agent.run(self.model, messages).await?;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -454,9 +681,9 @@ impl TurnContext<'_> {
 
 async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
-    let saved = connection::load(&dir)?;
+    let book = providers::load(&dir)?;
     let pack = resolve_subject(&args.subject)?;
-    let connection = resolve_chat_connection(&args, saved.as_ref(), &dir)?;
+    let connection = resolve_chat_connection(&args, &book, &dir)?;
 
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
@@ -489,6 +716,30 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         &connection.base_url,
         &connection.api_key,
     ));
+
+    let mut tools = registry_for(pack);
+    let discovery = mcp::discover(&dir).await?;
+    let mcp_count = discovery.tools.len();
+    for server in &discovery.servers {
+        if !server.ok {
+            eprintln!(
+                "[mcp] {}: {}",
+                server.name,
+                server.error.as_deref().unwrap_or("không khả dụng")
+            );
+        }
+    }
+    for tool in discovery.tools {
+        tools.register(tool);
+    }
+    if mcp_count > 0 {
+        eprintln!(
+            "[mcp] {mcp_count} tool từ {} server",
+            discovery.servers.len()
+        );
+    }
+    let skills = SkillRegistry::load_with_plugins(&dir)?;
+
     let turn = TurnContext {
         dir: &dir,
         session_id: &session_id,
@@ -497,6 +748,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         model: &connection.model,
         provider_id: &connection.provider_id,
         provider,
+        tools,
+        skills,
     };
 
     let interactive = args.prompt.is_none() && std::io::stdin().is_terminal();
@@ -579,10 +832,16 @@ fn doctor() -> anyhow::Result<()> {
     println!("tez {}", env!("CARGO_PKG_VERSION"));
     println!("data dir: {}", dir.display());
 
-    let connection = connection::load(&dir)?;
-    match &connection {
-        Some(c) => println!("connection: {} ({})", c.provider, c.model),
-        None => println!("connection: chưa có (chạy `tez connect`)"),
+    let book = providers::load(&dir)?;
+    match book.active() {
+        Some(entry) => println!(
+            "provider: {} ({}) · {} provider đã lưu · id {}",
+            entry.provider,
+            entry.model,
+            book.providers.len(),
+            entry.id
+        ),
+        None => println!("provider: chưa có (chạy `tez connect`)"),
     }
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -631,6 +890,16 @@ fn doctor() -> anyhow::Result<()> {
             .join(", ")
     );
     println!("tools: {}", full_registry().names().join(", "));
+    let skills = SkillRegistry::load_with_plugins(&dir)?;
+    println!(
+        "skills: {} (thư mục {})",
+        skills.all().len(),
+        dir.join("skills").display()
+    );
+    let mcp_servers = mcp::load_servers(&dir)?;
+    println!("mcp servers: {}", mcp_servers.len());
+    let plugins = plugins::load_all(&dir)?;
+    println!("plugins: {}", plugins.len());
     println!("disk: chạy scripts/disk-guard.sh check");
     Ok(())
 }
@@ -874,5 +1143,19 @@ async fn main() -> anyhow::Result<()> {
                 subject,
             } => tools_test(name, args, subject).await,
         },
+        Commands::Provider { command } => match command {
+            ProviderCommand::List => provider_list(),
+            ProviderCommand::Use { id } => provider_use(&id),
+            ProviderCommand::Remove { id } => provider_remove(&id),
+        },
+        Commands::Skills { command } => match command {
+            SkillsCommand::List => skills_list(),
+            SkillsCommand::Show { id } => skills_show(&id),
+        },
+        Commands::Mcp { command } => match command {
+            McpCommand::List => mcp_list(),
+            McpCommand::Test { name } => mcp_test(name).await,
+        },
+        Commands::Plugins => plugins_list(),
     }
 }

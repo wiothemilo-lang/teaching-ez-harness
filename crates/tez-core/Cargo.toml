@@ -7,10 +7,12 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 evalexpr.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tez-llm = { path = "../tez-llm" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "process", "io-util", "sync", "fs"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "sync", "fs"] }
