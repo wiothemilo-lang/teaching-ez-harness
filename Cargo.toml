@@ -5,6 +5,7 @@ members = [
   "crates/tez-core",
   "crates/tez-store",
   "crates/tez-auth",
+  "crates/tez-update",
   "crates/tez-cli",
 ]
 

@@ -3911,6 +3911,7 @@ dependencies = [
  "tez-core",
  "tez-llm",
  "tez-store",
+ "tez-update",
  "tokio",
 ]
 
@@ -3933,6 +3934,16 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "tez-update"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

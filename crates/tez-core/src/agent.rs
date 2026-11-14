@@ -7,7 +7,7 @@ use tez_llm::{ChatRequest, ChatResponse, LlmError, LlmProvider, Message, Usage};
 use crate::tools::{ToolError, ToolRegistry};
 
 /// Giới hạn policy cho một tool call.
-const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]

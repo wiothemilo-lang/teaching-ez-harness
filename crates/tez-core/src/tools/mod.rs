@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ pub mod molar_mass;
 pub mod physics_formula;
 pub mod plot_function;
 pub mod readability;
+pub mod workspace;
 
 #[derive(Debug, Error)]
 pub enum ToolError {
@@ -103,4 +105,15 @@ impl ToolRegistry {
             .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
         tool.execute(args).await
     }
+}
+
+/// Registry cho chế độ Code, giới hạn trong `root`.
+pub fn code_registry(root: impl AsRef<Path>) -> Result<ToolRegistry, ToolError> {
+    let workspace = workspace::Workspace::new(root)?;
+    let mut registry = ToolRegistry::new();
+    registry.register(workspace::ReadFile::new(workspace.clone()));
+    registry.register(workspace::WriteFile::new(workspace.clone()));
+    registry.register(workspace::ListFiles::new(workspace.clone()));
+    registry.register(workspace::RunCommand::new(workspace));
+    Ok(registry)
 }

@@ -21,6 +21,7 @@ tez-auth = { path = "../../../crates/tez-auth" }
 tez-core = { path = "../../../crates/tez-core" }
 tez-llm = { path = "../../../crates/tez-llm" }
 tez-store = { path = "../../../crates/tez-store" }
+tez-update = { path = "../../../crates/tez-update" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # Tauri app có target/ riêng, không build chung workspace root.

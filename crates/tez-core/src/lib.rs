@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod context;
 pub mod mcp;
+pub mod modes;
 pub mod plugins;
 pub mod skills;
 pub mod subjects;

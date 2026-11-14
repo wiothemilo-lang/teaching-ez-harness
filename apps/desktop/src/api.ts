@@ -12,6 +12,8 @@ import type {
   SaveProviderPayload,
   SessionDetail,
   SessionInfo,
+  DownloadUpdateResult,
+  UpdateInfo,
 } from "./types";
 
 export function appStatus(): Promise<AppStatus> {
@@ -72,6 +74,26 @@ export function installSamplePlugin(): Promise<PluginInfo> {
 
 export function openExtensionPath(kind: "skills" | "plugins" | "data" | "mcp"): Promise<string> {
   return invoke("open_extension_path", { kind });
+}
+
+export function checkUpdate(): Promise<UpdateInfo> {
+  return invoke("check_update");
+}
+
+export function downloadUpdate(): Promise<DownloadUpdateResult> {
+  return invoke("download_update");
+}
+
+export function launchUpdate(path: string): Promise<void> {
+  return invoke("launch_update", { path });
+}
+
+export function openExternal(url: string): Promise<void> {
+  return invoke("open_external", { url });
+}
+
+export function openWorkspace(path: string | null): Promise<{ path: string; exists: boolean }> {
+  return invoke("open_workspace", { path });
 }
 
 export function errorMessage(error: unknown): string {

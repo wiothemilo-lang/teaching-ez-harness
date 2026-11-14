@@ -3,9 +3,9 @@ import type { KeyboardEvent } from "react";
 import type { ChatMessage, ConnectionInfo, SubjectInfo, ToolTrace } from "../types";
 import {
   STRATEGY_LABELS,
-  SUBJECT_HINTS,
-  SUBJECT_SUGGESTIONS,
+  placeholderFor,
   subjectTone,
+  suggestionsFor,
 } from "../lib";
 import {
   IconArrowRight,
@@ -51,9 +51,9 @@ export function ChatView({
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const subjectId = subject?.id ?? "math";
-  const suggestions = SUBJECT_SUGGESTIONS[subjectId] ?? [];
-  const placeholder = SUBJECT_HINTS[subjectId] ?? "Hỏi bất cứ điều gì về bài học…";
+  const subjectId = subject?.id ?? "general";
+  const suggestions = suggestionsFor(subjectId, "chat");
+  const placeholder = placeholderFor(subjectId, "chat");
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -79,11 +79,13 @@ export function ChatView({
       <header className="chat-header">
         <div className="chat-heading">
           <div className="chat-eyebrow">
-            {subject
-              ? `${STRATEGY_LABELS[subject.strategy] ?? subject.strategy} · Lớp ${grade}`
-              : `Bàn học · Lớp ${grade}`}
+            {!subject
+              ? "Hội thoại"
+              : subject.id === "general"
+                ? STRATEGY_LABELS[subject.strategy] ?? "Trợ lý tổng quát"
+                : `${STRATEGY_LABELS[subject.strategy] ?? subject.strategy} · Lớp ${grade}`}
           </div>
-          <h1 className="chat-title">{subject?.name ?? "Buổi học"}</h1>
+          <h1 className="chat-title">{subject?.name ?? "Hội thoại"}</h1>
         </div>
         <div className="chat-header-actions">
           <button className="provider-chip" onClick={onOpenSettings} title="Quản lý nhà cung cấp">
@@ -130,12 +132,16 @@ export function ChatView({
                 {subjectIcon(subjectId, 22)}
               </div>
               <div className="welcome-eyebrow">
-                {subject ? `${subject.name.toUpperCase()} · LỚP ${grade}` : "BÀN HỌC"}
+                {!subject
+                  ? "HỘI THOẠI"
+                  : subject.id === "general"
+                    ? "TRỢ LÝ TỔNG QUÁT"
+                    : `${subject.name.toUpperCase()} · LỚP ${grade}`}
               </div>
-              <h2 className="welcome-title">Một buổi học bắt đầu từ câu hỏi.</h2>
+              <h2 className="welcome-title">Bắt đầu từ bất cứ điều gì.</h2>
               <p className="welcome-copy">
-                tez hướng dẫn từng bước, dùng công cụ để tính và kiểm tra, và giữ toàn bộ dữ liệu
-                trên máy bạn.
+                tez không giới hạn môn học. Hỏi kiến thức, nhờ giải thích, lên kế hoạch hay dùng
+                công cụ để tính toán — mọi dữ liệu ở lại trên máy bạn.
               </p>
 
               {!connection && (
@@ -241,14 +247,14 @@ export function ChatView({
           </div>
         </div>
         <p className="composer-note">
-          tez có thể mắc lỗi. Kiểm tra lại bước quan trọng và đối chiếu sách giáo khoa.
+          tez có thể mắc lỗi. Kiểm tra thông tin quan trọng trước khi dùng.
         </p>
       </div>
     </main>
   );
 }
 
-function ToolTraces({ tools }: { tools: ToolTrace[] }) {
+export function ToolTraces({ tools }: { tools: ToolTrace[] }) {
   const failed = tools.filter((tool) => !tool.ok).length;
   return (
     <details className="traces">

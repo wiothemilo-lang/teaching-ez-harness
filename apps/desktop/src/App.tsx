@@ -3,6 +3,7 @@ import * as api from "./api";
 import { errorMessage } from "./api";
 import { uid } from "./lib";
 import type {
+  AppMode,
   AppStatus,
   ChatMessage,
   SettingsTab,
@@ -12,6 +13,7 @@ import type {
 } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
+import { CodeView } from "./components/CodeView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Spinner } from "./components/ui";
 import { IconCheck, IconInfo, IconRefresh, IconX } from "./icons";
@@ -20,8 +22,10 @@ export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [subject, setSubject] = useState("math");
+  const [mode, setMode] = useState<AppMode>("chat");
+  const [subject, setSubject] = useState("general");
   const [grade, setGrade] = useState("10");
+  const [workspace, setWorkspace] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -63,6 +67,12 @@ export default function App() {
   useEffect(() => {
     void refresh(true);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!workspace && status?.default_workspace) {
+      setWorkspace(status.default_workspace);
+    }
+  }, [status, workspace]);
 
   const newSession = useCallback(() => {
     setSessionId(null);
@@ -110,6 +120,12 @@ export default function App() {
     newSession();
   };
 
+  const handleMode = (next: AppMode) => {
+    if (busy || next === mode) return;
+    setMode(next);
+    newSession();
+  };
+
   const openSession = useCallback(
     async (id: string) => {
       if (busy) return;
@@ -129,7 +145,10 @@ export default function App() {
         );
         setLastUsage(null);
         const found = sessions.find((session) => session.id === id);
-        if (found?.subject) setSubject(found.subject);
+        if (found) {
+          setMode(found.mode === "code" ? "code" : "chat");
+          if (found.subject) setSubject(found.subject);
+        }
       } catch (openError) {
         notify("error", "Không mở được buổi học", errorMessage(openError));
       } finally {
@@ -160,11 +179,13 @@ export default function App() {
 
     try {
       const reply = await api.chat({
-        subject,
+        subject: mode === "code" ? "general" : subject,
         grade,
         message: text,
         session_id: sessionId,
         provider_id: status.connection.id,
+        mode,
+        workspace: mode === "code" ? workspace || null : null,
       });
       setSessionId(reply.session_id);
       setMessages((previous) => [
@@ -188,6 +209,8 @@ export default function App() {
     subject,
     grade,
     sessionId,
+    mode,
+    workspace,
     refresh,
     openSettings,
   ]);
@@ -226,10 +249,13 @@ export default function App() {
       <Sidebar
         status={status}
         sessions={sessions}
+        mode={mode}
         subject={subject}
         grade={grade}
+        workspace={workspace}
         sessionId={sessionId}
         loadingSession={loadingSession}
+        onMode={handleMode}
         onSubject={handleSubject}
         onGrade={setGrade}
         onNewSession={startNewSession}
@@ -237,21 +263,45 @@ export default function App() {
         onOpenSettings={openSettings}
       />
 
-      <ChatView
-        subject={subjectInfo}
-        grade={grade}
-        connection={status.connection}
-        messages={messages}
-        input={input}
-        busy={busy}
-        error={error}
-        loadingSession={loadingSession}
-        lastUsage={lastUsage}
-        onInput={setInput}
-        onSend={() => void send()}
-        onOpenSettings={() => openSettings("providers")}
-        onDismissError={() => setError(null)}
-      />
+      {mode === "code" ? (
+        <CodeView
+          connection={status.connection}
+          messages={messages}
+          input={input}
+          busy={busy}
+          error={error}
+          loadingSession={loadingSession}
+          lastUsage={lastUsage}
+          workspace={workspace}
+          onWorkspace={setWorkspace}
+          onOpenWorkspace={() => {
+            api.openWorkspace(workspace || null).then(
+              (info) => setWorkspace(info.path),
+              (openError) => notify("error", "Không mở được workspace", errorMessage(openError)),
+            );
+          }}
+          onInput={setInput}
+          onSend={() => void send()}
+          onOpenSettings={() => openSettings("providers")}
+          onDismissError={() => setError(null)}
+        />
+      ) : (
+        <ChatView
+          subject={subjectInfo}
+          grade={grade}
+          connection={status.connection}
+          messages={messages}
+          input={input}
+          busy={busy}
+          error={error}
+          loadingSession={loadingSession}
+          lastUsage={lastUsage}
+          onInput={setInput}
+          onSend={() => void send()}
+          onOpenSettings={() => openSettings("providers")}
+          onDismissError={() => setError(null)}
+        />
+      )}
 
       <SettingsPanel
         open={settingsOpen}

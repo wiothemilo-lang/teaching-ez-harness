@@ -12,13 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "tez — Gia sư AI",
-        "width": 1120,
-        "height": 740,
-        "minWidth": 820,
-        "minHeight": 580,
+        "title": "tez — Chat & Code",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 860,
+        "minHeight": 600,
         "resizable": true,
-        "center": true
+        "center": true,
+        "theme": "Dark",
+        "backgroundColor": "#131211"
       }
     ],
     "security": {
@@ -35,8 +37,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "Gia sư AI local-first cho học sinh",
-    "longDescription": "tez là gia sư AI chạy trên máy bạn: dạy Toán, Vật lý, Hóa học, Tiếng Anh theo từng bước, dùng tool để tính toán và kiểm tra, lưu dữ liệu local.",
-    "category": "Education"
+    "shortDescription": "Chat và code agent local-first",
+    "longDescription": "tez là workspace AI local-first: một phần Chat tổng quát không giới hạn môn học, một phần Code đọc/sửa file và chạy lệnh trong workspace. Dữ liệu và API key nằm trên máy bạn.",
+    "category": "DeveloperTool",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Vietnamese", "English"]
+      }
+    }
   }
 }

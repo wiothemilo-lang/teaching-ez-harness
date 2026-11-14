@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use tez_llm::Message;
 
+use crate::modes::{code_system_prompt, Mode};
 use crate::subjects::SubjectPack;
 
 /// Dữ liệu đầu vào để build context cho một lượt agent.
@@ -13,6 +16,28 @@ pub struct ContextInput<'a> {
     pub recent: &'a [Message],
     /// Skill đã render sẵn (xem [`crate::skills::render`]).
     pub skills: &'a [String],
+    /// Chế độ làm việc; mặc định là `Chat`.
+    pub mode: Mode,
+    /// Thư mục làm việc, chỉ dùng ở chế độ Code.
+    pub workspace: Option<&'a str>,
+}
+
+impl<'a> ContextInput<'a> {
+    /// Context chat tối thiểu, dùng trong test và các call site cũ.
+    pub fn chat(subject: &'a SubjectPack, grade: &'a str, recent: &'a [Message]) -> Self {
+        Self {
+            subject,
+            grade,
+            objectives: &[],
+            excerpts: &[],
+            student_summary: None,
+            state: "chat",
+            recent,
+            skills: &[],
+            mode: Mode::Chat,
+            workspace: None,
+        }
+    }
 }
 
 /// Build messages theo cấu trúc: system + context + recent turns.
@@ -23,32 +48,50 @@ pub struct ContextBuilder;
 impl ContextBuilder {
     pub fn build(&self, input: ContextInput<'_>) -> Vec<Message> {
         let mut system = String::new();
-        system.push_str(&format!(
-            "Bạn là gia sư môn {} cho học sinh lớp {}. Trả lời bằng tiếng Việt, ngắn gọn, đúng trình độ.\n",
-            input.subject.name, input.grade
-        ));
-        system.push_str(
-            "Nguyên tắc: hướng dẫn từng bước, hỏi lại khi cần, không đưa đáp án cuối trước khi học sinh thử. \
-             Nếu dùng tài liệu, hãy trích dẫn nguồn. Nếu không chắc, nói rõ là không chắc. \
-             Khi cần tính toán hoặc kiểm tra, hãy dùng tool thay vì tính nhẩm.\n",
-        );
-        system.push_str(&format!("\n{}\n", input.subject.system_prompt()));
-
-        if !input.objectives.is_empty() {
-            system.push_str("\nMục tiêu bài học:\n");
-            for objective in input.objectives {
-                system.push_str(&format!("- {objective}\n"));
+        match input.mode {
+            Mode::Code => {
+                let workspace = input.workspace.unwrap_or(".");
+                system.push_str(&code_system_prompt(Path::new(workspace)));
+                system.push('\n');
+            }
+            Mode::Chat if input.subject.is_general() => {
+                system.push_str(&input.subject.system_prompt());
+                system.push_str(
+                    "\nNguyên tắc chung: trả lời đúng trọng tâm, nói rõ khi không chắc, \
+                     không bịa nguồn. Khi cần tính toán hoặc kiểm tra, dùng tool thay vì tính nhẩm.\n",
+                );
+            }
+            Mode::Chat => {
+                system.push_str(&format!(
+                    "Bạn là gia sư môn {} cho học sinh lớp {}. Trả lời bằng tiếng Việt, ngắn gọn, đúng trình độ.\n",
+                    input.subject.name, input.grade
+                ));
+                system.push_str(
+                    "Nguyên tắc: hướng dẫn từng bước, hỏi lại khi cần, không đưa đáp án cuối trước khi học sinh thử. \
+                     Nếu dùng tài liệu, hãy trích dẫn nguồn. Nếu không chắc, nói rõ là không chắc. \
+                     Khi cần tính toán hoặc kiểm tra, hãy dùng tool thay vì tính nhẩm.\n",
+                );
+                system.push_str(&format!("\n{}\n", input.subject.system_prompt()));
             }
         }
 
-        system.push_str(&format!("\nTrạng thái phiên học: {}\n", input.state));
+        if input.mode == Mode::Chat {
+            if !input.objectives.is_empty() {
+                system.push_str("\nMục tiêu bài học:\n");
+                for objective in input.objectives {
+                    system.push_str(&format!("- {objective}\n"));
+                }
+            }
 
-        if let Some(summary) = input.student_summary {
-            system.push_str(&format!("\nHồ sơ học sinh:\n{summary}\n"));
+            system.push_str(&format!("\nTrạng thái phiên học: {}\n", input.state));
+
+            if let Some(summary) = input.student_summary {
+                system.push_str(&format!("\nHồ sơ học sinh:\n{summary}\n"));
+            }
         }
 
         if !input.skills.is_empty() {
-            system.push_str("\nKỹ năng đang bật (là chỉ dẫn sư phạm, hãy áp dụng khi phù hợp):\n");
+            system.push_str("\nKỹ năng đang bật (là chỉ dẫn bổ sung, hãy áp dụng khi phù hợp):\n");
             for skill in input.skills {
                 system.push_str(skill);
                 system.push('\n');
@@ -77,7 +120,7 @@ impl ContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subjects::MATH;
+    use crate::subjects::{GENERAL, MATH};
 
     #[test]
     fn includes_objectives_and_recent_turns() {
@@ -94,6 +137,8 @@ mod tests {
             state: "practice",
             recent: &recent,
             skills: &["<skill name=\"test\">step</skill>".to_string()],
+            mode: Mode::Chat,
+            workspace: None,
         });
 
         assert_eq!(messages.len(), 2);
@@ -104,5 +149,36 @@ mod tests {
         assert!(system.contains("socratic"));
         assert!(system.contains("<skill name=\"test\">"));
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn general_mode_does_not_force_a_subject() {
+        let messages = ContextBuilder.build(ContextInput::chat(
+            &GENERAL,
+            "10",
+            &[Message::user("Xin chào")],
+        ));
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(!system.contains("gia sư môn"));
+        assert!(system.contains("trợ lý AI local-first"));
+    }
+
+    #[test]
+    fn code_mode_uses_workspace_prompt() {
+        let messages = ContextBuilder.build(ContextInput {
+            subject: &GENERAL,
+            grade: "",
+            objectives: &[],
+            excerpts: &[],
+            student_summary: None,
+            state: "",
+            recent: &[Message::user("Sửa lỗi build")],
+            skills: &[],
+            mode: Mode::Code,
+            workspace: Some("/tmp/demo-project"),
+        });
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(system.contains("/tmp/demo-project"));
+        assert!(system.contains("trợ lý lập trình"));
     }
 }

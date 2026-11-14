@@ -1,4 +1,6 @@
-export type SettingsTab = "providers" | "skills" | "mcp" | "plugins" | "data";
+export type SettingsTab = "providers" | "skills" | "mcp" | "plugins" | "update" | "data";
+
+export type AppMode = "chat" | "code";
 
 export type SubjectInfo = {
   id: string;
@@ -37,8 +39,30 @@ export type AppStatus = {
   subjects: SubjectInfo[];
   sessions: number;
   data_dir: string;
+  default_workspace: string;
   version: string;
   extensions: ExtensionSummary;
+};
+
+export type UpdateAsset = {
+  name: string;
+  url: string;
+  size: number;
+};
+
+export type UpdateInfo = {
+  current: string;
+  latest: string;
+  available: boolean;
+  notes: string;
+  url: string;
+  published_at: string | null;
+  assets: UpdateAsset[];
+};
+
+export type DownloadUpdateResult = {
+  path: string;
+  version: string;
 };
 
 export type ToolTrace = {
@@ -69,6 +93,7 @@ export type ChatMessage = {
 export type SessionInfo = {
   id: string;
   subject: string | null;
+  mode: string;
   state: string;
   messages: number;
   started_at: string;
@@ -161,6 +186,8 @@ export type ChatPayload = {
   message: string;
   session_id: string | null;
   provider_id: string | null;
+  mode: AppMode;
+  workspace: string | null;
 };
 
 export type ToastKind = "success" | "error" | "info";

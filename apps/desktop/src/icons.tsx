@@ -272,8 +272,48 @@ export function IconEyeOff(props: IconProps) {
   );
 }
 
+export function IconChat(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <path d="M20 12a7.5 7.5 0 0 1-7.5 7.5H5.5L3 21v-9a7.5 7.5 0 0 1 7.5-7.5H12A7.5 7.5 0 0 1 20 12z" />
+      <path d="M8 10h8M8 13.5h5" />
+    </Glyph>
+  );
+}
+
+export function IconCode(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <path d="m8.5 8-4.5 4 4.5 4" />
+      <path d="m15.5 8 4.5 4-4.5 4" />
+      <path d="m13.5 5-3 14" />
+    </Glyph>
+  );
+}
+
+export function IconDownload(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <path d="M12 4v11" />
+      <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+      <path d="M5 20h14" />
+    </Glyph>
+  );
+}
+
+export function IconSparkle(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <path d="M12 3.5 13.6 9l5.4 1.6-5.4 1.6L12 17.5l-1.6-5.3L5 10.6 10.4 9z" />
+      <path d="M18.5 16.5 19.2 19l2.3.7-2.3.8-.7 2.5-.7-2.5-2.3-.8 2.3-.7z" />
+    </Glyph>
+  );
+}
+
 export function subjectIcon(id: string, size = 18) {
   switch (id) {
+    case "general":
+      return <IconSparkle size={size} />;
     case "math":
       return <IconSigma size={size} />;
     case "physics":
