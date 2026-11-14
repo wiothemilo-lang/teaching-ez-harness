@@ -525,7 +525,7 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions
              SET state = 'failed', ended_at = datetime('now')
-             WHERE id = ?1 AND state = 'active'",
+             WHERE id = ?1 AND state IN ('intake', 'active')",
             params![session_id],
         )?;
         Ok(())
@@ -1027,7 +1027,7 @@ mod tests {
                 tokens_out: 0,
             })
             .unwrap();
-        store.resume_session(&used).unwrap();
+        // Session mới vẫn ở trạng thái intake khi lượt chat lỗi.
         store.abandon_session(&used).unwrap();
         let row = store.get_session(&used).unwrap().unwrap();
         assert_eq!(row.state, "failed");
