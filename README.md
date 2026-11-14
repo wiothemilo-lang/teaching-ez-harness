@@ -17,6 +17,41 @@ Harness local-first để biến model AI của bạn thành **gia sư có tool,
 - **Môn:** Toán, Vật lý, Hóa học, Tiếng Anh
 - **Provider:** mọi endpoint OpenAI-compatible (Groq, OpenRouter, OpenAI, Gemini, Ollama, custom)
 
+## Cài đặt (Linux)
+
+Cài cho user hiện tại, không cần `sudo`:
+
+```bash
+./scripts/install-local.sh
+```
+
+Script build bản release rồi cài:
+
+| Thành phần | Vị trí |
+|---|---|
+| CLI `tez` | `~/.local/bin/tez` |
+| Desktop | `~/.local/opt/tez/` — mở từ menu **tez — Gia sư AI** |
+| Desktop entry | `~/.local/share/applications/tez.desktop` |
+| Icon | `~/.local/share/icons/hicolor/512x512/apps/tez.png` |
+
+Yêu cầu build: Rust stable, Node + pnpm, WebKitGTK/GTK3 dev packages.
+
+Chạy trực tiếp AppImage vừa build (không cần cài):
+
+```bash
+./apps/desktop/src-tauri/target/release/bundle/appimage/tez_0.1.0_amd64.AppImage
+```
+
+Gỡ cài đặt:
+
+```bash
+rm -rf ~/.local/opt/tez ~/.local/bin/tez \
+  ~/.local/share/applications/tez.desktop \
+  ~/.local/share/icons/hicolor/512x512/apps/tez.png
+```
+
+Dữ liệu học tập nằm ở `~/.local/share/teaching-ez/`; xóa thêm thư mục đó nếu muốn xóa toàn bộ session, tài liệu và key.
+
 ## Trạng thái hiện tại
 
 Đã chạy được vertical slice:
@@ -136,7 +171,7 @@ crates/
 apps/
   desktop/      React + Vite + Tauri 2
 docs/           kế hoạch, kiến trúc, provider auth, disk policy
-scripts/        disk guard, build/test/desktop wrappers
+scripts/        disk guard, build/test/desktop/install wrappers
 ```
 
 Dữ liệu người dùng nằm ở `~/.local/share/teaching-ez/`:
@@ -172,6 +207,8 @@ scripts/desktop.sh check           # build frontend + cargo check/clippy
 scripts/desktop.sh appimage        # đóng gói AppImage (release)
 scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 ```
+
+**Sử dụng:** mở **tez — Gia sư AI** từ menu → bấm **Cài đặt** → chọn provider → dán API key (để trống nếu dùng Ollama) → **Lưu & kiểm tra** → chọn môn/lớp và nhập câu hỏi.
 
 Giao diện hiện có: chọn môn/lớp, chat nhiều lượt, xem tool call (args/kết quả/thời gian), session mới, **lịch sử phiên** (bấm để tải lại), **cài đặt provider** (Groq, Gemini, OpenRouter, OpenAI, Ollama, custom) kèm nút lưu + kiểm tra kết nối.
 
