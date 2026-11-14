@@ -1,0 +1,26 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+**/node_modules/
+dist/
+.pnpm-store/
+
+# Env / secrets
+.env
+.env.*
+*.key
+master.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# App data (không commit)
+*.db
+*.db-wal
+*.db-shm
