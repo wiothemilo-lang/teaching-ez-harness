@@ -28,10 +28,33 @@ pub enum ConnectionError {
     Vault(#[from] VaultError),
     #[error("provider 'custom' cần base_url")]
     MissingBaseUrl,
-    #[error("provider '{0}' không tồn tại")]
+    #[error(
+        "provider '{0}' không hỗ trợ (chọn: groq, openrouter, openai, gemini, ollama, custom)"
+    )]
     ProviderNotFound(String),
     #[error("API key đã lưu không phải UTF-8")]
     InvalidKeyEncoding,
+}
+
+/// Các provider OpenAI-compatible được hỗ trợ sẵn.
+pub const KNOWN_PROVIDERS: &[&str] =
+    &["groq", "openrouter", "openai", "gemini", "ollama", "custom"];
+
+/// Kiểm tra tên provider có nằm trong danh sách hỗ trợ.
+pub fn is_known_provider(provider: &str) -> bool {
+    let provider = provider.trim().to_lowercase();
+    KNOWN_PROVIDERS.contains(&provider.as_str())
+}
+
+/// Chặn tên provider lạ để không âm thầm gửi key tới endpoint mặc định.
+pub fn validate_provider(provider: &str) -> Result<(), ConnectionError> {
+    if is_known_provider(provider) {
+        Ok(())
+    } else {
+        Err(ConnectionError::ProviderNotFound(
+            provider.trim().to_string(),
+        ))
+    }
 }
 
 /// Tên hiển thị mặc định cho từng loại provider.
@@ -93,6 +116,7 @@ pub fn save(
     api_key: &str,
 ) -> Result<ConnectionFile, ConnectionError> {
     let dir = dir.as_ref();
+    validate_provider(provider)?;
     let base_url = match base_url.map(str::trim).filter(|value| !value.is_empty()) {
         Some(url) => url.to_string(),
         None if provider == "custom" => return Err(ConnectionError::MissingBaseUrl),
@@ -163,6 +187,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = save(dir.path(), "custom", None, None, "").unwrap_err();
         assert!(matches!(error, ConnectionError::MissingBaseUrl));
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = save(dir.path(), "bogus", None, None, "sk-secret").unwrap_err();
+        assert!(matches!(error, ConnectionError::ProviderNotFound(_)));
+        assert!(!path(dir.path()).exists());
+
+        assert!(is_known_provider("Groq"));
+        assert!(is_known_provider(" custom "));
+        assert!(!is_known_provider("bogus"));
+        assert!(validate_provider("openai").is_ok());
     }
 
     #[test]

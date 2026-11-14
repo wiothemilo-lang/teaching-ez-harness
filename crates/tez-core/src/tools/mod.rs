@@ -12,6 +12,7 @@ pub mod calculator;
 pub mod check_grammar;
 pub mod check_step;
 pub mod chem;
+pub mod compact;
 pub mod convert_units;
 pub mod molar_mass;
 pub mod physics_formula;
@@ -54,7 +55,38 @@ impl ToolOutput {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Thời gian tối đa cho một lần chạy; tool dài như `run_command` có thể ghi đè.
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
     async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError>;
+}
+
+/// Giới hạn đầu vào để parser đệ quy không tràn stack với input do model/người dùng sinh.
+pub const MAX_INPUT_LEN: usize = 4096;
+pub const MAX_NESTING_DEPTH: usize = 64;
+
+/// Chặn input quá dài hoặc lồng ngoặc quá sâu trước khi đưa vào parser đệ quy.
+pub fn check_input_bounds(input: &str) -> Result<(), String> {
+    if input.len() > MAX_INPUT_LEN {
+        return Err(format!("đầu vào quá dài (tối đa {MAX_INPUT_LEN} ký tự)"));
+    }
+    let mut depth = 0usize;
+    for ch in input.chars() {
+        match ch {
+            '(' | '[' | '{' => {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(format!(
+                        "lồng ngoặc quá sâu (tối đa {MAX_NESTING_DEPTH} cấp)"
+                    ));
+                }
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default, Clone)]
@@ -113,7 +145,51 @@ pub fn code_registry(root: impl AsRef<Path>) -> Result<ToolRegistry, ToolError> 
     let mut registry = ToolRegistry::new();
     registry.register(workspace::ReadFile::new(workspace.clone()));
     registry.register(workspace::WriteFile::new(workspace.clone()));
+    registry.register(workspace::EditFile::new(workspace.clone()));
     registry.register(workspace::ListFiles::new(workspace.clone()));
+    registry.register(workspace::GlobFiles::new(workspace.clone()));
+    registry.register(workspace::GrepFiles::new(workspace.clone()));
     registry.register(workspace::RunCommand::new(workspace));
+    registry.register(compact::Compact);
     Ok(registry)
+}
+
+/// Tên tool của chế độ Code, dùng cho prompt và kiểm tra.
+pub const CODE_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_files",
+    "glob",
+    "grep",
+    "run_command",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_normal_expression() {
+        assert!(check_input_bounds("(3 + 5) * 2").is_ok());
+        assert!(check_input_bounds("H2O").is_ok());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_input() {
+        let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(check_input_bounds(&deep).is_err());
+        let at_limit = format!(
+            "{}1{}",
+            "(".repeat(MAX_NESTING_DEPTH),
+            ")".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(check_input_bounds(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn rejects_overlong_input() {
+        let long = "1+".repeat(MAX_INPUT_LEN);
+        assert!(check_input_bounds(&long).is_err());
+    }
 }

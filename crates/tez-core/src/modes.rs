@@ -15,9 +15,15 @@ pub enum Mode {
 impl Mode {
     /// Parse từ chuỗi người dùng/DB. Giá trị lạ rơi về `Chat`.
     pub fn parse(value: &str) -> Self {
+        Self::try_parse(value).unwrap_or_default()
+    }
+
+    /// Parse chặt: trả `None` với giá trị không được hỗ trợ (dùng để báo lỗi CLI).
+    pub fn try_parse(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {
-            "code" | "coding" | "dev" => Self::Code,
-            _ => Self::Chat,
+            "chat" => Some(Self::Chat),
+            "code" | "coding" | "dev" => Some(Self::Code),
+            _ => None,
         }
     }
 
@@ -37,7 +43,21 @@ impl Mode {
 }
 
 /// Tool được phép dùng trong chế độ Code.
-pub const CODE_TOOLS: &[&str] = &["read_file", "write_file", "list_files", "run_command"];
+pub const CODE_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_files",
+    "glob",
+    "grep",
+    "run_command",
+    "todo_write",
+    "task",
+    "compact",
+    "memory_save",
+    "memory_search",
+    "memory_forget",
+];
 
 /// Prompt system cho trợ lý lập trình, gắn với một workspace cụ thể.
 pub fn code_system_prompt(workspace: &Path) -> String {
@@ -48,7 +68,9 @@ pub fn code_system_prompt(workspace: &Path) -> String {
          - Trả lời bằng tiếng Việt, ngắn gọn; code và tên định danh giữ nguyên tiếng Anh.\n\
          - Luôn đọc file liên quan trước khi sửa. Không đoán nội dung file.\n\
          - Ưu tiên thay đổi nhỏ, đúng phong cách code xung quanh; không refactor ngoài phạm vi yêu cầu.\n\
-         - Dùng read_file/list_files để khảo sát, write_file để ghi, run_command để build/test.\n\
+         - Dùng read_file/list_files/glob/grep để khảo sát, edit_file để sửa chính xác, write_file khi tạo file mới, run_command để build/test.\n\
+         - Với việc nhiều bước, gọi todo_write để lập kế hoạch và cập nhật trạng thái.\n\
+         - Khi cần khảo sát nhiều file hoặc tách một nhánh công việc, dùng task để giao cho subagent.\n\
          - Chỉ thao tác trong workspace. Không đọc hoặc ghi file nằm ngoài workspace.\n\
          - Không chạy lệnh phá hủy (rm -rf, format, drop database, git push --force) khi chưa được yêu cầu rõ ràng.\n\
          - Không đưa bí mật, API key hoặc token vào code, log hay câu trả lời.\n\
@@ -69,6 +91,9 @@ mod tests {
         assert_eq!(Mode::parse(""), Mode::Chat);
         assert_eq!(Mode::default(), Mode::Chat);
         assert_eq!(Mode::Code.as_str(), "code");
+        assert_eq!(Mode::try_parse("code"), Some(Mode::Code));
+        assert_eq!(Mode::try_parse("chat"), Some(Mode::Chat));
+        assert_eq!(Mode::try_parse("bogus"), None);
     }
 
     #[test]

@@ -5,6 +5,8 @@ import type {
   ChatReply,
   ConnectionTest,
   ExtensionsInfo,
+  HarnessConfig,
+  HarnessInfo,
   McpTest,
   PluginInfo,
   ProviderInfo,
@@ -30,6 +32,22 @@ export function loadSession(sessionId: string): Promise<SessionDetail> {
 
 export function chat(payload: ChatPayload): Promise<ChatReply> {
   return invoke("chat", { request: payload });
+}
+
+export function respondApproval(id: string, approved: boolean): Promise<boolean> {
+  return invoke("respond_approval", { request: { id, approved } });
+}
+
+export function getHarness(): Promise<HarnessInfo> {
+  return invoke("get_harness");
+}
+
+export function saveHarness(config: HarnessConfig): Promise<HarnessInfo> {
+  return invoke("save_harness", { config });
+}
+
+export function deleteMemory(name: string): Promise<boolean> {
+  return invoke("delete_memory", { request: { name } });
 }
 
 export function listProviders(): Promise<ProviderInfo[]> {

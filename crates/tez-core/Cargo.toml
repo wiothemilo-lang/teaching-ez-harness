@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 evalexpr.workspace = true
+glob.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tez-llm = { path = "../tez-llm" }

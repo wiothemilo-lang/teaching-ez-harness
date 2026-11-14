@@ -77,11 +77,14 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Thành phần | Trạng thái |
 |---|---|
 | Rust workspace (`tez-llm`, `tez-core`, `tez-store`, `tez-auth`, `tez-update`, `tez-cli`) | ✅ |
-| Agent loop: tool call, timeout 60s, cap output 8KB, tối đa 8 bước | ✅ |
+| Agent loop: tool call, timeout 60s, cap output 8KB, tối đa 12 bước (chỉnh được) | ✅ |
 | Chat tổng quát (không giới hạn môn) + 4 preset Toán/Lý/Hóa/Anh | ✅ |
-| Chế độ Code: `read_file`, `write_file`, `list_files`, `run_command` trong workspace | ✅ |
+| Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
+| Harness: permission pipeline 4 mức, approval desktop/CLI, hook audit + che bí mật | ✅ |
+| Harness: todo plan, subagent `task`, compaction 4 bước, memory dài hạn | ✅ |
+| `harness.json` + tab **Cài đặt → Harness** (quyền, giới hạn, nén, memory, hook) | ✅ |
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
-| SQLite: session (kèm mode), message, tool call, token usage | ✅ |
+| SQLite: session (kèm mode), message, tool call, todo, token usage | ✅ |
 | Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
 | Skills Markdown: 4 built-in, khớp môn + từ khóa, chèn vào context | ✅ |
 | MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace | ✅ |
@@ -89,11 +92,11 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
 | Vault AES-256-GCM cho API key | ✅ |
-| `tez connect`, `test`, `chat`, `update`, `doctor`, `subject`, `sessions`, `usage`, `doc`, `tools`, `provider`, `skills`, `mcp`, `plugins` | ✅ |
+| `tez connect`, `test`, `chat`, `update`, `doctor`, `subject`, `sessions`, `usage`, `doc`, `tools`, `provider`, `skills`, `mcp`, `plugins`, `memory`, `harness` | ✅ |
 | Disk quota + cleanup (`scripts/disk-guard.sh`) | ✅ |
 | RAG PDF/DOCX, context inspector | ⏳ |
-| Tauri desktop: hai chế độ Chat/Code, tool trace, lịch sử phiên | ✅ |
-| Desktop: giao diện tối kiểu Claude Code, quản lý provider, skills/MCP/plugin, dữ liệu | ✅ |
+| Tauri desktop: hai chế độ Chat/Code, tool trace, lịch sử phiên, todo/context dock | ✅ |
+| Desktop: giao diện tối kiểu Claude Code, quản lý provider, skills/MCP/plugin, harness, dữ liệu | ✅ |
 | Kiểm tra + tải cập nhật từ GitHub Releases (desktop & CLI) | ✅ |
 | Đóng gói AppImage Linux + installer Windows (NSIS/MSI) | ✅ |
 
@@ -139,6 +142,16 @@ Binary: `target/debug/tez`
 # Chế độ Code trong một workspace
 ./target/debug/tez chat --mode code --workspace ~/du-an "Đọc cấu trúc và tìm lỗi build"
 ./target/debug/tez chat --mode code --workspace ~/du-an
+
+# Harness: xem cấu hình, duyệt tự động, giới hạn bước, chế độ chỉ đọc
+./target/debug/tez harness
+./target/debug/tez chat --yes "Chạy test và sửa lỗi"
+./target/debug/tez chat --permission read_only "Giải thích kiến trúc repo"
+./target/debug/tez chat --max-steps 20 --no-memory "Tiếp tục việc còn dở"
+
+# Bộ nhớ dài hạn
+./target/debug/tez memory list
+./target/debug/tez memory search "quy ước build"
 
 # Kiểm tra / tải cập nhật
 ./target/debug/tez update
@@ -227,7 +240,7 @@ Chi tiết định dạng file và bảo mật: [docs/EXTENSIONS.md](docs/EXTENS
 ./target/debug/tez subject show chemistry
 ```
 
-Pack `general` là mặc định và không giới hạn chủ đề. Bốn pack Toán/Lý/Hóa/Anh là preset: mỗi pack khai báo prompt sư phạm, chiến lược dạy và allowlist tool. Ở chế độ Chat, agent dùng tool của pack đang chọn; ở chế độ Code, agent dùng bốn tool workspace.
+Pack `general` là mặc định và không giới hạn chủ đề. Bốn pack Toán/Lý/Hóa/Anh là preset: mỗi pack khai báo prompt sư phạm, chiến lược dạy và allowlist tool. Ở chế độ Chat, agent dùng tool của pack đang chọn; ở chế độ Code, agent dùng bộ tool workspace (`read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`) cùng `todo_write`, `task`, `compact` và memory.
 
 ## Cấu trúc
 
@@ -249,12 +262,16 @@ scripts/        disk guard, build/test/desktop/install wrappers
 
 Dữ liệu người dùng nằm ở `~/.local/share/teaching-ez/`:
 
-- `tez.db` — session, message, tool call, usage, tài liệu + FTS5 index
+- `tez.db` — session, message, tool call, todo, usage, tài liệu + FTS5 index
 - `providers.json` — sổ nhiều provider + provider đang dùng
 - `connection.json` — bản đồng bộ của provider active (tương thích CLI cũ)
 - `mcp.json` — cấu hình MCP server
 - `skills/` — skill Markdown của user
 - `plugins/` — plugin local
+- `harness.json` — permission mode, giới hạn agent, compaction, memory, hook
+- `memory/` — bộ nhớ dài hạn (mỗi bản ghi một file Markdown + `MEMORY.md`)
+- `audit.jsonl` — audit log tool call và lần kết thúc phiên
+- `sessions/<id>/` — artifact của compaction (tool result lớn, transcript)
 - `master.key` — khóa vault (quyền 0600)
 
 ## Dung lượng
@@ -290,7 +307,10 @@ scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar có công tắc **Chat / Code**; mỗi chế độ có phiên riêng.
 
 - **Chat:** trợ lý tổng quát, không bắt chọn môn. Preset môn/lớp vẫn có nếu muốn; tool trace có args/kết quả/thời gian, token usage.
-- **Code:** nhập hoặc mở workspace; agent dùng `read_file`, `write_file`, `list_files`, `run_command` và bị giới hạn trong thư mục đó.
+- **Code:** nhập hoặc mở workspace; agent dùng `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `todo_write`, `task`, `compact` và bị giới hạn trong thư mục đó.
+- **Duyệt thao tác:** khi permission mode yêu cầu, app hiện hộp thoại kèm lý do, tool và args JSON; chọn **Từ chối** hoặc **Cho phép chạy**.
+- **Dock harness:** ngay trên ô nhập, hiện kế hoạch todo, thanh context so với giới hạn, số lượt nén và số thao tác bị chặn.
+- **Cài đặt → Harness:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), giới hạn bước/token/nhiệt độ, bật/tắt compaction, memory, quản lý hook shell và xoá bản ghi memory.
 - **Cài đặt → Nhà cung cấp:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
 - **Cài đặt → Kỹ năng:** xem skill, môn, từ khóa, nội dung Markdown, mở thư mục.
 - **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool.
@@ -319,6 +339,8 @@ Chạy không cần FUSE:
 - Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.
 - Skill khớp từ khóa đơn giản, tối đa 2 skill mỗi lượt.
 - Code mode giới hạn đường dẫn ở tầng ứng dụng, chưa phải sandbox OS; `run_command` chạy bằng quyền của user.
+- Permission pipeline và hook là lớp kiểm soát của app, không thay thế sandbox hệ điều hành; deny-list chỉ chặn các mẫu phá hủy rõ ràng.
+- Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu).
 - Cập nhật không tự động cài: người dùng bấm tải rồi chạy installer.
 - Installer Windows có trong workflow release nhưng chưa được ký số (SmartScreen có thể cảnh báo).
 - Chưa có sync đa máy; dữ liệu nằm trên máy bạn.

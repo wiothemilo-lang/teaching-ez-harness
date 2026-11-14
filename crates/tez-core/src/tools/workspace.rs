@@ -142,11 +142,13 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Đọc một file text trong workspace. Luôn dùng trước khi sửa file.".into(),
+            description: "Đọc một file text trong workspace. Luôn dùng trước khi sửa file. Có thể truyền offset/limit để đọc một đoạn theo dòng.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Đường dẫn tương đối trong workspace" }
+                    "path": { "type": "string", "description": "Đường dẫn tương đối trong workspace" },
+                    "offset": { "type": "integer", "minimum": 1, "description": "Dòng bắt đầu (1-based)" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Số dòng tối đa" }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -174,7 +176,38 @@ impl Tool for ReadFile {
         }
 
         match tokio::fs::read_to_string(&path).await {
-            Ok(content) => Ok(ToolOutput::ok(content)),
+            Ok(content) => {
+                let offset = args
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.clamp(1, 2_000) as usize);
+                if offset == 1 && limit.is_none() {
+                    return Ok(ToolOutput::ok(content));
+                }
+                let lines: Vec<&str> = content.lines().collect();
+                if offset > lines.len() && !lines.is_empty() {
+                    return Ok(ToolOutput::error(format!(
+                        "offset {offset} vượt quá số dòng ({})",
+                        lines.len()
+                    )));
+                }
+                let end = limit
+                    .map(|limit| (offset - 1 + limit).min(lines.len()))
+                    .unwrap_or(lines.len());
+                let slice = lines
+                    .get(offset.saturating_sub(1)..end)
+                    .unwrap_or_default()
+                    .join("\n");
+                Ok(ToolOutput::ok(format!(
+                    "[dòng {offset}-{end}/{}]\n{slice}",
+                    lines.len()
+                )))
+            }
             Err(error) => Ok(ToolOutput::error(format!(
                 "không đọc được file dạng text: {error}"
             ))),
@@ -229,6 +262,97 @@ impl Tool for WriteFile {
             Ok(()) => Ok(ToolOutput::ok(format!(
                 "đã ghi {} byte vào {}",
                 content.len(),
+                self.workspace.display(&path)
+            ))),
+            Err(error) => Ok(ToolOutput::error(format!("không ghi được file: {error}"))),
+        }
+    }
+}
+
+/// Thay thế chính xác một đoạn text trong file; bắt buộc khớp duy nhất.
+pub struct EditFile {
+    workspace: Workspace,
+}
+
+impl EditFile {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for EditFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "edit_file".into(),
+            description: "Thay một đoạn text chính xác trong file. Mặc định đoạn cũ phải xuất hiện đúng một lần; dùng replace_all nếu muốn thay mọi lần. An toàn hơn write_file vì không ghi đè cả file."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Đường dẫn tương đối trong workspace" },
+                    "old_string": { "type": "string", "description": "Đoạn text cũ cần thay, giữ nguyên thụt lề" },
+                    "new_string": { "type": "string", "description": "Đoạn text mới" },
+                    "replace_all": { "type": "boolean", "description": "Thay mọi lần xuất hiện" }
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let path = self.workspace.resolve(required_str(&args, "path")?)?;
+        let old_string = required_str(&args, "old_string")?;
+        let new_string = required_str(&args, "new_string")?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if old_string.is_empty() {
+            return Ok(ToolOutput::error("old_string không được rỗng"));
+        }
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) => return Ok(ToolOutput::error(format!("không đọc được file: {error}"))),
+        };
+        if metadata.len() > MAX_READ_BYTES {
+            return Ok(ToolOutput::error(format!(
+                "file quá lớn để sửa an toàn ({} byte, giới hạn {} byte)",
+                metadata.len(),
+                MAX_READ_BYTES
+            )));
+        }
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(error) => {
+                return Ok(ToolOutput::error(format!(
+                    "không đọc được file dạng text: {error}"
+                )))
+            }
+        };
+        let count = content.matches(old_string).count();
+        if count == 0 {
+            return Ok(ToolOutput::error(
+                "không tìm thấy old_string trong file; hãy đọc lại file và dùng đúng ngữ cảnh",
+            ));
+        }
+        if count > 1 && !replace_all {
+            return Ok(ToolOutput::error(format!(
+                "old_string xuất hiện {count} lần; thêm ngữ cảnh để khớp duy nhất hoặc đặt replace_all=true"
+            )));
+        }
+
+        let updated = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+        match tokio::fs::write(&path, updated).await {
+            Ok(()) => Ok(ToolOutput::ok(format!(
+                "đã thay {count} lần trong {}",
                 self.workspace.display(&path)
             ))),
             Err(error) => Ok(ToolOutput::error(format!("không ghi được file: {error}"))),
@@ -324,6 +448,238 @@ fn walk(workspace: &Workspace, dir: &Path, depth: usize, out: &mut Vec<String>) 
     }
 }
 
+/// Tìm file theo glob pattern, ví dụ `src/**/*.rs`.
+pub struct GlobFiles {
+    workspace: Workspace,
+}
+
+impl GlobFiles {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for GlobFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "glob".into(),
+            description: "Tìm file trong workspace theo glob pattern (`*`, `**`, `?`, `[...]`), ví dụ `src/**/*.ts`. Bỏ qua node_modules/target/.git."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob pattern tương đối với workspace" },
+                    "path": { "type": "string", "description": "Thư mục bắt đầu, mặc định '.'" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 300 }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let pattern_text = required_str(&args, "pattern")?;
+        let pattern = glob::Pattern::new(pattern_text)
+            .map_err(|error| ToolError::InvalidArgs(format!("glob không hợp lệ: {error}")))?;
+        let base = self
+            .workspace
+            .resolve(optional_str(&args, "path").unwrap_or("."))?;
+        if !base.is_dir() {
+            return Ok(ToolOutput::error("path không phải thư mục"));
+        }
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(1, 300) as usize;
+
+        let mut files = Vec::new();
+        walk_files(&base, 0, &mut files);
+        let mut matches: Vec<String> = files
+            .into_iter()
+            .filter_map(|path| {
+                let rel = path
+                    .strip_prefix(self.workspace.root())
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let file_name = path.file_name()?.to_string_lossy();
+                (pattern.matches(&rel) || pattern.matches(file_name.as_ref())).then_some(rel)
+            })
+            .collect();
+        matches.sort();
+        matches.dedup();
+        if matches.is_empty() {
+            return Ok(ToolOutput::ok("(không có file khớp)"));
+        }
+        let total = matches.len();
+        matches.truncate(limit);
+        let mut text = matches.join("\n");
+        if total > limit {
+            text.push_str(&format!(
+                "\n… (còn {} file, tăng limit để xem thêm)",
+                total - limit
+            ));
+        }
+        cap_text(&mut text);
+        Ok(ToolOutput::ok(text))
+    }
+}
+
+/// Tìm text trong file bằng regex.
+pub struct GrepFiles {
+    workspace: Workspace,
+}
+
+impl GrepFiles {
+    pub fn new(workspace: Workspace) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for GrepFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "grep".into(),
+            description: "Tìm dòng khớp regex trong các file text của workspace. Trả về `đường_dẫn:dòng: nội_dung`. Dùng để định vị symbol trước khi đọc file."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Regex cần tìm" },
+                    "path": { "type": "string", "description": "Thư mục/file bắt đầu, mặc định '.'" },
+                    "include": { "type": "string", "description": "Glob lọc file, ví dụ `*.rs` hoặc `src/**/*.ts`" },
+                    "ignore_case": { "type": "boolean", "description": "Không phân biệt hoa thường" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 300 }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let pattern_text = required_str(&args, "pattern")?;
+        let ignore_case = args
+            .get("ignore_case")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let regex = regex::RegexBuilder::new(pattern_text)
+            .case_insensitive(ignore_case)
+            .build()
+            .map_err(|error| ToolError::InvalidArgs(format!("regex không hợp lệ: {error}")))?;
+        let include = args
+            .get("include")
+            .and_then(Value::as_str)
+            .map(glob::Pattern::new)
+            .transpose()
+            .map_err(|error| {
+                ToolError::InvalidArgs(format!("include glob không hợp lệ: {error}"))
+            })?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 300) as usize;
+
+        let base = self
+            .workspace
+            .resolve(optional_str(&args, "path").unwrap_or("."))?;
+        let mut files = Vec::new();
+        if base.is_file() {
+            files.push(base);
+        } else if base.is_dir() {
+            walk_files(&base, 0, &mut files);
+        } else {
+            return Ok(ToolOutput::error("path không tồn tại"));
+        }
+
+        let mut lines = Vec::new();
+        for file in files {
+            if lines.len() >= limit {
+                break;
+            }
+            let rel = file
+                .strip_prefix(self.workspace.root())
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Some(include) = &include {
+                let file_name = file.file_name().map(|value| value.to_string_lossy());
+                let matched = include.matches(&rel)
+                    || file_name
+                        .as_deref()
+                        .map(|name| include.matches(name))
+                        .unwrap_or(false);
+                if !matched {
+                    continue;
+                }
+            }
+            let Ok(metadata) = std::fs::metadata(&file) else {
+                continue;
+            };
+            if metadata.len() > 512 * 1024 {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (index, line) in content.lines().enumerate() {
+                if lines.len() >= limit {
+                    break;
+                }
+                if regex.is_match(line) {
+                    let mut preview: String = line.trim().chars().take(240).collect();
+                    if line.trim().chars().count() > 240 {
+                        preview.push('…');
+                    }
+                    lines.push(format!("{rel}:{}: {preview}", index + 1));
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok(ToolOutput::ok("(không có dòng khớp)"));
+        }
+        let mut text = lines.join("\n");
+        cap_text(&mut text);
+        Ok(ToolOutput::ok(text))
+    }
+}
+
+/// Duyệt file text trong thư mục, bỏ thư mục build và giới hạn số lượng.
+fn walk_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 12 || out.len() >= 5_000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut items: Vec<_> = entries.filter_map(Result::ok).collect();
+    items.sort_by_key(|entry| entry.file_name());
+    for entry in items {
+        if out.len() >= 5_000 {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "dist" | ".venv" | "__pycache__"
+            ) {
+                continue;
+            }
+            walk_files(&path, depth + 1, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
 /// Chạy một lệnh shell trong workspace.
 pub struct RunCommand {
     workspace: Workspace,
@@ -353,6 +709,10 @@ impl Tool for RunCommand {
                 "additionalProperties": false
             }),
         }
+    }
+
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(130)
     }
 
     async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {

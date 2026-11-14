@@ -40,14 +40,21 @@ impl Tool for CheckStep {
             .get("tolerance")
             .and_then(Value::as_f64)
             .unwrap_or(1e-6);
+        super::check_input_bounds(expected).map_err(ToolError::InvalidArgs)?;
+        super::check_input_bounds(actual).map_err(ToolError::InvalidArgs)?;
 
         let expected_value = evalexpr::eval(expected)
             .map_err(|e| ToolError::InvalidArgs(format!("expected không hợp lệ: {e}")))?;
         let actual_value = evalexpr::eval(actual)
             .map_err(|e| ToolError::InvalidArgs(format!("actual không hợp lệ: {e}")))?;
 
-        let (Some(a), Some(b)) = (expected_value.as_float().ok(), actual_value.as_float().ok())
-        else {
+        let as_number = |value: &evalexpr::Value| {
+            value
+                .as_float()
+                .ok()
+                .or_else(|| value.as_int().ok().map(|number| number as f64))
+        };
+        let (Some(a), Some(b)) = (as_number(&expected_value), as_number(&actual_value)) else {
             return Ok(ToolOutput::error(
                 "chỉ so sánh được biểu thức cho kết quả số".to_string(),
             ));
@@ -78,5 +85,27 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("tương đương"));
+    }
+
+    #[tokio::test]
+    async fn compares_integers() {
+        let tool = CheckStep;
+        let out = tool
+            .execute(json!({"expected": "4", "actual": "2+2"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("tương đương"));
+    }
+
+    #[tokio::test]
+    async fn rejects_deeply_nested_expressions() {
+        let tool = CheckStep;
+        let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+        let error = tool
+            .execute(json!({"expected": deep, "actual": "1"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs(_)));
     }
 }

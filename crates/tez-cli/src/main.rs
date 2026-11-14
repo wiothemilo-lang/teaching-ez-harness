@@ -4,20 +4,30 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
-use dialoguer::Password;
+use dialoguer::{Confirm, Password};
 use directories::ProjectDirs;
 use serde_json::Value;
 use tez_auth::connection;
 use tez_auth::providers::{self, ProviderBook, ProviderInput};
 use tez_auth::Vault;
-use tez_core::agent::Agent;
+use tez_core::agent::{Agent, AgentConfig, RunContext};
+use tez_core::compaction::{session_artifact_dir, CompactSettings, Compactor};
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::harness;
+use tez_core::hooks::{self, HookRegistry};
 use tez_core::mcp;
+use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
 use tez_core::modes::{self, Mode};
+use tez_core::permission::{
+    ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
+};
 use tez_core::plugins;
 use tez_core::skills::{self, SkillRegistry};
+use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects::{self, SubjectPack};
+use tez_core::todo::{TodoState, TodoWrite};
 use tez_core::tools::balance_equation::BalanceEquation;
 use tez_core::tools::calculator::Calculator;
 use tez_core::tools::check_grammar::CheckGrammar;
@@ -27,7 +37,7 @@ use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::{code_registry, ToolRegistry};
+use tez_core::tools::{code_registry, ToolError, ToolRegistry};
 use tez_llm::{LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
@@ -90,6 +100,20 @@ enum Commands {
     },
     /// Liệt kê plugin local.
     Plugins,
+    /// Xem bộ nhớ dài hạn đã lưu.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    /// Xem cấu hình harness.
+    Harness,
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    List,
+    Search { query: String },
+    Forget { name: String },
 }
 
 #[derive(Subcommand)]
@@ -158,6 +182,18 @@ struct ChatArgs {
     /// Số message cũ nạp lại khi resume.
     #[arg(long, default_value_t = 12)]
     history: usize,
+    /// Tự động duyệt mọi thao tác cần permission (dùng cho CI/script).
+    #[arg(long, default_value_t = false)]
+    yes: bool,
+    /// Ghi đè permission mode: read_only | strict | standard | trust.
+    #[arg(long)]
+    permission: Option<String>,
+    /// Ghi đè số bước tối đa của agent.
+    #[arg(long)]
+    max_steps: Option<usize>,
+    /// Tắt tự động nạp memory vào context.
+    #[arg(long, default_value_t = false)]
+    no_memory: bool,
     /// Câu hỏi; bỏ trống để vào chế độ chat tương tác (hoặc đọc stdin nếu có pipe).
     prompt: Option<String>,
 }
@@ -550,6 +586,18 @@ fn resolve_chat_connection(
     book: &ProviderBook,
     dir: &Path,
 ) -> anyhow::Result<ResolvedConnection> {
+    // Tên provider lạ không được âm thầm rơi về endpoint OpenAI mặc định.
+    if let Some(requested) = args.provider.as_deref() {
+        let saved = book.find(requested).is_some()
+            || book
+                .providers
+                .iter()
+                .any(|entry| entry.provider == requested);
+        if !saved {
+            connection::validate_provider(requested).map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+    }
+
     let selected = args
         .provider
         .as_deref()
@@ -597,6 +645,28 @@ fn resolve_chat_connection(
     })
 }
 
+/// Hỏi người dùng ngay trong terminal trước khi chạy tool rủi ro.
+struct CliApprover;
+
+#[async_trait]
+impl Approver for CliApprover {
+    async fn approve(&self, request: &ApprovalRequest) -> bool {
+        let prompt = format!(
+            "⚠ {} — công cụ: {} {}",
+            request.reason, request.tool, request.args
+        );
+        tokio::task::spawn_blocking(move || {
+            Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
 struct TurnContext<'a> {
     dir: &'a Path,
     session_id: &'a str,
@@ -609,6 +679,14 @@ struct TurnContext<'a> {
     skills: SkillRegistry,
     mode: Mode,
     workspace: &'a Path,
+    policy: Arc<PermissionPolicy>,
+    approver: Arc<dyn Approver>,
+    hooks: Arc<HookRegistry>,
+    compaction: CompactSettings,
+    memory: MemoryStore,
+    memory_settings: harness::MemorySettings,
+    todos: Arc<TodoState>,
+    max_steps: usize,
 }
 
 impl TurnContext<'_> {
@@ -639,9 +717,9 @@ impl TurnContext<'_> {
         })?;
         drop(store);
 
-        // Giữ tối đa 20 message gần nhất để context không phình vô hạn.
-        if conversation.len() > 20 {
-            let drain = conversation.len() - 20;
+        // Giữ tối đa 40 message gần nhất; compaction của agent xử lý phần còn lại.
+        if conversation.len() > 40 {
+            let drain = conversation.len() - 40;
             conversation.drain(0..drain);
         }
 
@@ -651,6 +729,16 @@ impl TurnContext<'_> {
         let matched = self.skills.matching(self.pack.id, prompt, 2);
         let skill_snippets: Vec<String> =
             matched.iter().map(|skill| skills::render(skill)).collect();
+
+        let recalled = if self.memory_settings.enabled && self.memory_settings.auto_recall {
+            let records = self
+                .memory
+                .search(prompt, self.memory_settings.recall_limit);
+            memory::render_recalled(&records)
+        } else {
+            Vec::new()
+        };
+        let todos = self.todos.snapshot();
 
         let objectives: Vec<String> = Vec::new();
         let workspace_label = self.workspace.display().to_string();
@@ -663,13 +751,32 @@ impl TurnContext<'_> {
             state: "practice",
             recent: &recent,
             skills: &skill_snippets,
+            memory: &recalled,
+            todos: &todos,
             mode: self.mode,
             workspace: Some(&workspace_label),
         });
 
-        let agent = Agent::new(Arc::clone(&self.provider), self.tools.clone());
+        let artifact_dir = session_artifact_dir(self.dir, self.session_id);
+        let compactor = Compactor::new(self.compaction.clone(), Some(artifact_dir.clone()));
+        let agent = Agent::new(Arc::clone(&self.provider), self.tools.clone())
+            .with_config(AgentConfig {
+                max_steps: self.max_steps,
+                ..AgentConfig::default()
+            })
+            .with_policy(Arc::clone(&self.policy))
+            .with_approver(Arc::clone(&self.approver))
+            .with_hooks(Arc::clone(&self.hooks))
+            .with_compactor(compactor)
+            .with_todos(Arc::clone(&self.todos));
         let started = Instant::now();
-        let outcome = agent.run(self.model, messages).await?;
+        let outcome = agent
+            .run_with(
+                self.model,
+                messages,
+                RunContext::new(self.session_id, Some(&artifact_dir), prompt),
+            )
+            .await?;
         let latency_ms = started.elapsed().as_millis() as u64;
 
         println!("{}", outcome.text);
@@ -678,6 +785,22 @@ impl TurnContext<'_> {
             eprintln!(
                 "[tool] {} ({status}, {}ms) args={} -> {}",
                 step.tool, step.duration_ms, step.args, step.output
+            );
+        }
+        if outcome.compactions.changed() {
+            eprintln!(
+                "[context] nén: {} kết quả lớn, {} tin cũ, {} kết quả micro, tóm tắt={} · ~{} ký tự",
+                outcome.compactions.persisted,
+                outcome.compactions.snipped,
+                outcome.compactions.micro_compacted,
+                outcome.compactions.summarized,
+                outcome.compactions.estimated_chars
+            );
+        }
+        if outcome.permission_denials > 0 {
+            eprintln!(
+                "[permission] {} thao tác bị chặn/từ chối",
+                outcome.permission_denials
             );
         }
 
@@ -700,6 +823,9 @@ impl TurnContext<'_> {
                 step.duration_ms,
             )?;
         }
+        if let Ok(items_json) = serde_json::to_string(&outcome.todos) {
+            store.save_todos(self.session_id, &items_json)?;
+        }
         store.record_usage(UsageRecord {
             profile_id: "default",
             connection_id: None,
@@ -719,11 +845,26 @@ impl TurnContext<'_> {
     }
 }
 
+/// Đọc toàn bộ stdin khi có pipe. Trả `None` nếu đang chạy ở terminal.
+fn read_stdin_prompt() -> anyhow::Result<Option<String>> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    use std::io::Read;
+    let mut prompt = String::new();
+    std::io::stdin().read_to_string(&mut prompt)?;
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Câu hỏi rỗng.");
+    }
+    Ok(Some(prompt.trim().to_string()))
+}
+
 async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
     let book = providers::load(&dir)?;
-    let mode = Mode::parse(&args.mode);
-    let pack = subjects::resolve_or_general(&args.subject);
+    let mut mode = Mode::try_parse(&args.mode)
+        .ok_or_else(|| anyhow::anyhow!("chế độ '{}' không hợp lệ. Chọn: chat, code", args.mode))?;
+    let mut pack = subjects::resolve_or_general(&args.subject);
     let workspace = match args.workspace.clone() {
         Some(path) => path,
         None => std::env::current_dir()?,
@@ -731,14 +872,29 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let workspace = workspace.canonicalize().unwrap_or(workspace);
     let connection = resolve_chat_connection(&args, &book, &dir)?;
 
+    // Kiểm tra câu hỏi trước khi tạo session để không sinh session rác.
+    if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            anyhow::bail!("Câu hỏi rỗng.");
+        }
+    }
+    let stdin_prompt = if args.prompt.is_none() {
+        read_stdin_prompt()?
+    } else {
+        None
+    };
+
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
-    let (session_id, mut conversation) = match args.session.as_deref() {
+    let (session_id, mut conversation, todo_json) = match args.session.as_deref() {
         Some(id) => {
-            if !store.session_exists(id)? {
-                anyhow::bail!("không tìm thấy session '{id}'. Xem: tez sessions");
-            }
+            let row = store.get_session(id)?.ok_or_else(|| {
+                anyhow::anyhow!("không tìm thấy session '{id}'. Xem: tez sessions")
+            })?;
             store.resume_session(id)?;
+            // Session đã lưu quyết định chế độ và môn học; cờ CLI chỉ dùng khi tạo mới.
+            mode = Mode::parse(&row.mode);
+            pack = subjects::resolve_or_general(row.subject.as_deref().unwrap_or("general"));
             let conversation = store
                 .load_messages(id, args.history)?
                 .into_iter()
@@ -748,14 +904,43 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
                     _ => None,
                 })
                 .collect();
-            (id.to_string(), conversation)
+            let todos = store.load_todos(id)?;
+            (id.to_string(), conversation, todos)
         }
         None => (
             store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
             Vec::new(),
+            None,
         ),
     };
     drop(store);
+
+    let todos = Arc::new(TodoState::new());
+    if let Some(json) = todo_json {
+        if let Ok(items) = serde_json::from_str::<Vec<tez_core::todo::TodoItem>>(&json) {
+            let _ = todos.replace(items);
+        }
+    }
+
+    let mut config = harness::load(&dir);
+    if let Some(permission) = args.permission.as_deref() {
+        config.permission_mode = PermissionMode::parse(permission);
+    }
+    if let Some(max_steps) = args.max_steps {
+        config.max_steps = max_steps.clamp(1, 100);
+    }
+    if args.no_memory {
+        config.memory.auto_recall = false;
+    }
+    let policy = Arc::new(PermissionPolicy::new(config.permission_mode));
+    let approver: Arc<dyn Approver> = if args.yes || config.permission_mode == PermissionMode::Trust
+    {
+        Arc::new(AutoApprover)
+    } else {
+        Arc::new(CliApprover)
+    };
+    let hooks = Arc::new(hooks::build_registry(Some(&dir), &config.hooks));
+    let memory = MemoryStore::new(dir.join("memory"));
 
     let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatible::new(
         &connection.provider_id,
@@ -764,6 +949,23 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     ));
 
     let mut tools = registry_for_mode(pack, mode, &workspace)?;
+    tools.register(MemorySave::new(memory.clone()));
+    tools.register(MemorySearch::new(memory.clone()));
+    tools.register(MemoryForget::new(memory.clone()));
+    tools.register(TodoWrite::new(Arc::clone(&todos)));
+    if mode == Mode::Code {
+        let runtime = Arc::new(SubagentRuntime {
+            provider: Arc::clone(&provider),
+            model: connection.model.clone(),
+            tools: tools.clone(),
+            policy: Arc::clone(&policy),
+            approver: Arc::clone(&approver),
+            hooks: Arc::clone(&hooks),
+            max_steps: config.max_steps,
+            compaction: config.compaction.clone(),
+        });
+        tools.register(TaskTool::new(runtime));
+    }
     let discovery = mcp::discover(&dir).await?;
     let mcp_count = discovery.tools.len();
     for server in &discovery.servers {
@@ -798,16 +1000,28 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         skills,
         mode,
         workspace: &workspace,
+        policy,
+        approver,
+        hooks,
+        compaction: config.compaction.clone(),
+        memory,
+        memory_settings: config.memory.clone(),
+        todos,
+        max_steps: config.max_steps,
     };
 
-    let interactive = args.prompt.is_none() && std::io::stdin().is_terminal();
+    let interactive = args.prompt.is_none() && stdin_prompt.is_none();
     let mut last_summary = String::new();
 
-    if let Some(prompt) = args.prompt.as_deref() {
-        if prompt.trim().is_empty() {
-            anyhow::bail!("Câu hỏi rỗng.");
+    if let Some(prompt) = args.prompt.as_deref().or(stdin_prompt.as_deref()) {
+        match turn.run_turn(&mut conversation, prompt).await {
+            Ok(text) => last_summary = text,
+            Err(error) => {
+                // Không để session rỗng hoặc kẹt 'active' khi lượt chat thất bại.
+                Store::open(dir.join("tez.db"))?.abandon_session(&session_id)?;
+                return Err(error);
+            }
         }
-        last_summary = turn.run_turn(&mut conversation, prompt).await?;
     } else if interactive {
         match mode {
             Mode::Code => {
@@ -861,14 +1075,6 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             }
             println!();
         }
-    } else {
-        use std::io::Read;
-        let mut prompt = String::new();
-        std::io::stdin().read_to_string(&mut prompt)?;
-        if prompt.trim().is_empty() {
-            anyhow::bail!("Câu hỏi rỗng.");
-        }
-        last_summary = turn.run_turn(&mut conversation, prompt.trim()).await?;
     }
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -903,9 +1109,10 @@ async fn update(args: UpdateArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         Err(error) => {
-            println!("Không kiểm tra được cập nhật: {error}");
-            println!("Bạn vẫn có thể tải bản mới nhất thủ công từ trang Releases của repo.");
-            return Ok(());
+            anyhow::bail!(
+                "Không kiểm tra được cập nhật: {error}\n\
+                 Bạn vẫn có thể tải bản mới nhất thủ công từ trang Releases của repo."
+            );
         }
     };
 
@@ -1001,6 +1208,25 @@ fn doctor() -> anyhow::Result<()> {
     );
     println!("code tools: {}", modes::CODE_TOOLS.join(", "));
     println!("tools: {}", full_registry().names().join(", "));
+    let harness_config = harness::load(&dir);
+    println!(
+        "harness: permission={} max_steps={} compaction={} ({} ký tự) memory={} hooks={}",
+        harness_config.permission_mode.as_str(),
+        harness_config.max_steps,
+        if harness_config.compaction.enabled {
+            "bật"
+        } else {
+            "tắt"
+        },
+        harness_config.compaction.context_char_limit,
+        if harness_config.memory.enabled {
+            "bật"
+        } else {
+            "tắt"
+        },
+        harness_config.hooks.len()
+    );
+    println!("harness config: {}", harness::config_path(&dir).display());
     let skills = SkillRegistry::load_with_plugins(&dir)?;
     println!(
         "skills: {} (thư mục {})",
@@ -1012,6 +1238,109 @@ fn doctor() -> anyhow::Result<()> {
     let plugins = plugins::load_all(&dir)?;
     println!("plugins: {}", plugins.len());
     println!("disk: chạy scripts/disk-guard.sh check");
+    Ok(())
+}
+
+fn harness_show() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let config = harness::load(&dir);
+    println!("harness config: {}", harness::config_path(&dir).display());
+    println!(
+        "permission: {} — {}",
+        config.permission_mode.as_str(),
+        config.permission_mode.description()
+    );
+    println!("max steps: {}", config.max_steps);
+    println!("max tokens: {}", config.max_tokens);
+    println!(
+        "compaction: {} · giới hạn {} ký tự · trigger {} tin · target {} tin",
+        if config.compaction.enabled {
+            "bật"
+        } else {
+            "tắt"
+        },
+        config.compaction.context_char_limit,
+        config.compaction.trigger_messages,
+        config.compaction.target_messages
+    );
+    println!(
+        "memory: {} · auto recall {} · tối đa {} bản ghi",
+        if config.memory.enabled {
+            "bật"
+        } else {
+            "tắt"
+        },
+        if config.memory.auto_recall {
+            "bật"
+        } else {
+            "tắt"
+        },
+        config.memory.recall_limit
+    );
+    println!("hooks: {}", config.hooks.len());
+    for hook in &config.hooks {
+        println!(
+            "  - {} → {} ({}s, {})",
+            hook.event,
+            hook.command,
+            hook.timeout_secs,
+            if hook.enabled { "bật" } else { "tắt" }
+        );
+    }
+    println!(
+        "memory dir: {} ({} bản ghi)",
+        dir.join("memory").display(),
+        MemoryStore::new(dir.join("memory")).records().len()
+    );
+    println!("audit log: {}", dir.join("audit.jsonl").display());
+    Ok(())
+}
+
+fn memory_list() -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let store = MemoryStore::new(dir.join("memory"));
+    let records = store.records();
+    if records.is_empty() {
+        println!("Chưa có bản ghi memory nào. Agent có thể lưu bằng tool memory_save.");
+        return Ok(());
+    }
+    println!("{:<28} {:<10} MÔ TẢ", "TÊN", "LOẠI");
+    for record in records {
+        println!(
+            "{:<28} {:<10} {}",
+            record.name, record.kind, record.description
+        );
+    }
+    Ok(())
+}
+
+fn memory_search(query: &str) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let store = MemoryStore::new(dir.join("memory"));
+    let records = store.search(query, 5);
+    if records.is_empty() {
+        println!("(không tìm thấy memory liên quan)");
+        return Ok(());
+    }
+    for record in records {
+        println!(
+            "## {} ({})\n{}\n",
+            record.name,
+            record.kind,
+            record.preview(600)
+        );
+    }
+    Ok(())
+}
+
+fn memory_forget(name: &str) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let store = MemoryStore::new(dir.join("memory"));
+    if store.forget(name).map_err(anyhow::Error::msg)? {
+        println!("đã xoá memory '{name}'");
+    } else {
+        println!("không tìm thấy memory '{name}'");
+    }
     Ok(())
 }
 
@@ -1216,16 +1545,39 @@ async fn tools_test(name: String, args: String, subject: Option<String>) -> anyh
     };
     let value: Value = serde_json::from_str(&args)
         .with_context(|| format!("args không phải JSON hợp lệ: {args}"))?;
-    let output = registry.execute(&name, value).await?;
-    println!("{}", output.content);
-    if output.is_error {
-        std::process::exit(4);
+    match registry.execute(&name, value).await {
+        Ok(output) => {
+            println!("{}", output.content);
+            if output.is_error {
+                std::process::exit(4);
+            }
+        }
+        // Tool chạy nhưng input sai cũng là lỗi thực thi: cùng mã thoát 4.
+        Err(error @ (ToolError::InvalidArgs(_) | ToolError::Execution(_))) => {
+            eprintln!("{error}");
+            std::process::exit(4);
+        }
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
 
+/// Rust bỏ qua SIGPIPE mặc định. Trả lại hành vi Unix chuẩn để lệnh như
+/// `tez doctor | head` thoát im lặng (mã 141) thay vì panic khi stdout đóng.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: `signal` chỉ đặt handler mặc định cho SIGPIPE, không truy cập bộ nhớ.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    restore_sigpipe();
     let cli = Cli::parse();
     match cli.command {
         Commands::Doctor => doctor(),
@@ -1270,5 +1622,11 @@ async fn main() -> anyhow::Result<()> {
             McpCommand::Test { name } => mcp_test(name).await,
         },
         Commands::Plugins => plugins_list(),
+        Commands::Memory { command } => match command {
+            MemoryCommand::List => memory_list(),
+            MemoryCommand::Search { query } => memory_search(&query),
+            MemoryCommand::Forget { name } => memory_forget(&name),
+        },
+        Commands::Harness => harness_show(),
     }
 }

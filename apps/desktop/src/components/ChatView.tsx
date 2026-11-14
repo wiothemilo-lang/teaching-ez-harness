@@ -1,6 +1,13 @@
 import { useEffect, useRef } from "react";
 import type { KeyboardEvent } from "react";
-import type { ChatMessage, ConnectionInfo, SubjectInfo, ToolTrace } from "../types";
+import type {
+  ChatMessage,
+  CompactReport,
+  ConnectionInfo,
+  SubjectInfo,
+  TodoItem,
+  ToolTrace,
+} from "../types";
 import {
   STRATEGY_LABELS,
   placeholderFor,
@@ -18,6 +25,7 @@ import {
   subjectIcon,
 } from "../icons";
 import { OkMark, Spinner } from "./ui";
+import { HarnessDock } from "./HarnessDock";
 
 type Props = {
   subject: SubjectInfo | undefined;
@@ -29,9 +37,14 @@ type Props = {
   error: string | null;
   loadingSession: boolean;
   lastUsage: { input: number; output: number } | null;
+  todos: TodoItem[];
+  compaction: CompactReport | null;
+  contextLimit: number;
+  denials: number;
   onInput: (value: string) => void;
   onSend: () => void;
   onOpenSettings: () => void;
+  onOpenHarness: () => void;
   onDismissError: () => void;
 };
 
@@ -45,9 +58,14 @@ export function ChatView({
   error,
   loadingSession,
   lastUsage,
+  todos,
+  compaction,
+  contextLimit,
+  denials,
   onInput,
   onSend,
   onOpenSettings,
+  onOpenHarness,
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -205,6 +223,14 @@ export function ChatView({
           )}
         </div>
       </div>
+
+      <HarnessDock
+        todos={todos}
+        compaction={compaction}
+        contextLimit={contextLimit}
+        denials={denials}
+        onOpenSettings={onOpenHarness}
+      />
 
       <div className="composer-wrap">
         <div className="composer">
