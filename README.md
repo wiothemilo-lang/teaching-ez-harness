@@ -1,5 +1,14 @@
 # teaching-ez-harness
 
+[![CodeRabbit Reviews](https://img.shields.io/badge/CodeRabbit-reviewed-FF570A?logo=coderabbit&logoColor=white)](https://coderabbit.ai)
+[![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
+[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)](#build--test)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
+[![Local-first](https://img.shields.io/badge/local--first-BYOK-2F7D5B)](docs/DESKTOP-CLI.md)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20AppImage-lightgrey?logo=linux&logoColor=black)](#desktop-tauri)
+[![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+
 Harness local-first để biến model AI của bạn thành **gia sư có tool, context, memory và policy** — không chỉ là chatbot.
 
 - **CLI:** `tez`
