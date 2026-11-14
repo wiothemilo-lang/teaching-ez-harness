@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/tez-llm",
+  "crates/tez-core",
+  "crates/tez-store",
+  "crates/tez-auth",
+  "crates/tez-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+aes-gcm = "0.10"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+directories = "5"
+evalexpr = "11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.dev]
+# Giảm dung lượng target/ khi phát triển; vẫn đủ debug cơ bản.
+debug = 1
+incremental = true
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
