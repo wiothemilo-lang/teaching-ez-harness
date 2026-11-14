@@ -15,9 +15,15 @@ pub enum Mode {
 impl Mode {
     /// Parse từ chuỗi người dùng/DB. Giá trị lạ rơi về `Chat`.
     pub fn parse(value: &str) -> Self {
+        Self::try_parse(value).unwrap_or_default()
+    }
+
+    /// Parse chặt: trả `None` với giá trị không được hỗ trợ (dùng để báo lỗi CLI).
+    pub fn try_parse(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {
-            "code" | "coding" | "dev" => Self::Code,
-            _ => Self::Chat,
+            "chat" => Some(Self::Chat),
+            "code" | "coding" | "dev" => Some(Self::Code),
+            _ => None,
         }
     }
 
@@ -69,6 +75,9 @@ mod tests {
         assert_eq!(Mode::parse(""), Mode::Chat);
         assert_eq!(Mode::default(), Mode::Chat);
         assert_eq!(Mode::Code.as_str(), "code");
+        assert_eq!(Mode::try_parse("code"), Some(Mode::Code));
+        assert_eq!(Mode::try_parse("chat"), Some(Mode::Chat));
+        assert_eq!(Mode::try_parse("bogus"), None);
     }
 
     #[test]

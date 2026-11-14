@@ -27,7 +27,7 @@ use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::{code_registry, ToolRegistry};
+use tez_core::tools::{code_registry, ToolError, ToolRegistry};
 use tez_llm::{LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
@@ -550,6 +550,18 @@ fn resolve_chat_connection(
     book: &ProviderBook,
     dir: &Path,
 ) -> anyhow::Result<ResolvedConnection> {
+    // Tên provider lạ không được âm thầm rơi về endpoint OpenAI mặc định.
+    if let Some(requested) = args.provider.as_deref() {
+        let saved = book.find(requested).is_some()
+            || book
+                .providers
+                .iter()
+                .any(|entry| entry.provider == requested);
+        if !saved {
+            connection::validate_provider(requested).map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+    }
+
     let selected = args
         .provider
         .as_deref()
@@ -719,11 +731,26 @@ impl TurnContext<'_> {
     }
 }
 
+/// Đọc toàn bộ stdin khi có pipe. Trả `None` nếu đang chạy ở terminal.
+fn read_stdin_prompt() -> anyhow::Result<Option<String>> {
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    use std::io::Read;
+    let mut prompt = String::new();
+    std::io::stdin().read_to_string(&mut prompt)?;
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Câu hỏi rỗng.");
+    }
+    Ok(Some(prompt.trim().to_string()))
+}
+
 async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
     let book = providers::load(&dir)?;
-    let mode = Mode::parse(&args.mode);
-    let pack = subjects::resolve_or_general(&args.subject);
+    let mut mode = Mode::try_parse(&args.mode)
+        .ok_or_else(|| anyhow::anyhow!("chế độ '{}' không hợp lệ. Chọn: chat, code", args.mode))?;
+    let mut pack = subjects::resolve_or_general(&args.subject);
     let workspace = match args.workspace.clone() {
         Some(path) => path,
         None => std::env::current_dir()?,
@@ -731,14 +758,29 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     let workspace = workspace.canonicalize().unwrap_or(workspace);
     let connection = resolve_chat_connection(&args, &book, &dir)?;
 
+    // Kiểm tra câu hỏi trước khi tạo session để không sinh session rác.
+    if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            anyhow::bail!("Câu hỏi rỗng.");
+        }
+    }
+    let stdin_prompt = if args.prompt.is_none() {
+        read_stdin_prompt()?
+    } else {
+        None
+    };
+
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
     let (session_id, mut conversation) = match args.session.as_deref() {
         Some(id) => {
-            if !store.session_exists(id)? {
-                anyhow::bail!("không tìm thấy session '{id}'. Xem: tez sessions");
-            }
+            let row = store.get_session(id)?.ok_or_else(|| {
+                anyhow::anyhow!("không tìm thấy session '{id}'. Xem: tez sessions")
+            })?;
             store.resume_session(id)?;
+            // Session đã lưu quyết định chế độ và môn học; cờ CLI chỉ dùng khi tạo mới.
+            mode = Mode::parse(&row.mode);
+            pack = subjects::resolve_or_general(row.subject.as_deref().unwrap_or("general"));
             let conversation = store
                 .load_messages(id, args.history)?
                 .into_iter()
@@ -800,14 +842,18 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         workspace: &workspace,
     };
 
-    let interactive = args.prompt.is_none() && std::io::stdin().is_terminal();
+    let interactive = args.prompt.is_none() && stdin_prompt.is_none();
     let mut last_summary = String::new();
 
-    if let Some(prompt) = args.prompt.as_deref() {
-        if prompt.trim().is_empty() {
-            anyhow::bail!("Câu hỏi rỗng.");
+    if let Some(prompt) = args.prompt.as_deref().or(stdin_prompt.as_deref()) {
+        match turn.run_turn(&mut conversation, prompt).await {
+            Ok(text) => last_summary = text,
+            Err(error) => {
+                // Không để session rỗng hoặc kẹt 'active' khi lượt chat thất bại.
+                Store::open(dir.join("tez.db"))?.abandon_session(&session_id)?;
+                return Err(error);
+            }
         }
-        last_summary = turn.run_turn(&mut conversation, prompt).await?;
     } else if interactive {
         match mode {
             Mode::Code => {
@@ -861,14 +907,6 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             }
             println!();
         }
-    } else {
-        use std::io::Read;
-        let mut prompt = String::new();
-        std::io::stdin().read_to_string(&mut prompt)?;
-        if prompt.trim().is_empty() {
-            anyhow::bail!("Câu hỏi rỗng.");
-        }
-        last_summary = turn.run_turn(&mut conversation, prompt.trim()).await?;
     }
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -903,9 +941,10 @@ async fn update(args: UpdateArgs) -> anyhow::Result<()> {
             return Ok(());
         }
         Err(error) => {
-            println!("Không kiểm tra được cập nhật: {error}");
-            println!("Bạn vẫn có thể tải bản mới nhất thủ công từ trang Releases của repo.");
-            return Ok(());
+            anyhow::bail!(
+                "Không kiểm tra được cập nhật: {error}\n\
+                 Bạn vẫn có thể tải bản mới nhất thủ công từ trang Releases của repo."
+            );
         }
     };
 
@@ -1216,16 +1255,39 @@ async fn tools_test(name: String, args: String, subject: Option<String>) -> anyh
     };
     let value: Value = serde_json::from_str(&args)
         .with_context(|| format!("args không phải JSON hợp lệ: {args}"))?;
-    let output = registry.execute(&name, value).await?;
-    println!("{}", output.content);
-    if output.is_error {
-        std::process::exit(4);
+    match registry.execute(&name, value).await {
+        Ok(output) => {
+            println!("{}", output.content);
+            if output.is_error {
+                std::process::exit(4);
+            }
+        }
+        // Tool chạy nhưng input sai cũng là lỗi thực thi: cùng mã thoát 4.
+        Err(error @ (ToolError::InvalidArgs(_) | ToolError::Execution(_))) => {
+            eprintln!("{error}");
+            std::process::exit(4);
+        }
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
 
+/// Rust bỏ qua SIGPIPE mặc định. Trả lại hành vi Unix chuẩn để lệnh như
+/// `tez doctor | head` thoát im lặng (mã 141) thay vì panic khi stdout đóng.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: `signal` chỉ đặt handler mặc định cho SIGPIPE, không truy cập bộ nhớ.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    restore_sigpipe();
     let cli = Cli::parse();
     match cli.command {
         Commands::Doctor => doctor(),

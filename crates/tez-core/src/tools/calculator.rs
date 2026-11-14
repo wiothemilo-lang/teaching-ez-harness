@@ -33,6 +33,7 @@ impl Tool for Calculator {
             .get("expression")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'expression'".into()))?;
+        super::check_input_bounds(expression).map_err(ToolError::InvalidArgs)?;
 
         match evalexpr::eval(expression) {
             Ok(value) => Ok(ToolOutput::ok(value.to_string())),
@@ -61,5 +62,16 @@ mod tests {
         let tool = Calculator;
         let out = tool.execute(json!({"expression": "2 +"})).await.unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn rejects_deeply_nested_expression() {
+        let tool = Calculator;
+        let deep = format!("{}1{}", "(".repeat(5000), ")".repeat(5000));
+        let error = tool
+            .execute(json!({ "expression": deep }))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs(_)));
     }
 }
