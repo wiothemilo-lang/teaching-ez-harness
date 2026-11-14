@@ -46,6 +46,11 @@ impl Workspace {
     }
 
     /// Ghép đường dẫn người dùng nhập với workspace và chặn thoát ra ngoài.
+    ///
+    /// Không canonicalize cả đường dẫn vì file đích có thể chưa tồn tại. Thay
+    /// vào đó canonicalize tổ tiên gần nhất còn tồn tại rồi ghép lại phần chưa
+    /// tồn tại. Nhờ vậy symlink hỏng hoặc symlink trỏ ra ngoài đều bị chặn,
+    /// thay vì âm thầm quay về đường dẫn chưa chuẩn hóa.
     fn resolve(&self, input: &str) -> Result<PathBuf, ToolError> {
         let raw = Path::new(input.trim());
         let joined = if raw.is_absolute() {
@@ -62,18 +67,60 @@ impl Workspace {
             )));
         }
 
-        // Chống symlink trỏ ra ngoài: canonicalize phần đã tồn tại.
-        if let Ok(canonical) = normalized.canonicalize() {
-            if !canonical.starts_with(&self.root) {
-                return Err(ToolError::InvalidArgs(format!(
-                    "đường dẫn '{}' trỏ ra ngoài workspace",
-                    input
-                )));
+        let outside =
+            || ToolError::InvalidArgs(format!("đường dẫn '{}' trỏ ra ngoài workspace", input));
+
+        // Tìm tổ tiên gần nhất còn tồn tại, gom các thành phần chưa tồn tại.
+        let mut existing = normalized.as_path();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            match existing.symlink_metadata() {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        // Symlink hỏng không canonicalize được: từ chối luôn,
+                        // không được coi đường dẫn là hợp lệ.
+                        let canonical = existing.canonicalize().map_err(|_| {
+                            ToolError::InvalidArgs(format!(
+                                "đường dẫn '{}' chứa liên kết hỏng",
+                                input
+                            ))
+                        })?;
+                        if !canonical.starts_with(&self.root) {
+                            return Err(outside());
+                        }
+                        let mut resolved = canonical;
+                        for part in missing.iter().rev() {
+                            resolved.push(part);
+                        }
+                        return Ok(resolved);
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let name = existing.file_name().ok_or_else(&outside)?.to_os_string();
+                    missing.push(name);
+                    existing = existing.parent().ok_or_else(&outside)?;
+                }
+                Err(error) => {
+                    return Err(ToolError::Execution(format!(
+                        "không kiểm tra được đường dẫn '{}': {error}",
+                        input
+                    )))
+                }
             }
-            return Ok(canonical);
         }
 
-        Ok(normalized)
+        let canonical = existing.canonicalize().map_err(|error| {
+            ToolError::Execution(format!("không mở được đường dẫn '{}': {error}", input))
+        })?;
+        if !canonical.starts_with(&self.root) {
+            return Err(outside());
+        }
+        let mut resolved = canonical;
+        for part in missing.iter().rev() {
+            resolved.push(part);
+        }
+        Ok(resolved)
     }
 
     fn display(&self, path: &Path) -> String {
@@ -436,7 +483,14 @@ fn walk(workspace: &Workspace, dir: &Path, depth: usize, out: &mut Vec<String>) 
             continue;
         }
         let path = entry.path();
-        let is_dir = path.is_dir();
+        // Không đi theo symlink: đích có thể nằm ngoài workspace.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let is_dir = file_type.is_dir();
         let mut line = workspace.display(&path);
         if is_dir {
             line.push('/');
@@ -602,11 +656,11 @@ impl Tool for GrepFiles {
             if lines.len() >= limit {
                 break;
             }
-            let rel = file
-                .strip_prefix(self.workspace.root())
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/");
+            // File ngoài workspace không được dán nhãn như file trong.
+            let Ok(rel) = file.strip_prefix(self.workspace.root()) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
             if let Some(include) = &include {
                 let file_name = file.file_name().map(|value| value.to_string_lossy());
                 let matched = include.matches(&rel)
@@ -666,7 +720,14 @@ fn walk_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
+        // Không đi theo symlink: có thể dẫn tới file/thư mục ngoài workspace.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if matches!(
                 name.as_str(),
                 ".git" | "node_modules" | "target" | "dist" | ".venv" | "__pycache__"
@@ -851,5 +912,96 @@ mod tests {
         let output = tool.execute(json!({"command": command})).await.unwrap();
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocks_write_through_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().join("ws")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        make_symlink(&outside.join("missing.txt"), &workspace.root().join("link"));
+
+        let write = WriteFile::new(workspace);
+        let output = write
+            .execute(json!({"path": "link", "content": "escaped"}))
+            .await;
+        assert!(output.is_err(), "ghi qua symlink hỏng phải bị chặn");
+        assert!(!outside.join("missing.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocks_write_through_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().join("ws")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        make_symlink(&outside, &workspace.root().join("ext"));
+
+        let write = WriteFile::new(workspace);
+        let output = write
+            .execute(json!({"path": "ext/new/f.txt", "content": "escaped"}))
+            .await;
+        assert!(output.is_err(), "ghi qua thư mục symlink phải bị chặn");
+        assert!(!outside.join("new/f.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocks_reading_symlink_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().join("ws")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOPSECRET").unwrap();
+        make_symlink(
+            &outside.join("secret.txt"),
+            &workspace.root().join("secret.txt"),
+        );
+
+        let read = ReadFile::new(workspace);
+        let output = read.execute(json!({"path": "secret.txt"})).await;
+        assert!(output.is_err(), "đọc symlink ra ngoài phải bị chặn");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn walk_does_not_follow_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().join("ws")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOPSECRET").unwrap();
+        make_symlink(&outside, &workspace.root().join("ext"));
+
+        let list = ListFiles::new(workspace.clone());
+        let output = list.execute(json!({"depth": 3})).await.unwrap();
+        assert!(!output.content.contains("secret.txt"));
+
+        let grep = GrepFiles::new(workspace);
+        let output = grep.execute(json!({"pattern": "TOPSECRET"})).await.unwrap();
+        assert_eq!(output.content, "(không có dòng khớp)");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allows_symlink_that_stays_inside_workspace() {
+        let (_dir, workspace) = workspace();
+        std::fs::write(workspace.root().join("real.txt"), "hello").unwrap();
+        make_symlink(
+            &workspace.root().join("real.txt"),
+            &workspace.root().join("alias.txt"),
+        );
+
+        let read = ReadFile::new(workspace);
+        let output = read.execute(json!({"path": "alias.txt"})).await.unwrap();
+        assert_eq!(output.content, "hello");
     }
 }
