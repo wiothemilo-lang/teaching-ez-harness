@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import * as api from "./api";
 import { errorMessage } from "./api";
 import { uid } from "./lib";
 import type {
   AppMode,
   AppStatus,
+  ApprovalRequest,
   ChatMessage,
+  CompactReport,
   SettingsTab,
   SessionInfo,
   ToastItem,
   ToastKind,
+  TodoItem,
 } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { CodeView } from "./components/CodeView";
+import { ApprovalDialog } from "./components/ApprovalDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Spinner } from "./components/ui";
 import { IconCheck, IconInfo, IconRefresh, IconX } from "./icons";
@@ -36,6 +41,11 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("providers");
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  const [todos, setTodos] = useState<TodoItem[]>([]);
+  const [compaction, setCompaction] = useState<CompactReport | null>(null);
+  const [denials, setDenials] = useState(0);
+  const [contextLimit, setContextLimit] = useState(60_000);
 
   const notify = useCallback((kind: ToastKind, title: string, detail?: string) => {
     setToasts([{ id: uid(), kind, title, detail }]);
@@ -44,6 +54,18 @@ export default function App() {
   const dismissToast = useCallback((id: string) => {
     setToasts((previous) => previous.filter((toast) => toast.id !== id));
   }, []);
+
+  const respondApproval = useCallback(
+    (approved: boolean) => {
+      if (!approval) return;
+      const id = approval.id;
+      setApproval(null);
+      void api.respondApproval(id, approved).catch((responseError) => {
+        notify("error", "Không gửi được phản hồi", errorMessage(responseError));
+      });
+    },
+    [approval, notify],
+  );
 
   const refresh = useCallback(
     async (silent = false) => {
@@ -68,6 +90,38 @@ export default function App() {
     void refresh(true);
   }, [refresh]);
 
+  const refreshHarness = useCallback(async () => {
+    try {
+      const info = await api.getHarness();
+      setContextLimit(info.config.compaction.context_char_limit);
+    } catch {
+      // Bản preview không có backend Tauri; giữ giới hạn mặc định.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshHarness();
+  }, [refreshHarness]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<ApprovalRequest>("tez://approval-request", (event) => {
+      setApproval(event.payload);
+    })
+      .then((dispose) => {
+        if (disposed) dispose();
+        else unlisten = dispose;
+      })
+      .catch(() => {
+        // Không có event bridge (preview/web) — bỏ qua.
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   useEffect(() => {
     if (!workspace && status?.default_workspace) {
       setWorkspace(status.default_workspace);
@@ -80,6 +134,9 @@ export default function App() {
     setInput("");
     setError(null);
     setLastUsage(null);
+    setTodos([]);
+    setCompaction(null);
+    setDenials(0);
   }, []);
 
   const startNewSession = useCallback(() => {
@@ -94,9 +151,10 @@ export default function App() {
 
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
-  const handleChanged = useCallback(() => {
-    void refresh(true);
-  }, [refresh]);
+  const handleChanged = useCallback(async () => {
+    await refresh(true);
+    await refreshHarness();
+  }, [refresh, refreshHarness]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -144,6 +202,9 @@ export default function App() {
             })),
         );
         setLastUsage(null);
+        setTodos(detail.todos ?? []);
+        setCompaction(null);
+        setDenials(0);
         const found = sessions.find((session) => session.id === id);
         if (found) {
           setMode(found.mode === "code" ? "code" : "chat");
@@ -193,6 +254,16 @@ export default function App() {
         { id: uid(), role: "assistant", text: reply.text, tools: reply.tools },
       ]);
       setLastUsage({ input: reply.input_tokens, output: reply.output_tokens });
+      setTodos(reply.todos ?? []);
+      setCompaction(reply.compactions ?? null);
+      setDenials(reply.permission_denials ?? 0);
+      if (reply.stop_reason === "max_steps") {
+        notify(
+          "info",
+          "Đã chạm giới hạn bước",
+          "Agent dừng để tránh chạy quá lâu. Bạn có thể yêu cầu tiếp tục hoặc tăng giới hạn trong Harness.",
+        );
+      }
       void refresh(true);
     } catch (sendError) {
       setMessages((previous) => previous.filter((message) => message.id !== optimisticId));
@@ -213,6 +284,7 @@ export default function App() {
     workspace,
     refresh,
     openSettings,
+    notify,
   ]);
 
   if (!status) {
@@ -272,6 +344,10 @@ export default function App() {
           error={error}
           loadingSession={loadingSession}
           lastUsage={lastUsage}
+          todos={todos}
+          compaction={compaction}
+          contextLimit={contextLimit}
+          denials={denials}
           workspace={workspace}
           onWorkspace={setWorkspace}
           onOpenWorkspace={() => {
@@ -283,6 +359,7 @@ export default function App() {
           onInput={setInput}
           onSend={() => void send()}
           onOpenSettings={() => openSettings("providers")}
+          onOpenHarness={() => openSettings("harness")}
           onDismissError={() => setError(null)}
         />
       ) : (
@@ -296,9 +373,14 @@ export default function App() {
           error={error}
           loadingSession={loadingSession}
           lastUsage={lastUsage}
+          todos={todos}
+          compaction={compaction}
+          contextLimit={contextLimit}
+          denials={denials}
           onInput={setInput}
           onSend={() => void send()}
           onOpenSettings={() => openSettings("providers")}
+          onOpenHarness={() => openSettings("harness")}
           onDismissError={() => setError(null)}
         />
       )}
@@ -312,6 +394,8 @@ export default function App() {
         onChanged={handleChanged}
         notify={notify}
       />
+
+      {approval && <ApprovalDialog request={approval} onRespond={respondApproval} />}
 
       <div className="toasts" aria-live="polite" aria-atomic="false">
         {toasts.map((toast) => (

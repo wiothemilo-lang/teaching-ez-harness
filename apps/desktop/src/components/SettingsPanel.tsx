@@ -25,11 +25,13 @@ import {
   IconPlus,
   IconPuzzle,
   IconRefresh,
+  IconSliders,
   IconTerminal,
   IconTrash,
   IconX,
 } from "../icons";
 import { Callout, EmptyNote, Spinner, Tag } from "./ui";
+import { HarnessPanel } from "./HarnessPanel";
 import { UpdatePanel } from "./UpdatePanel";
 
 type Props = {
@@ -127,6 +129,7 @@ const TAB_META: { id: SettingsTab; label: string; icon: ReactNode }[] = [
   { id: "skills", label: "Kỹ năng", icon: <IconBook size={16} /> },
   { id: "mcp", label: "MCP", icon: <IconPlug size={16} /> },
   { id: "plugins", label: "Plugin", icon: <IconPuzzle size={16} /> },
+  { id: "harness", label: "Harness", icon: <IconSliders size={16} /> },
   { id: "update", label: "Cập nhật", icon: <IconDownload size={16} /> },
   { id: "data", label: "Dữ liệu", icon: <IconDatabase size={16} /> },
 ];
@@ -203,6 +206,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
     skills: extensions?.skills?.length ?? null,
     mcp: extensions?.mcp?.length ?? null,
     plugins: extensions?.plugins?.length ?? null,
+    harness: null,
     update: null,
     data: null,
   };
@@ -451,6 +455,10 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
   };
 
   const content = () => {
+    if (tab === "harness") {
+      return <HarnessPanel notify={notify} onChanged={onChanged} />;
+    }
+
     if (tab === "update") {
       return <UpdatePanel current={status?.version ?? "0.1.0"} notify={notify} />;
     }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -168,6 +168,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS session_todos (
+    session_id TEXT PRIMARY KEY,
+    items_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS ai_usage (
     id TEXT PRIMARY KEY,
     profile_id TEXT NOT NULL,
@@ -218,6 +224,7 @@ INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (5);
 "#;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
@@ -424,6 +431,31 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Lưu kế hoạch todo của phiên (JSON array).
+    pub fn save_todos(&self, session_id: &str, items_json: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO session_todos (session_id, items_json, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(session_id) DO UPDATE SET
+                items_json = excluded.items_json,
+                updated_at = datetime('now')",
+            params![session_id, items_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_todos(&self, session_id: &str) -> Result<Option<String>, StoreError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT items_json FROM session_todos WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value)
     }
 
     pub fn record_usage(&self, record: UsageRecord<'_>) -> Result<(), StoreError> {
@@ -824,7 +856,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
 
         store.ensure_profile("p1", "Học sinh").unwrap();
 
@@ -920,6 +952,32 @@ mod tests {
         let by_id = |id: &str| sessions.iter().find(|row| row.id == id).unwrap();
         assert_eq!(by_id(&chat).mode, "chat");
         assert_eq!(by_id(&code).mode, "code");
+    }
+
+    #[test]
+    fn stores_session_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session("default", None, Some("general"))
+            .unwrap();
+
+        assert_eq!(store.load_todos(&id).unwrap(), None);
+        store
+            .save_todos(&id, r#"[{"content":"đọc file","status":"pending"}]"#)
+            .unwrap();
+        let saved = store.load_todos(&id).unwrap().unwrap();
+        assert!(saved.contains("đọc file"));
+
+        store
+            .save_todos(&id, r#"[{"content":"đọc file","status":"completed"}]"#)
+            .unwrap();
+        assert!(store
+            .load_todos(&id)
+            .unwrap()
+            .unwrap()
+            .contains("completed"));
     }
 
     #[test]

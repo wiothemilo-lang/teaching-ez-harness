@@ -12,6 +12,7 @@ pub mod calculator;
 pub mod check_grammar;
 pub mod check_step;
 pub mod chem;
+pub mod compact;
 pub mod convert_units;
 pub mod molar_mass;
 pub mod physics_formula;
@@ -54,6 +55,10 @@ impl ToolOutput {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Thời gian tối đa cho một lần chạy; tool dài như `run_command` có thể ghi đè.
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
     async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError>;
 }
 
@@ -140,10 +145,25 @@ pub fn code_registry(root: impl AsRef<Path>) -> Result<ToolRegistry, ToolError> 
     let mut registry = ToolRegistry::new();
     registry.register(workspace::ReadFile::new(workspace.clone()));
     registry.register(workspace::WriteFile::new(workspace.clone()));
+    registry.register(workspace::EditFile::new(workspace.clone()));
     registry.register(workspace::ListFiles::new(workspace.clone()));
+    registry.register(workspace::GlobFiles::new(workspace.clone()));
+    registry.register(workspace::GrepFiles::new(workspace.clone()));
     registry.register(workspace::RunCommand::new(workspace));
+    registry.register(compact::Compact);
     Ok(registry)
 }
+
+/// Tên tool của chế độ Code, dùng cho prompt và kiểm tra.
+pub const CODE_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_files",
+    "glob",
+    "grep",
+    "run_command",
+];
 
 #[cfg(test)]
 mod tests {

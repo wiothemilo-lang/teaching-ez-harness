@@ -45,14 +45,14 @@ Model của người dùng chỉ cần làm phần **suy luận/ngôn ngữ**. �
 Cargo.toml                     # workspace
 crates/
   tez-core/                    # domain + agent runtime + context + tools + pedagogy
-  tez-llm/                     # provider trait + adapters + streaming + tool calls
+  tez-llm/                     # provider trait + OpenAI-compatible adapter + tool calls
   tez-auth/                    # connections, keychain, vault, OAuth
   tez-store/                   # SQLite, migrations, repositories
-  tez-server/                  # axum local API + SSE
   tez-cli/                     # binary `tez`
+  tez-update/                  # GitHub Releases check/download
 apps/
   desktop/                     # React + Vite frontend
-  desktop/src-tauri/           # Tauri shell (Rust), depends on core/server
+  desktop/src-tauri/           # Tauri shell (Rust), depends on tez-core
 subjects/
   math/                        # manifest, prompts, rubrics, evals
   physics/
@@ -70,77 +70,90 @@ docs/
 ### 3.1 Vòng lặp
 
 ```
-1. Nhận tin nhắn + session + lesson + subject.
-2. Build context (có budget token).
+1. Compactor chạy các bước rẻ trước khi gọi model:
+   a. ghi kết quả tool lớn ra file, giữ preview;
+   b. cắt bớt lịch sử cũ, lưu transcript;
+   c. micro-compact kết quả cũ nếu vẫn quá giới hạn.
+2. Nếu vẫn quá giới hạn → gọi model tóm tắt lịch sử (bước đắt, mất chi tiết).
 3. Gọi provider với messages + tool schemas.
-4. Nếu model trả text cuối → stream, lưu, kết thúc.
-5. Nếu model gọi tool:
-   a. Validate args (JSON Schema).
-   b. Kiểm tra quyền theo age mode/lesson.
-   c. Thực thi tool (timeout, output cap).
-   d. Ghi tool result vào conversation.
-   e. Quay lại bước 2 (tối đa N bước).
-6. Nếu hết bước/token → trả lời tóm tắt + gợi ý.
+4. Nếu model trả text cuối:
+   a. chạy hook `Stop` (có thể trả `continue` để agent làm tiếp);
+   b. trả `AgentOutcome` và kết thúc.
+5. Nếu model gọi tool, với từng call:
+   a. chạy hook `PreToolUse` — có thể chặn thẳng;
+   b. permission pipeline: deny-list → ask → allow;
+   c. nếu `ask`, gọi `Approver` (dialog desktop hoặc terminal CLI);
+   d. thực thi tool với timeout riêng của tool;
+   e. cắt output theo `max_tool_output`;
+   f. chạy hook `PostToolUse` — có thể thay output (ví dụ che secret);
+   g. ghi tool result vào conversation.
+6. Nếu agent có todo và lâu không cập nhật, chèn reminder `todo_write`.
+7. Quay lại bước 1 (tối đa `max_steps`).
 ```
 
-**Giới hạn mặc định:**
+**Giới hạn mặc định (`AgentConfig` + `harness.json`):**
 
 | Giới hạn | Giá trị |
 |---|---|
-| Số bước agent | 8 |
-| Số tool call / bước | 4 |
-| Timeout mỗi tool | 10s |
-| Output tool tối đa | 8KB (tóm tắt nếu dài) |
-| Retry provider | 2 lần (429/5xx) |
-| Token context | theo model, mặc định 32k |
+| Số bước agent | 12 (chỉnh 1–100) |
+| `max_tokens` mỗi phản hồi | 1024 |
+| `temperature` | 0.2 |
+| Timeout mỗi tool | 60s mặc định; `run_command` 130s; `task` 180s |
+| Output tool tối đa | 8KB (cắt an toàn theo UTF-8) |
+| Compaction | bật, ngưỡng 60.000 ký tự JSON |
+| Token context | ước lượng bằng độ dài JSON messages, không cần tokenizer |
 
-### 3.2 Kiểu dữ liệu (ý tưởng)
+### 3.2 Kiểu dữ liệu
 
 ```rust
 pub struct Agent {
-    pub provider: std::sync::Arc<dyn LlmProvider>,
-    pub tools: ToolRegistry,
-    pub context: ContextBuilder,
-    pub policy: AgentPolicy,
-    pub store: std::sync::Arc<Store>,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    config: AgentConfig,
+    policy: Arc<PermissionPolicy>,
+    approver: Arc<dyn Approver>,
+    hooks: Arc<HookRegistry>,
+    compactor: Compactor,
+    todos: Option<Arc<TodoState>>,
 }
 
-pub struct AgentRequest {
-    pub profile_id: ProfileId,
-    pub session_id: SessionId,
-    pub lesson_id: Option<LessonId>,
-    pub subject: SubjectId,
-    pub user_message: String,
-    pub model: ModelRef,
-    pub age_mode: AgeMode,
+pub struct RunContext<'a> {
+    pub session_id: Option<&'a str>,
+    pub artifact_dir: Option<&'a Path>,
+    pub active_request: Option<&'a str>,
 }
 
-pub enum AgentEvent {
-    TextDelta(String),
-    ToolCall { id: String, name: String, args: serde_json::Value },
-    ToolResult { id: String, name: String, ok: bool, preview: String },
-    StateChanged(SessionState),
-    Usage(Usage),
-    Done(AgentOutcome),
-    Error(AgentError),
+pub struct AgentOutcome {
+    pub text: String,
+    pub steps: Vec<AgentStep>,
+    pub usage: Usage,
+    pub todos: Vec<TodoItem>,
+    pub compactions: CompactReport,
+    pub permission_denials: usize,
+    pub stop_reason: StopReason, // Completed | MaxSteps | Stopped
 }
 ```
 
+Agent được lắp bằng builder: `Agent::new(provider, tools)` rồi
+`.with_config(...)`, `.with_policy(...)`, `.with_approver(...)`,
+`.with_hooks(...)`, `.with_compactor(...)`, `.with_todos(...)`.
+`run_with(model, messages, RunContext)` là entry point chính; `run()` chỉ là
+wrapper không có session/artifact.
+
 ### 3.3 Streaming
 
-- Provider stream → `TextDelta` ngay khi có token.
-- Tool call deltas được tích lũy đến khi đủ JSON.
-- Server chuyển thành SSE events cho desktop/CLI.
-- UI hiển thị "đang gọi tool…" và card kết quả.
+Bản hiện tại **chưa streaming**: provider trả một `ChatResponse` hoàn chỉnh,
+desktop/CLI hiển thị sau khi lượt chạy xong. Khi thêm streaming, `TextDelta`
+và tool-call delta sẽ đi qua cùng event channel của Tauri/CLI; các lớp
+permission, hook và compaction không phụ thuộc vào cách provider trả dữ liệu.
 
 ### 3.4 Kết thúc
 
 Agent dừng khi:
 
-- Model trả câu trả lời cuối (không còn tool call).
-- Chạm `max_steps` hoặc token budget.
-- Người dùng hủy (cancellation token).
-- Lỗi không phục hồi (provider auth, tool panic).
+- Model trả câu trả lời cuối và hook `Stop` không yêu cầu tiếp.
+- Chạm `max_steps` → `StopReason::MaxSteps`, kèm text gợi ý chia nhỏ việc.
+- Người dùng hủy hoặc lỗi không phục hồi → `AgentError`.
 
 ---
 
@@ -180,12 +193,27 @@ pub struct BudgetPolicy {
 
 ### 4.3 Compaction
 
-Khi conversation vượt ngưỡng:
+Compaction là pipeline bốn bước, chạy từ rẻ tới đắt
+(`crates/tez-core/src/compaction.rs`):
 
-1. Giữ nguyên 6 lượt gần nhất.
-2. Tóm tắt các lượt cũ bằng model rẻ (hoặc extractive nếu offline).
-3. Lưu summary vào `sessions.summary`.
-4. Không tóm tắt mục tiêu/trạng thái/tool specs.
+1. **Persist kết quả tool lớn** — kết quả > `large_result_chars` được ghi vào
+   `sessions/<id>/tool-results/<call_id>.txt`; conversation chỉ giữ preview.
+2. **Snip lịch sử** — khi số message vượt `trigger_messages`, lưu toàn bộ
+   transcript vào `sessions/<id>/transcripts/<timestamp>.json`, giữ vài message
+   đầu + `target_messages` message gần nhất, chèn marker có đường dẫn transcript.
+3. **Micro-compact** — nếu vẫn vượt `context_char_limit`, thay kết quả tool cũ
+   bằng đường dẫn file, giữ `keep_recent_results` kết quả gần nhất.
+4. **LLM summary** — chỉ khi vẫn vượt giới hạn: gọi model tóm tắt mục tiêu,
+   file đã đọc/sửa, quyết định, việc còn lại; giữ system prompt và yêu cầu hiện
+   tại, kèm đường dẫn transcript.
+
+Thứ tự này cố định vì bước 1–3 không gọi model và luôn có đường phục hồi; bước
+4 mất chi tiết nên chỉ là phương án cuối. Nếu provider vẫn báo lỗi context
+(`prompt is too long`, `maximum context`), agent thử tóm tắt một lần rồi chạy
+lại. Agent cũng có tool `compact` để chủ động nén sau một giai đoạn dài.
+
+`harness.json` chỉnh được `enabled`, `context_char_limit`, `large_result_chars`,
+`preview_chars`, `trigger_messages`, `target_messages`, `keep_recent_results`.
 
 ### 4.4 Context inspector
 
@@ -204,33 +232,49 @@ Khi conversation vượt ngưỡng:
 ```rust
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
-    fn spec(&self) -> ToolSpec;                 // name, description, JSON schema
-    fn permission(&self) -> ToolPermission;
+    fn spec(&self) -> ToolSpec; // name, description, JSON schema
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(60)
+    }
     async fn execute(
         &self,
         args: serde_json::Value,
-        ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
 }
 
-pub enum ToolPermission {
-    ReadOnly,
-    WriteStudentData,
-    TeacherOnly,
-    Dangerous,   // không dùng trong MVP
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
 }
 ```
 
-### 5.2 Registry & policy
+Tool không tự quyết định permission; policy tập trung ở `Agent`. Tool chỉ khai
+báo schema và (nếu cần) timeout dài hơn mặc định.
 
-- Tool registry toàn cục; mỗi subject pack khai báo tool được phép.
-- `AgentPolicy` lọc thêm theo age mode:
-  - `child`: chỉ read-only + write có xác nhận của giáo viên/phụ huynh.
-  - `teen`: read-only + write evidence; không tool nguy hiểm.
-  - `adult`: như teen + teacher-only nếu là giáo viên.
-- Desktop hiện confirmation cho `WriteStudentData`; CLI có `--yes`.
-- Tool args validate bằng JSON Schema (`schemars` + `jsonschema`).
-- Tool result luôn được coi là **dữ liệu không tin cậy**; wrap trong delimiter; không thực thi chỉ dẫn trong đó.
+### 5.2 Registry, permission & hook
+
+- **Registry**: `ToolRegistry` giữ tool built-in, tool MCP (`mcp__server__tool`)
+  và tool harness (`todo_write`, `task`, `memory_*`, `compact`). Mỗi subject
+  pack lọc allowlist; chế độ Code dùng `code_registry(root)`.
+- **Permission pipeline** (`crates/tez-core/src/permission.rs`) có bốn mode:
+  `read_only`, `strict`, `standard` (mặc định), `trust`. Mỗi call đi qua ba cổng
+  theo thứ tự: deny-list (lệnh phá hủy) → ask rules (xóa, `git reset --hard`,
+  cài package, `curl | sh`, tool MCP…) → allow. `read_only` chặn mọi thao tác
+  ghi/chạy lệnh; `strict` hỏi trước mọi thay đổi; `trust` bỏ qua ask nhưng vẫn
+  giữ deny-list.
+- **Approver**: trait async. Desktop hiển thị dialog và trả lời qua event
+  `tez://approval-request` + command `respond_approval`; CLI dùng
+  `dialoguer::Confirm`, có `--yes` để tự duyệt và `--permission` để ghi đè mode.
+- **Hooks** (`crates/tez-core/src/hooks.rs`): `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `Stop`. Hook built-in ghi audit JSONL
+  (`<data_dir>/audit.jsonl`) và che API key/private key trong output tool.
+  Người dùng thêm hook shell trong `harness.json`; hook nhận JSON qua stdin và
+  trả `{"block": "...", "output": "...", "continue": "...", "note": "..."}`.
+- **Subagent**: tool `task` chạy một `Agent` mới với `messages[]` sạch, cùng
+  workspace/policy/hook, không có tool `task` (một tầng delegation). Chỉ văn bản
+  cuối quay về agent cha.
+- Tool args được validate theo JSON Schema ở tầng tool; tool result luôn là
+  **dữ liệu không tin cậy**, không thực thi chỉ dẫn nằm trong đó.
 
 ### 5.3 Danh mục tool
 
@@ -304,21 +348,26 @@ Gateway khai báo capability `tool_calling: native | prompted | none`.
 
 ### 5.5 Chế độ Code — workspace tools
 
-`crates/tez-core/src/tools/workspace.rs` cung cấp bốn tool gắn với một `Workspace`
-(root đã canonicalize):
+`crates/tez-core/src/tools/workspace.rs` cung cấp các tool gắn với một
+`Workspace` (root đã canonicalize):
 
 | Tool | Việc |
 |---|---|
-| `read_file` | đọc text ≤ 256 KB |
+| `read_file` | đọc text ≤ 256 KB; `offset`/`limit` để đọc theo dòng |
 | `write_file` | ghi đè toàn bộ nội dung, tạo thư mục cha |
+| `edit_file` | thay `old_string` bằng `new_string`; mặc định phải khớp duy nhất, `replace_all` để thay mọi lần |
 | `list_files` | liệt kê ≤ 300 entry, 1–4 tầng, bỏ `node_modules`/`target`/`.git` |
-| `run_command` | `sh -c` (`cmd /C` trên Windows), timeout 1–120 s, cwd trong workspace |
+| `glob` | tìm file theo pattern `src/**/*.rs`, bỏ thư mục build |
+| `grep` | tìm regex trong file text; lọc `include`, `ignore_case`, trả `path:dòng: nội_dung` |
+| `run_command` | `sh -c` (`cmd /C` trên Windows), timeout 130 s, cwd trong workspace |
+| `compact` | agent chủ động yêu cầu nén lịch sử sau một giai đoạn |
 
 `Workspace::resolve` ghép path tương đối với root, chuẩn hóa `.`/`..`, rồi
 canonicalize phần đã tồn tại để chặn symlink trỏ ra ngoài. Đây là giới hạn ở
-tầng ứng dụng, không phải sandbox OS. `tools::code_registry(root)` đăng ký cả
-bốn tool; `Mode::Code` trong `crates/tez-core/src/modes.rs` chọn prompt system
-gắn workspace và registry này.
+tầng ứng dụng, không phải sandbox OS. `tools::code_registry(root)` đăng ký các
+tool file/lệnh; `CODE_TOOL_NAMES` là danh sách chuẩn. `Mode::Code` trong
+`crates/tez-core/src/modes.rs` chọn prompt system gắn workspace và allowlist
+`CODE_TOOLS`, bao gồm cả `todo_write`, `task`, `compact` và `memory_*`.
 
 ## 6. Subject packs
 
@@ -421,27 +470,42 @@ Chi tiết auth/BYOK: [PROVIDER-AUTH.md](PROVIDER-AUTH.md).
 
 ## 8. Storage
 
-Thêm các bảng cho agent:
+Schema hiện tại là version 5. `Store::open` chạy `SCHEMA` idempotent rồi thêm cột
+còn thiếu (`sessions.subject`, `sessions.mode`) để nâng cấp DB cũ.
 
 ```sql
-sessions (id, lesson_id, profile_id, state, summary, started_at, ended_at)
+profiles (id, name, age_mode, created_at)
+connections (id, profile_id, provider_id, label, auth_type,
+             encrypted_payload, metadata, status, last_used_at, created_at)
+lessons (id, profile_id, title, subject, grade_level, objectives,
+         strategy, created_at)
+sessions (id, lesson_id, profile_id, subject, mode, state, summary,
+          started_at, ended_at)
 messages (id, session_id, role, content, model, tokens_in, tokens_out, created_at)
-agent_steps (id, session_id, step_no, model, tokens_in, tokens_out,
-             latency_ms, finish_reason, created_at)
-tool_calls (id, step_id, name, args_json, result_preview, ok, latency_ms, error)
-context_snapshots (id, session_id, step_id, sections_json, tokens_json)
-evidence (id, session_id, objective_id, type, score, meta_json)
+tool_calls (id, session_id, tool_name, args_json, output, ok,
+            duration_ms, created_at)
+session_todos (session_id, items_json, updated_at)
+context_snapshots (id, session_id, step_no, sections_json, tokens_json, created_at)
 ai_usage (id, profile_id, connection_id, provider_id, model_id, task,
           tokens_in, tokens_out, latency_ms, status, created_at)
+documents (id, profile_id, subject, title, source_path, mime, bytes, created_at)
+document_chunks (id, document_id, chunk_no, content, created_at)
+document_chunks_fts (FTS5: content, search_text, chunk_id, document_id)
 ```
 
-- `context_snapshots` giúp debug "model đã thấy gì".
-- Không lưu secret; tool args có thể chứa dữ liệu học sinh → retention ngắn, cho phép xóa.
-- SQLite WAL; một local server ghi.
+- `session_todos` giữ kế hoạch của phiên dưới dạng JSON array; desktop/CLI nạp
+  lại khi resume và ghi sau mỗi lượt.
+- `context_snapshots` giữ chỗ cho context inspector; bản hiện tại chưa ghi.
+- Artifact compaction nằm ngoài DB: `sessions/<id>/tool-results/*.txt` và
+  `sessions/<id>/transcripts/*.json`.
+- Không lưu secret; tool args có thể chứa dữ liệu học sinh → retention ngắn,
+  cho phép xóa.
+- SQLite WAL + `busy_timeout=5000`; desktop và CLI có thể mở đồng thời, tranh
+  chấp ngắn được SQLite xử lý.
 
 ---
 
-## 9. Local server API
+## 9. Local server API (kế hoạch)
 
 ```
 GET  /health
@@ -477,14 +541,31 @@ GET  /v1/usage
 
 ## 10. Tauri desktop
 
-- Tauri 2, React + Vite + Tailwind + shadcn.
-- Tauri shell khởi động local axum server (in-process) và inject `{ url, token }` cho frontend.
-- Tauri commands: `server_info`, `pick_file`, `open_external`, `app_info`.
-- Frontend gọi HTTP local; SSE cho chat.
-- Màn hình: Onboarding, Chat, Lessons, Tools, Context Inspector, Settings/Connections, Usage.
-- Tool call card: tên, args, kết quả, quyền, thời gian.
-- Citation panel: tài liệu/trang/snippet.
-- Context panel: section + token count + phần bị cắt.
+- Tauri 2, React + Vite; giao diện dark kiểu Claude Code.
+- **Không có local HTTP server trong bản hiện tại.** Frontend gọi trực tiếp
+  Tauri commands (in-process), không qua axum/SSE.
+- Commands chính:
+  - `app_status`, `list_sessions`, `load_session`, `chat`;
+  - `respond_approval`, `get_harness`, `save_harness`, `delete_memory`;
+  - `list_providers`, `save_provider`, `delete_provider`, `activate_provider`,
+    `test_provider`, `test_connection`;
+  - `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`,
+    `install_sample_plugin`, `open_extension_path`;
+  - `check_update`, `download_update`, `launch_update`, `open_external`,
+    `open_workspace`.
+- **Approval flow:** agent gặp call cần duyệt → `DesktopApprover` emit event
+  `tez://approval-request` kèm `ApprovalRequest { id, tool, args, reason,
+  session_id }` → React mở modal → `respond_approval({ id, approved })` →
+  oneshot trả kết quả cho agent. Timeout 180 s thì từ chối.
+- `ChatReply` trả thêm `todos`, `compactions`, `permission_denials`,
+  `stop_reason`; `SessionDetail` trả `todos` đã lưu.
+- Màn hình hiện tại:
+  - **Chat** — trò chuyện tổng quát, không bắt chọn môn.
+  - **Code** — workspace tools, tool trace, todo/context dock, approval modal.
+  - **Settings** — Providers, Skills, MCP, Plugins, **Harness**, Update, Data.
+  - **Harness** — permission mode, giới hạn agent, compaction, memory + xoá bản
+    ghi, hook shell; hiển thị đường dẫn `harness.json`/memory/audit.
+- Tool call card: tên, args, kết quả, thời gian, trạng thái ok/error.
 - Security: Tauri capabilities allowlist, CSP, không load remote content.
 
 Chi tiết đóng gói: [DESKTOP-CLI.md](DESKTOP-CLI.md).
@@ -494,29 +575,41 @@ Chi tiết đóng gói: [DESKTOP-CLI.md](DESKTOP-CLI.md).
 ## 11. CLI `tez`
 
 ```bash
-tez init
-tez connect
 tez connect groq --method key
 tez connect ollama
-tez models
-tez chat --subject math --lesson <id>
-tez chat --no-tools
+tez chat "Giải thích borrow checker"
+tez chat --mode code --workspace ~/projects/app "Sửa lỗi build"
+tez chat --session <id> --history 20 "Tiếp tục việc còn dở"
+tez chat --yes --permission trust --max-steps 20 "Chạy test và sửa lỗi"
+tez chat --permission read_only "Đọc và giải thích kiến trúc repo"
+tez chat --no-memory "Bỏ qua memory đã lưu"
 tez tools list
 tez tools test calculate --args '{"expression":"2+2"}'
-tez context inspect --session <id>
-tez trace <session-id>
-tez lesson create
-tez lesson ingest <file>
 tez subject list
+tez sessions
+tez memory list
+tez memory search "quy ước build"
+tez memory forget "Build command"
+tez harness
 tez usage
 tez doctor
-tez serve
+tez update --check-only
 ```
 
-- `--json` cho automation.
-- Exit code: 0 ok, 2 auth, 3 quota, 4 tool error.
-- Streaming text + tool status.
-- `tez doctor`: server, DB, keychain, provider, tokenizer, disk.
+- `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
+  tương tác; có pipe thì đọc một lần từ stdin.
+- `--mode code` dùng workspace tools; `--workspace` mặc định là thư mục hiện
+  tại. `--session` khôi phục mode/môn học đã lưu của session.
+- `--yes` tự duyệt mọi thao tác cần permission (CI/script); `--permission`
+  ghi đè `harness.json`; `--max-steps` và `--no-memory` ghi đè giới hạn và
+  auto-recall cho riêng lượt chạy.
+- `tez memory list|search|forget` đọc/xoá bản ghi Markdown trong
+  `<data_dir>/memory`; `tez harness` in permission mode, giới hạn agent,
+  compaction, memory, hook và đường dẫn audit.
+- Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
+  thống kê nén đi ra stderr để pipe stdout vẫn sạch. Chưa có streaming token.
+- Lỗi trả exit code 1 kèm thông báo; `tez doctor` kiểm tra data dir, provider,
+  DB, skill, MCP, plugin, harness và dung lượng.
 
 ---
 
@@ -527,7 +620,12 @@ tez serve
 - `cargo dist` (tùy chọn) cho CLI đa nền tảng.
 - GitHub Actions matrix: Linux/macOS/Windows; cache cargo; build Tauri cần system deps.
 - Code signing: bỏ qua giai đoạn đầu; ghi rõ cách mở installer unsigned.
-- Auto-update: Tauri updater + GitHub Releases (khi có bản stable).
+- Update: crate `tez-update` gọi GitHub Releases API (repo mặc định
+  `teaching-ez/tez`, ghi đè bằng `TEZ_GITHUB_REPO`), tải asset vào
+  `<data_dir>/updates`; không tự cài. Desktop hiển thị panel cập nhật; CLI dùng
+  `tez update --check-only` hoặc `--download`.
+- Windows: script PowerShell trong `scripts/windows/` và installer NSIS
+  `currentUser`; workflow release tạo asset khi push tag `v*`.
 
 ---
 
@@ -535,7 +633,7 @@ tez serve
 
 | Rủi ro | Biện pháp |
 |---|---|
-| Tool nguy hiểm | Không có shell/code runner trong MVP; permission + allowlist |
+| Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; đây không phải sandbox OS |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
 | Key rò rỉ | Keychain + AES-GCM; redaction; không trả secret |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
@@ -548,10 +646,21 @@ tez serve
 
 ## 14. Testing & eval
 
-- **Unit:** tool math/chemistry; context budget; vault; policy.
-- **Integration:** mock provider + agent loop; tool call → result → final.
+- **Unit:** tool math/chemistry/workspace; permission (deny/ask/allow, trust,
+  read-only); compaction 4 bước; memory lưu/tìm/xoá; todo; hook block +
+  redaction; harness config sanitize; store migration v5 và `session_todos`.
+- **Integration:** mock provider + agent loop; tool call → result → final;
+  permission denial; subagent trả text cuối; MCP stdio.
+- **Số test hiện tại:** `tez-core` 84 + 1 MCP stdio, `tez-cli` 12,
+  `tez-auth` 9, `tez-update` 2. `cargo test --workspace` xanh.
+- **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
+  `cargo fmt --all -- --check` sạch.
+- **Frontend:** `pnpm exec tsc --noEmit` và `pnpm build` (Vite) sạch; preview
+  tĩnh với Tauri mock dùng để kiểm tra approval modal, Harness dock và
+  Settings → Harness.
 - **Trajectory eval:** model có gọi đúng tool? có bỏ qua tool cần thiết? có lộ đáp án?
-- **CLI e2e:** `assert_cmd`; connect/chat/tools/context.
+- **CLI e2e:** `assert_cmd`; connect/chat/tools/context (mở rộng cho memory và
+  permission).
 - **Desktop smoke:** Playwright/Tauri driver (sau).
 - **Eval bộ môn:** 8 case/môn + 20 case chung; promptfoo hoặc harness Rust.
 - **Regression:** mỗi prompt/tool change chạy lại; so sánh pass rate.

@@ -1,17 +1,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, State};
 use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
-use tez_core::agent::Agent;
+use tez_core::agent::{Agent, AgentConfig, RunContext, StopReason};
+use tez_core::compaction::{session_artifact_dir, CompactReport, Compactor};
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::harness::{self, HarnessConfig};
+use tez_core::hooks::{self};
 use tez_core::mcp::{self, McpServerConfig};
+use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
 use tez_core::modes::Mode;
+use tez_core::permission::{ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy};
 use tez_core::plugins;
 use tez_core::skills::{self, SkillRegistry};
+use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects::{self, SubjectPack};
+use tez_core::todo::{TodoItem, TodoState, TodoWrite};
 use tez_core::tools::balance_equation::BalanceEquation;
 use tez_core::tools::calculator::Calculator;
 use tez_core::tools::check_grammar::CheckGrammar;
@@ -147,6 +156,7 @@ struct StoredMessageInfo {
 struct SessionDetail {
     id: String,
     messages: Vec<StoredMessageInfo>,
+    todos: Vec<TodoItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,6 +184,98 @@ struct ChatReply {
     output_tokens: u64,
     provider: String,
     model: String,
+    todos: Vec<TodoItem>,
+    compactions: CompactReport,
+    permission_denials: usize,
+    stop_reason: String,
+}
+
+/// Kênh chờ người dùng bấm duyệt trong desktop.
+#[derive(Default)]
+struct ApprovalBroker {
+    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+}
+
+impl ApprovalBroker {
+    fn register(&self, id: &str) -> tokio::sync::oneshot::Receiver<bool> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(id.to_string(), tx);
+        }
+        rx
+    }
+
+    fn respond(&self, id: &str, approved: bool) -> bool {
+        let sender = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(id));
+        match sender {
+            Some(tx) => tx.send(approved).is_ok(),
+            None => false,
+        }
+    }
+
+    fn cancel(&self, id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(id);
+        }
+    }
+}
+
+struct DesktopApprover {
+    app: AppHandle,
+    broker: Arc<ApprovalBroker>,
+}
+
+#[async_trait]
+impl Approver for DesktopApprover {
+    async fn approve(&self, request: &ApprovalRequest) -> bool {
+        let receiver = self.broker.register(&request.id);
+        if let Err(error) = self.app.emit("tez://approval-request", request) {
+            eprintln!("[permission] không gửi được yêu cầu duyệt: {error}");
+            self.broker.cancel(&request.id);
+            return false;
+        }
+        match tokio::time::timeout(Duration::from_secs(180), receiver).await {
+            Ok(Ok(approved)) => approved,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                self.broker.cancel(&request.id);
+                false
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RespondApprovalRequest {
+    id: String,
+    approved: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryNameRequest {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryInfo {
+    name: String,
+    description: String,
+    kind: String,
+    body: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HarnessInfo {
+    config: HarnessConfig,
+    path: String,
+    memory_dir: String,
+    audit_log: String,
+    memory: Vec<MemoryInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -717,18 +819,35 @@ fn load_session(request: SessionRequest) -> Result<SessionDetail, String> {
         })
         .collect();
 
+    let todos = store
+        .load_todos(&request.session_id)
+        .map_err(|error| error.to_string())?
+        .and_then(|json| serde_json::from_str::<Vec<TodoItem>>(&json).ok())
+        .unwrap_or_default();
+
     Ok(SessionDetail {
         id: request.session_id,
         messages,
+        todos,
     })
 }
 
 #[tauri::command]
-async fn chat(request: ChatRequest) -> Result<ChatReply, String> {
-    chat_inner(request).await.map_err(friendly)
+async fn chat(
+    app: AppHandle,
+    broker: State<'_, Arc<ApprovalBroker>>,
+    request: ChatRequest,
+) -> Result<ChatReply, String> {
+    chat_inner(app, Arc::clone(&broker), request)
+        .await
+        .map_err(friendly)
 }
 
-async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
+async fn chat_inner(
+    app: AppHandle,
+    broker: Arc<ApprovalBroker>,
+    request: ChatRequest,
+) -> anyhow::Result<ChatReply> {
     let dir = data_dir()?;
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
     let pack = subjects::resolve_or_general(&request.subject);
@@ -738,17 +857,30 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     };
     let connection = resolve_connection(&dir, request.provider_id.as_deref())?;
 
+    let config = harness::load(&dir);
+    let policy = Arc::new(PermissionPolicy::new(config.permission_mode));
+    let approver: Arc<dyn Approver> = if config.permission_mode == PermissionMode::Trust {
+        Arc::new(AutoApprover)
+    } else {
+        Arc::new(DesktopApprover {
+            app,
+            broker: Arc::clone(&broker),
+        })
+    };
+    let hooks = Arc::new(hooks::build_registry(Some(&dir), &config.hooks));
+    let memory_store = MemoryStore::new(dir.join("memory"));
+
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
 
-    let (session_id, history) = match request.session_id.as_deref() {
+    let (session_id, history, todo_json) = match request.session_id.as_deref() {
         Some(id) => {
             if !store.session_exists(id)? {
                 anyhow::bail!("session '{id}' không tồn tại");
             }
             store.resume_session(id)?;
             let history = store
-                .load_messages(id, 20)?
+                .load_messages(id, 40)?
                 .into_iter()
                 .filter_map(|message| match message.role.as_str() {
                     "user" => Some(Message::user(message.content)),
@@ -756,13 +888,21 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
                     _ => None,
                 })
                 .collect();
-            (id.to_string(), history)
+            (id.to_string(), history, store.load_todos(id)?)
         }
         None => (
             store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
             Vec::new(),
+            None,
         ),
     };
+
+    let todos = Arc::new(TodoState::new());
+    if let Some(json) = todo_json {
+        if let Ok(items) = serde_json::from_str::<Vec<TodoItem>>(&json) {
+            let _ = todos.replace(items);
+        }
+    }
 
     let subject_filter = if pack.is_general() {
         None
@@ -792,6 +932,14 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
     let matched = registry.matching(pack.id, &request.message, 2);
     let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
 
+    let recalled = if config.memory.enabled && config.memory.auto_recall {
+        let records = memory_store.search(&request.message, config.memory.recall_limit);
+        memory::render_recalled(&records)
+    } else {
+        Vec::new()
+    };
+    let todo_snapshot = todos.snapshot();
+
     let objectives: Vec<String> = Vec::new();
     let workspace_label = workspace
         .as_ref()
@@ -806,6 +954,8 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         state: "practice",
         recent: &recent,
         skills: &skill_snippets,
+        memory: &recalled,
+        todos: &todo_snapshot,
         mode,
         workspace: Some(&workspace_label),
     });
@@ -820,14 +970,51 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         (Mode::Code, Some(root)) => code_registry(root)?,
         _ => registry_for(pack),
     };
+    tools.register(MemorySave::new(memory_store.clone()));
+    tools.register(MemorySearch::new(memory_store.clone()));
+    tools.register(MemoryForget::new(memory_store.clone()));
+    tools.register(TodoWrite::new(Arc::clone(&todos)));
     let discovery = mcp::discover(&dir).await?;
     for tool in discovery.tools {
         tools.register(tool);
     }
 
-    let agent = Agent::new(provider, tools);
+    if mode == Mode::Code {
+        let runtime = Arc::new(SubagentRuntime {
+            provider: Arc::clone(&provider),
+            model: connection.model.clone(),
+            tools: tools.clone(),
+            policy: Arc::clone(&policy),
+            approver: Arc::clone(&approver),
+            hooks: Arc::clone(&hooks),
+            max_steps: config.max_steps,
+            compaction: config.compaction.clone(),
+        });
+        tools.register(TaskTool::new(runtime));
+    }
+
+    let artifact_dir = session_artifact_dir(&dir, &session_id);
+    let compactor = Compactor::new(config.compaction.clone(), Some(artifact_dir.clone()));
+    let agent = Agent::new(provider, tools)
+        .with_config(AgentConfig {
+            max_steps: config.max_steps,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            ..AgentConfig::default()
+        })
+        .with_policy(Arc::clone(&policy))
+        .with_approver(Arc::clone(&approver))
+        .with_hooks(Arc::clone(&hooks))
+        .with_compactor(compactor)
+        .with_todos(Arc::clone(&todos));
     let started = Instant::now();
-    let outcome = agent.run(&connection.model, messages).await?;
+    let outcome = agent
+        .run_with(
+            &connection.model,
+            messages,
+            RunContext::new(&session_id, Some(&artifact_dir), &request.message),
+        )
+        .await?;
     let latency_ms = started.elapsed().as_millis() as u64;
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -848,6 +1035,9 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
             step.ok,
             step.duration_ms,
         )?;
+    }
+    if let Ok(items_json) = serde_json::to_string(&outcome.todos) {
+        store.save_todos(&session_id, &items_json)?;
     }
     store.record_usage(UsageRecord {
         profile_id: "default",
@@ -881,7 +1071,65 @@ async fn chat_inner(request: ChatRequest) -> anyhow::Result<ChatReply> {
         output_tokens: outcome.usage.output_tokens,
         provider: connection.provider_name,
         model: connection.model,
+        todos: outcome.todos,
+        compactions: outcome.compactions,
+        permission_denials: outcome.permission_denials,
+        stop_reason: match outcome.stop_reason {
+            StopReason::Completed => "completed",
+            StopReason::MaxSteps => "max_steps",
+            StopReason::Stopped => "stopped",
+        }
+        .to_string(),
     })
+}
+
+#[tauri::command]
+fn respond_approval(
+    broker: State<'_, Arc<ApprovalBroker>>,
+    request: RespondApprovalRequest,
+) -> bool {
+    broker.respond(&request.id, request.approved)
+}
+
+fn harness_info(dir: &Path) -> HarnessInfo {
+    let config = harness::load(dir);
+    let memory = MemoryStore::new(dir.join("memory"))
+        .records()
+        .into_iter()
+        .map(|record| MemoryInfo {
+            name: record.name,
+            description: record.description,
+            kind: record.kind,
+            body: record.body,
+            path: record.path.display().to_string(),
+        })
+        .collect();
+    HarnessInfo {
+        config,
+        path: harness::config_path(dir).display().to_string(),
+        memory_dir: dir.join("memory").display().to_string(),
+        audit_log: dir.join("audit.jsonl").display().to_string(),
+        memory,
+    }
+}
+
+#[tauri::command]
+fn get_harness() -> Result<HarnessInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    Ok(harness_info(&dir))
+}
+
+#[tauri::command]
+fn save_harness(config: HarnessConfig) -> Result<HarnessInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    harness::save(&dir, &config)?;
+    Ok(harness_info(&dir))
+}
+
+#[tauri::command]
+fn delete_memory(request: MemoryNameRequest) -> Result<bool, String> {
+    let dir = data_dir().map_err(friendly)?;
+    MemoryStore::new(dir.join("memory")).forget(&request.name)
 }
 
 #[tauri::command]
@@ -944,9 +1192,14 @@ fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(Arc::new(ApprovalBroker::default()))
         .invoke_handler(tauri::generate_handler![
             app_status,
             chat,
+            respond_approval,
+            get_harness,
+            save_harness,
+            delete_memory,
             list_sessions,
             load_session,
             list_providers,

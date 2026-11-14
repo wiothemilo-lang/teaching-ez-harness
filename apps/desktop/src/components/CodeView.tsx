@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { KeyboardEvent } from "react";
-import type { ChatMessage, ConnectionInfo } from "../types";
+import type { ChatMessage, CompactReport, ConnectionInfo, TodoItem } from "../types";
 import { CODE_SUGGESTIONS, placeholderFor } from "../lib";
 import {
   IconArrowRight,
@@ -13,6 +13,7 @@ import {
   IconX,
 } from "../icons";
 import { ToolTraces } from "./ChatView";
+import { HarnessDock } from "./HarnessDock";
 import { Spinner } from "./ui";
 
 type Props = {
@@ -23,12 +24,17 @@ type Props = {
   error: string | null;
   loadingSession: boolean;
   lastUsage: { input: number; output: number } | null;
+  todos: TodoItem[];
+  compaction: CompactReport | null;
+  contextLimit: number;
+  denials: number;
   workspace: string;
   onWorkspace: (value: string) => void;
   onOpenWorkspace: () => void;
   onInput: (value: string) => void;
   onSend: () => void;
   onOpenSettings: () => void;
+  onOpenHarness: () => void;
   onDismissError: () => void;
 };
 
@@ -40,12 +46,17 @@ export function CodeView({
   error,
   loadingSession,
   lastUsage,
+  todos,
+  compaction,
+  contextLimit,
+  denials,
   workspace,
   onWorkspace,
   onOpenWorkspace,
   onInput,
   onSend,
   onOpenSettings,
+  onOpenHarness,
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -210,6 +221,14 @@ export function CodeView({
           )}
         </div>
       </div>
+
+      <HarnessDock
+        todos={todos}
+        compaction={compaction}
+        contextLimit={contextLimit}
+        denials={denials}
+        onOpenSettings={onOpenHarness}
+      />
 
       <div className="composer-wrap">
         <div className="composer">

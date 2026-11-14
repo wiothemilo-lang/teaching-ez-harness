@@ -1,6 +1,88 @@
-export type SettingsTab = "providers" | "skills" | "mcp" | "plugins" | "update" | "data";
+export type SettingsTab =
+  | "providers"
+  | "skills"
+  | "mcp"
+  | "plugins"
+  | "harness"
+  | "update"
+  | "data";
 
 export type AppMode = "chat" | "code";
+
+export type PermissionMode = "read_only" | "strict" | "standard" | "trust";
+
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+export type TodoItem = {
+  content: string;
+  status: TodoStatus;
+};
+
+export type CompactReport = {
+  persisted: number;
+  snipped: number;
+  micro_compacted: number;
+  summarized: boolean;
+  estimated_chars: number;
+  transcript: string | null;
+};
+
+export type CompactionSettings = {
+  enabled: boolean;
+  context_char_limit: number;
+  large_result_chars: number;
+  preview_chars: number;
+  trigger_messages: number;
+  target_messages: number;
+  keep_recent_results: number;
+};
+
+export type MemorySettings = {
+  enabled: boolean;
+  auto_recall: boolean;
+  recall_limit: number;
+};
+
+export type HookConfig = {
+  event: string;
+  command: string;
+  timeout_secs: number;
+  enabled: boolean;
+};
+
+export type HarnessConfig = {
+  permission_mode: PermissionMode;
+  max_steps: number;
+  max_tokens: number;
+  temperature: number;
+  compaction: CompactionSettings;
+  memory: MemorySettings;
+  hooks: HookConfig[];
+};
+
+export type MemoryRecord = {
+  name: string;
+  description: string;
+  kind: string;
+  body: string;
+  path: string;
+};
+
+export type HarnessInfo = {
+  config: HarnessConfig;
+  path: string;
+  memory_dir: string;
+  audit_log: string;
+  memory: MemoryRecord[];
+};
+
+export type ApprovalRequest = {
+  id: string;
+  tool: string;
+  args: unknown;
+  reason: string;
+  session_id: string | null;
+};
 
 export type SubjectInfo = {
   id: string;
@@ -81,6 +163,10 @@ export type ChatReply = {
   output_tokens: number;
   provider: string;
   model: string;
+  todos: TodoItem[];
+  compactions: CompactReport;
+  permission_denials: number;
+  stop_reason: "completed" | "max_steps" | "stopped";
 };
 
 export type ChatMessage = {
@@ -103,6 +189,7 @@ export type SessionInfo = {
 export type SessionDetail = {
   id: string;
   messages: { role: string; content: string }[];
+  todos: TodoItem[];
 };
 
 export type ConnectionTest = {

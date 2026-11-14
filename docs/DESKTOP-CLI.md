@@ -28,23 +28,18 @@
 │ Tauri desktop       │        │ CLI (tez)           │
 │ React + Vite        │        │ clap + dialoguer    │
 └──────────┬──────────┘        └──────────┬──────────┘
-           │ HTTP/SSE 127.0.0.1           │
+           │ Tauri commands               │ gọi trực tiếp
            └──────────────┬───────────────┘
                           ▼
            ┌─────────────────────────────────┐
-           │ Local server (axum)             │
-           │  /v1/agent/chat /v1/connections │
-           └──────────────┬──────────────────┘
-                          ▼
-           ┌─────────────────────────────────┐
            │ tez-core (Rust)                 │
-           │  agent loop · context · tools   │
-           │  pedagogy · rag · domain        │
+           │  agent loop · harness · context │
+           │  tools · pedagogy · rag         │
            └──────────────┬──────────────────┘
                           ▼
         ┌─────────────────┴─────────────────┐
         │ SQLite + FTS5        OS keychain  │
-        │ (lessons, traces)    (master key) │
+        │ (sessions, todos)    (master key) │
         └─────────────────┬─────────────────┘
                           ▼
               Provider APIs / Ollama
@@ -52,17 +47,24 @@
 
 **Process model:**
 
-> **MVP hiện tại:** desktop gọi Tauri commands in-process (`app_status`, `chat`, `list_sessions`, `load_session`, `list_providers`, `save_provider`, `delete_provider`, `activate_provider`, `test_provider`, `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `open_extension_path`), dùng chung crate và DB với CLI; chưa có `tez-server`. Khi cần streaming/SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
+> **MVP hiện tại:** desktop gọi Tauri commands in-process, dùng chung crate và DB với CLI; chưa có `tez-server`. Nhóm command chính:
+>
+> - Chat/session: `app_status`, `chat`, `list_sessions`, `load_session`.
+> - Harness: `respond_approval`, `get_harness`, `save_harness`, `delete_memory`.
+> - Provider: `list_providers`, `save_provider`, `delete_provider`, `activate_provider`, `test_provider`, `test_connection`.
+> - Extension: `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `open_extension_path`.
+> - Update/file: `check_update`, `download_update`, `launch_update`, `open_external`, `open_workspace`.
+>
+> Khi một tool cần duyệt, `DesktopApprover` phát event `tez://approval-request`; React mở modal rồi gọi `respond_approval({ id, approved })`. Khi cần streaming/SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
 
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
 - Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp môn/từ khóa và đăng ký tool MCP vào cùng registry với tool built-in.
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
-- Local server là chủ sở hữu duy nhất của DB, vault, provider calls.
-- Tauri shell khởi động server in-process (tokio) và inject `{ url, token }` cho frontend.
-- CLI tìm server qua `server.json`; nếu chưa có, chạy one-shot hoặc `tez serve`.
-- Server bind `127.0.0.1`, port ngẫu nhiên; token bearer; file `0600`.
-- Một server tránh tranh chấp SQLite; streaming/refresh/retry viết một lần.
+- Desktop và CLI đều mở SQLite trực tiếp; WAL + `busy_timeout` xử lý tranh chấp ngắn. Không có process server riêng.
+- Mỗi lệnh chat mở Store, nạp session/todo, chạy agent rồi ghi message/tool call/usage; lỗi DB trả về UI dưới dạng chuỗi thân thiện.
+- Provider call nằm trong `tez-core` qua trait `LlmProvider`; vault/keychain nằm trong `tez-auth`.
+- Streaming/SSE và local server vẫn là kế hoạch khi cần nhiều client; hiện tại token trả một lần.
 
 ---
 
@@ -93,18 +95,18 @@ subjects/
 | Ngôn ngữ | **Rust** | Core/CLI/desktop backend một ngôn ngữ; an toàn, nhanh. |
 | Desktop shell | **Tauri 2** | Binary nhỏ, dùng webview hệ thống; Rust backend. |
 | Frontend | **React + Vite + CSS design system** | Không cần SSR; build nhanh; giao diện editorial tự viết, không phụ thuộc UI kit. |
-| Local server | **axum + tokio + tower-http** | SSE/streaming tốt, hệ sinh thái mạnh. |
-| HTTP client | **reqwest + rustls + eventsource-stream** | Provider streaming. |
-| DB | **SQLite + rusqlite (bundled) + refinery** | Local, zero cost, migration. |
+| Local server | **chưa triển khai** | Hiện Tauri commands in-process; thêm axum/SSE khi cần nhiều client. |
+| HTTP client | **reqwest + rustls** | Gọi provider OpenAI-compatible. |
+| DB | **SQLite + rusqlite (bundled)** | Local, zero cost; migration SQL idempotent trong `tez-store`. |
 | Vector | **FTS5 + embedding BLOB + cosine** (sqlite-vec sau) | Đơn giản cho <10k chunk. |
-| Serialize | **serde + serde_json + schemars + jsonschema** | Tool schema/validation. |
+| Serialize | **serde + serde_json** | Tool schema/JSON; chưa dùng schemars/jsonschema. |
 | Credential | **keyring + aes-gcm + argon2** | OS keychain + mã hóa. |
-| CLI | **clap + dialoguer/inquire + indicatif** | Nhanh; ratatui TUI sau. |
-| Tokenizer | **tiktoken-rs** (xấp xỉ cho provider khác) | Context budget. |
+| CLI | **clap + dialoguer** | Nhanh; ratatui TUI sau. |
+| Tokenizer | **chưa dùng** | Ước lượng context bằng độ dài JSON; thêm `tiktoken-rs` khi cần. |
 | Logging | **tracing + tracing-subscriber** | Debug có cấu trúc. |
 | Errors | **thiserror (lib) + anyhow (CLI)** | Rõ ràng. |
-| Config | **directories + figment/toml** | Chuẩn OS. |
-| Test | **cargo test + wiremock + assert_cmd + insta** | Unit/integration/snapshot. |
+| Config | **directories + serde_json** | Chuẩn OS; `harness.json`, `providers.json`. |
+| Test | **cargo test + mock provider** | Unit/integration; `assert_cmd` cho CLI e2e sau. |
 | CI | **GitHub Actions** | Build matrix 3 OS. |
 
 **Tauri thay vì Electron:** bạn thích Rust; binary nhỏ; backend Rust tự nhiên. Đổi lại: compile lâu hơn, cần cài system deps (Linux: webkit2gtk, libappindicator...), và học Tauri.
@@ -113,7 +115,7 @@ subjects/
 
 ---
 
-## 5. Local server API
+## 5. Local server API (kế hoạch)
 
 ```
 GET  /health
@@ -143,19 +145,17 @@ GET  /v1/usage
 ## 6. CLI `tez`
 
 ```bash
-tez init
-tez connect
 tez connect groq --method key
 tez connect ollama
 tez connect custom
-tez auth list
-tez auth switch groq work
-tez auth logout groq work
-tez models
-tez chat --subject math --lesson <id>
-tez chat --no-tools
-tez chat --mode code --workspace ~/du-an
-tez update
+tez chat "Giải thích borrow checker"
+tez chat --subject math "Giải phương trình 2x + 3 = 7"
+tez chat --mode code --workspace ~/du-an "Sửa lỗi build"
+tez chat --session <id> --history 20 "Tiếp tục việc còn dở"
+tez chat --yes --permission trust --max-steps 20 "Chạy test"
+tez chat --permission read_only "Đọc và giải thích kiến trúc"
+tez chat --no-memory "Bỏ qua memory đã lưu"
+tez update --check-only
 tez update --download
 tez tools list
 tez tools test calculate --args '{"expression":"2+2"}'
@@ -166,21 +166,28 @@ tez skills show <id>
 tez mcp list
 tez mcp test [server]
 tez plugins
-tez context inspect --session <id>
-tez trace <session-id>
-tez lesson list
-tez lesson create
-tez lesson ingest <file>
 tez subject list
+tez sessions
+tez memory list
+tez memory search "quy ước build"
+tez memory forget "Build command"
+tez harness
 tez usage
 tez doctor
-tez serve
 ```
 
-- `--json` cho automation.
-- Exit code: 0 ok, 2 auth, 3 quota, 4 tool error.
-- Streaming text + trạng thái tool.
-- `tez doctor`: server, DB, keychain, provider, tokenizer, disk.
+- `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
+  tương tác; có pipe thì đọc một lần từ stdin.
+- `--mode code` dùng workspace tools; `--workspace` mặc định là thư mục hiện
+  tại. `--session` khôi phục mode/môn học đã lưu.
+- `--yes` tự duyệt mọi thao tác cần permission; `--permission` ghi đè
+  `harness.json`; `--max-steps` và `--no-memory` ghi đè cho riêng lượt chạy.
+- `tez memory list|search|forget` và `tez harness` xem bộ nhớ dài hạn và cấu
+  hình harness.
+- Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
+  thống kê nén đi ra stderr. Chưa có streaming token.
+- Lỗi trả exit code 1 kèm thông báo. `tez doctor` kiểm tra data dir, provider,
+  DB, skill, MCP, plugin, harness và dung lượng.
 
 ---
 
@@ -188,21 +195,22 @@ tez serve
 
 | Màn hình | Chức năng |
 |---|---|
-| Onboarding | Chọn provider, connect, chọn model |
-| **Chat** | Trợ lý tổng quát (không bắt chọn môn), preset môn/lớp tùy chọn, tool trace, token usage |
-| **Code** | Workspace chip, `read_file`/`write_file`/`list_files`/`run_command`, tool trace |
-| Lessons | Tạo/sửa bài, objectives, tài liệu, ingest |
-| Tools | Danh sách tool theo môn, bật/tắt, test |
-| Context | Xem section/token/bị cắt |
+| **Chat** | Trợ lý tổng quát (không bắt chọn môn), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
+| **Code** | Workspace chip, `read_file`/`write_file`/`edit_file`/`list_files`/`glob`/`grep`/`run_command`, todo/context dock, approval modal |
+| **Approval modal** | Hiện lý do + tool + args JSON; từ chối hoặc cho phép; timeout 180 s thì từ chối |
+| **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
 | Settings → MCP | Server stdio, env, cwd, test, danh sách tool |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
+| **Settings → Harness** | Permission mode, giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
 | Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
 | Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục |
-| Settings → Models | Model mặc định theo task |
-| Usage | Token/latency/chi phí ước tính |
-| About/Doctor | Version, log, health |
+| Usage | Token/latency/chi phí ước tính *(kế hoạch)* |
+| About/Doctor | Version, log, health *(kế hoạch)* |
+
+Các màn Lessons, Tools, Context inspector và Models theo mô tả cũ vẫn là kế
+hoạch; bản hiện tại tập trung vào Chat/Code, extension và harness.
 
 **Tauri security:**
 
@@ -241,8 +249,9 @@ Chi tiết: [PROVIDER-AUTH.md](PROVIDER-AUTH.md).
 ## 9. SQLite
 
 - `PRAGMA journal_mode=WAL`, `foreign_keys=ON`.
-- Migration bằng `refinery` khi server khởi động; backup trước migration lớn.
-- Bảng chính: `profiles`, `provider_catalog`, `connections`, `model_preferences`, `courses`, `lessons`, `objectives`, `documents`, `chunks`, `sessions`, `messages`, `agent_steps`, `tool_calls`, `context_snapshots`, `evidence`, `ai_usage`, `settings`.
+- Migration hiện tại là schema version 5; `Store::migrate` chạy `SCHEMA` idempotent rồi thêm cột còn thiếu (`sessions.subject`, `sessions.mode`).
+- Bảng chính: `profiles`, `connections`, `lessons`, `sessions`, `messages`, `context_snapshots`, `tool_calls`, `session_todos`, `ai_usage`, `documents`, `document_chunks`, `document_chunks_fts`, `schema_migrations`.
+- `session_todos` giữ kế hoạch của phiên dưới dạng JSON array, khoá theo `session_id`; desktop/CLI nạp lại khi resume.
 - Không multi-tenant; mỗi máy một DB.
 
 Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
@@ -289,12 +298,12 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 
 | Rủi ro | Biện pháp |
 |---|---|
-| Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check; file token `0600`. |
+| Local server (tương lai) | Nếu bật `tez-server`: 127.0.0.1 + bearer token + Origin check; file token `0600`. Hiện desktop gọi Tauri command in-process. |
 | Key rò rỉ | keychain + AES-GCM; redaction; không log header. |
 | Key lộ qua renderer | Renderer không nhận secret. |
-| Tool nguy hiểm | Không shell/code runner MVP; permission + allowlist. |
-| Prompt injection | Tài liệu/tool result là data; delimiter; không thực thi. |
-| Ghi dữ liệu sai | Write tool confirmation; audit. |
+| Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; không phải sandbox OS. |
+| Prompt injection | Tài liệu/tool result là data; delimiter; không thực thi chỉ dẫn; tool allowlist. |
+| Ghi dữ liệu sai | Write/edit tool qua permission; audit JSONL; todo/plan hiển thị để người dùng theo dõi. |
 | Update giả | GitHub Releases + checksum; signing sau. |
 | Dữ liệu trẻ em | Local-only; age mode; không telemetry mặc định. |
 
@@ -302,12 +311,13 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 
 ## 13. Testing
 
-- Unit: vault, tool math/chemistry, context budget, policy.
-- Integration: mock provider + agent loop; SSE.
-- CLI e2e: `assert_cmd`; connect/chat/tools/context.
-- Desktop smoke: Tauri driver/Playwright (sau).
-- Migration: schema cũ → mới, không mất dữ liệu.
-- Security: secret không có trong log/response; token sai 401.
+- Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, store migration v5 và `session_todos`.
+- Integration: mock provider + agent loop; permission denial; subagent; MCP stdio; artifact compaction (`sessions/<id>/tool-results|transcripts`).
+- CLI e2e: `assert_cmd`; connect/chat/tools/context; `--yes`/`--permission`/`--max-steps`; `memory`, `harness`.
+- Desktop smoke: Tauri driver/Playwright (sau); preview mock hiện kiểm tra approval modal, Harness dock và Settings → Harness.
+- Frontend: `tsc --noEmit` + Vite build sạch.
+- Migration: schema cũ → v5, không mất dữ liệu; todo của phiên cũ được giữ.
+- Security: secret không có trong log/response; audit JSONL; redaction; token sai 401 (khi có server).
 
 ---
 
@@ -316,12 +326,12 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Phase | Thời lượng | Kết quả |
 |---|---|---|
 | 0. Rust basics | 1–2 tuần | CLI nhỏ, hiểu ownership/async |
-| 1. Core + CLI | 2–3 tuần | `tez chat` streaming |
+| 1. Core + CLI | 2–3 tuần | `tez chat` (hiện non-streaming) |
 | 2. Auth + store | 2 tuần | `tez connect/models`, vault, SQLite |
-| 3. Agent loop | 2–3 tuần | Context + tools + 6 tool chung |
+| 3. Agent loop + harness | 2–3 tuần | Context + tools + permission/hooks/todo/subagent/compaction/memory |
 | 4. Subject packs | 2–3 tuần | 4 môn mỏng, RAG, evidence, eval |
-| 5. Tauri | 2–3 tuần | Desktop UI, tool cards, context inspector |
-| 6. Packaging | 1–2 tuần | Installer 3 OS, beta |
+| 5. Tauri | 2–3 tuần | Desktop UI, approval modal, Harness dock, context inspector |
+| 6. Packaging | 1–2 tuần | Installer 3 OS, updater, beta |
 
 **Tổng:** 12–18 tuần part-time; 5h/tuần thì 6–8 tháng.
 
@@ -332,7 +342,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Quyết định | Chọn | Lý do |
 |---|---|---|
 | Desktop shell | Tauri | Rust, binary nhỏ |
-| Local server | axum | Share desktop/CLI, SSE |
+| Desktop ↔ core | Tauri command in-process | Không cần server/SSE; ít bề mặt tấn công |
 | DB | SQLite | Local, zero cost |
 | Provider | OpenAI-compatible trước | Phủ Groq/OpenRouter/Cloudflare/Ollama |
 | Agent | Tự viết loop | Kiểm soát pedagogy/tools/context |
@@ -345,10 +355,10 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 
 1. CAS Toán: numeric/step-check hay SymPy sidecar?
 2. Grammar Anh: `harper` hay model?
-3. Tool write: auto hay confirmation?
+3. Memory: giữ keyword scoring hay thêm embedding local?
 4. Subject pack: compile-time hay load file?
 5. Lesson pack trong MVP?
-6. Tauri updater bật ngay?
+6. Code mode: có cần sandbox OS (container/landlock) ngoài giới hạn workspace?
 
 ---
 
