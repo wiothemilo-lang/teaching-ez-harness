@@ -181,6 +181,7 @@ pub fn parse_formula(formula: &str) -> Result<Composition, String> {
     if cleaned.is_empty() {
         return Err("công thức rỗng".to_string());
     }
+    super::check_input_bounds(&cleaned)?;
 
     let mut total = Composition::new();
     for part in cleaned.split(['·', '*']) {
@@ -263,5 +264,11 @@ mod tests {
     #[test]
     fn rejects_unknown_element() {
         assert!(parse_formula("Xx2O").is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_formula() {
+        let deep = format!("{}H{}", "(".repeat(5000), ")".repeat(5000));
+        assert!(parse_formula(&deep).is_err());
     }
 }

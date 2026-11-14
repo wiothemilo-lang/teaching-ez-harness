@@ -21,3 +21,7 @@ tez-llm = { path = "../tez-llm" }
 tez-store = { path = "../tez-store" }
 tez-update = { path = "../tez-update" }
 tokio.workspace = true
+
+# Khôi phục SIGPIPE mặc định của Unix để `tez ... | head` không panic.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

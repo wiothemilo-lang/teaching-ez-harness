@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 dialoguer = "0.11"
 directories = "5"
 evalexpr = "11"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

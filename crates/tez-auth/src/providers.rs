@@ -148,6 +148,7 @@ pub fn upsert(
     let dir = dir.as_ref();
     let mut book = load(dir)?;
     let provider = input.provider.trim().to_lowercase();
+    connection::validate_provider(&provider)?;
     let requested_id = input
         .id
         .map(str::trim)
@@ -366,6 +367,28 @@ mod tests {
         assert_eq!(edited.name, "Groq nhanh");
         assert_eq!(edited.model, "llama-3.1-8b-instant");
         assert_eq!(decrypt_key(dir.path(), &edited).unwrap(), "sk-keep");
+    }
+
+    #[test]
+    fn rejects_unknown_provider_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "bogus",
+                api_key: Some("sk-secret"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            connection::ConnectionError::ProviderNotFound(_)
+        ));
+        assert!(!path(dir.path()).exists());
+        assert!(load(dir.path()).unwrap().providers.is_empty());
     }
 
     #[test]

@@ -66,6 +66,7 @@ impl Tool for PlotFunction {
             .get("expression")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'expression'".into()))?;
+        super::check_input_bounds(expression).map_err(ToolError::InvalidArgs)?;
         let x_min = args.get("x_min").and_then(Value::as_f64).unwrap_or(-10.0);
         let x_max = args.get("x_max").and_then(Value::as_f64).unwrap_or(10.0);
         let width = args

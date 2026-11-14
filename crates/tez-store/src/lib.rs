@@ -220,6 +220,19 @@ INSERT OR IGNORE INTO schema_migrations(version) VALUES (3);
 INSERT OR IGNORE INTO schema_migrations(version) VALUES (4);
 "#;
 
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        mode: row.get(2)?,
+        state: row.get(3)?,
+        summary: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        messages: row.get(7)?,
+    })
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
@@ -243,6 +256,7 @@ impl Store {
         self.conn.execute_batch(SCHEMA)?;
         self.add_column_if_missing("sessions", "subject", "TEXT")?;
         self.add_column_if_missing("sessions", "mode", "TEXT NOT NULL DEFAULT 'chat'")?;
+        self.add_column_if_missing("documents", "subject", "TEXT")?;
         self.ensure_fts_schema()?;
         Ok(())
     }
@@ -452,6 +466,39 @@ impl Store {
         Ok(exists != 0)
     }
 
+    /// Metadata của một session, dùng khi resume để khôi phục mode/môn học.
+    pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRow>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.subject, s.mode, s.state, s.summary, s.started_at, s.ended_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+             FROM sessions s
+             WHERE s.id = ?1",
+        )?;
+        let mut rows = statement.query_map(params![session_id], session_from_row)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Dọn session khi một lượt chat thất bại: xoá nếu chưa có message nào,
+    /// ngược lại đánh dấu `failed` để không kẹt ở trạng thái `active`.
+    pub fn abandon_session(&self, session_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM sessions
+             WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = ?1)",
+            params![session_id],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions
+             SET state = 'failed', ended_at = datetime('now')
+             WHERE id = ?1 AND state IN ('intake', 'active')",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     /// Mở lại session để chat tiếp.
     pub fn resume_session(&self, session_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
@@ -648,18 +695,7 @@ impl Store {
              ORDER BY s.started_at DESC, s.rowid DESC
              LIMIT ?1",
         )?;
-        let rows = statement.query_map(params![limit as i64], |row| {
-            Ok(SessionRow {
-                id: row.get(0)?,
-                subject: row.get(1)?,
-                mode: row.get(2)?,
-                state: row.get(3)?,
-                summary: row.get(4)?,
-                started_at: row.get(5)?,
-                ended_at: row.get(6)?,
-                messages: row.get(7)?,
-            })
-        })?;
+        let rows = statement.query_map(params![limit as i64], session_from_row)?;
 
         let mut sessions = Vec::new();
         for row in rows {
@@ -884,6 +920,85 @@ mod tests {
         let by_id = |id: &str| sessions.iter().find(|row| row.id == id).unwrap();
         assert_eq!(by_id(&chat).mode, "chat");
         assert_eq!(by_id(&code).mode, "code");
+    }
+
+    #[test]
+    fn gets_session_metadata_for_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+
+        let id = store
+            .create_session_mode("default", None, Some("math"), "code")
+            .unwrap();
+        let row = store
+            .get_session(&id)
+            .unwrap()
+            .expect("session phải tồn tại");
+        assert_eq!(row.id, id);
+        assert_eq!(row.mode, "code");
+        assert_eq!(row.subject.as_deref(), Some("math"));
+        assert_eq!(row.state, "intake");
+        assert_eq!(row.messages, 0);
+
+        assert!(store.get_session("không-tồn-tại").unwrap().is_none());
+    }
+
+    #[test]
+    fn abandon_session_removes_empty_and_marks_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+
+        let empty = store
+            .create_session_mode("default", None, Some("general"), "chat")
+            .unwrap();
+        store.abandon_session(&empty).unwrap();
+        assert!(store.get_session(&empty).unwrap().is_none());
+
+        let used = store
+            .create_session_mode("default", None, Some("general"), "chat")
+            .unwrap();
+        store
+            .append_message(NewMessage {
+                session_id: &used,
+                role: "user",
+                content: "hello",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+        // Session mới vẫn ở trạng thái intake khi lượt chat lỗi.
+        store.abandon_session(&used).unwrap();
+        let row = store.get_session(&used).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.messages, 1);
+        assert!(row.ended_at.is_some());
+    }
+
+    #[test]
+    fn migrates_documents_subject_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.ensure_profile("default", "Học sinh").unwrap();
+        }
+        {
+            // Mô phỏng DB cũ trước khi có cột documents.subject.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE documents DROP COLUMN subject")
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        store
+            .add_document("default", Some("math"), "Ghi chú", None, None, "nội dung")
+            .unwrap();
+        let documents = store.list_documents(10).unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].subject.as_deref(), Some("math"));
     }
 
     #[test]
