@@ -8,6 +8,7 @@ import type {
   HarnessConfig,
   HarnessInfo,
   McpTest,
+  PlanInfo,
   PluginInfo,
   ProviderInfo,
   SaveMcpPayload,
@@ -41,8 +42,20 @@ export function stopChat(): Promise<boolean> {
   return invoke("stop_chat");
 }
 
-export function respondApproval(id: string, approved: boolean): Promise<boolean> {
-  return invoke("respond_approval", { request: { id, approved } });
+export function loadSessionPlan(sessionId: string): Promise<PlanInfo> {
+  return invoke("load_session_plan", { sessionId });
+}
+
+export function saveSessionPlan(sessionId: string, text: string): Promise<PlanInfo> {
+  return invoke("save_session_plan", { sessionId, text });
+}
+
+export function respondApproval(
+  id: string,
+  approved: boolean,
+  remember = false,
+): Promise<boolean> {
+  return invoke("respond_approval", { request: { id, approved, remember } });
 }
 
 export function getHarness(): Promise<HarnessInfo> {

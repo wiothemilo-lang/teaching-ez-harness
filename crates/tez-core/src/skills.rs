@@ -173,30 +173,79 @@ impl SkillRegistry {
     /// Skill không có description vẫn hiện, chỉ thiếu phần mô tả. Danh sách
     /// sắp theo id để prompt ổn định giữa các lần chạy.
     pub fn catalog_lines(&self, limit: usize) -> Vec<String> {
+        self.grouped()
+            .into_iter()
+            .flat_map(|(_, skills)| skills)
+            .take(limit)
+            .map(catalog_line)
+            .collect()
+    }
+
+    /// Danh mục đầy đủ có tiêu đề theo nguồn, dùng khi model gọi `skill`
+    /// không kèm tên.
+    pub fn catalog_grouped(&self, limit: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut remaining = limit;
+        for (label, skills) in self.grouped() {
+            if remaining == 0 {
+                break;
+            }
+            lines.push(format!("[{label}] {}", skills.len()));
+            for skill in skills {
+                if remaining == 0 {
+                    break;
+                }
+                lines.push(catalog_line(skill));
+                remaining -= 1;
+            }
+        }
+        lines
+    }
+
+    /// Bản rút gọn cho system prompt: mỗi nguồn một dòng kèm id tiêu biểu.
+    pub fn catalog_overview(&self, max_ids_per_source: usize) -> Vec<String> {
+        self.grouped()
+            .into_iter()
+            .map(|(label, skills)| {
+                let ids: Vec<&str> = skills
+                    .iter()
+                    .take(max_ids_per_source)
+                    .map(|skill| skill.id.as_str())
+                    .collect();
+                let more = if skills.len() > max_ids_per_source {
+                    format!(", … +{}", skills.len() - max_ids_per_source)
+                } else {
+                    String::new()
+                };
+                let ids = if ids.is_empty() {
+                    "…".to_string()
+                } else {
+                    format!("{}{}", ids.join(", "), more)
+                };
+                format!("- {label} ({}): {ids}", skills.len())
+            })
+            .collect()
+    }
+
+    fn grouped(&self) -> Vec<(String, Vec<&Skill>)> {
         let mut skills: Vec<&Skill> = self.skills.iter().collect();
         // Skill dự án đứng trước để model thấy ngữ cảnh cục bộ trước built-in.
         skills.sort_by(|a, b| {
             source_rank(&a.source)
                 .cmp(&source_rank(&b.source))
+                .then_with(|| a.source.cmp(&b.source))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        skills
-            .into_iter()
-            .take(limit)
-            .map(|skill| {
-                let description = truncate_chars(skill.description.trim(), 160);
-                let id = if skill.source == "project" {
-                    format!("[project] {}", skill.id)
-                } else {
-                    skill.id.clone()
-                };
-                if description.is_empty() {
-                    format!("- {id} — {}", skill.name)
-                } else {
-                    format!("- {id} — {}: {}", skill.name, description)
-                }
-            })
-            .collect()
+
+        let mut groups: Vec<(String, Vec<&Skill>)> = Vec::new();
+        for skill in skills {
+            let label = source_label(&skill.source);
+            match groups.iter_mut().find(|(name, _)| *name == label) {
+                Some((_, items)) => items.push(skill),
+                None => groups.push((label, vec![skill])),
+            }
+        }
+        groups
     }
 
     /// Chọn tối đa `limit` skill khớp môn và từ khóa.
@@ -235,6 +284,28 @@ impl SkillRegistry {
         matched.sort_by(|a, b| a.name.cmp(&b.name));
         matched.truncate(limit);
         matched
+    }
+}
+
+fn catalog_line(skill: &Skill) -> String {
+    let description = truncate_chars(skill.description.trim(), 160);
+    let id = if skill.source == "project" {
+        format!("[project] {}", skill.id)
+    } else {
+        skill.id.clone()
+    };
+    if description.is_empty() {
+        format!("- {id} — {}", skill.name)
+    } else {
+        format!("- {id} — {}: {}", skill.name, description)
+    }
+}
+
+fn source_label(source: &str) -> String {
+    match source {
+        "project" | "user" | "builtin" => source.to_string(),
+        "plugin" => "plugin".to_string(),
+        other => format!("plugin:{other}"),
     }
 }
 
@@ -540,6 +611,22 @@ mod tests {
         assert_eq!(description.chars().count(), 161);
         assert!(description.ends_with('…'));
         assert_eq!(lines[1], "- plain — Plain");
+    }
+
+    #[test]
+    fn catalog_groups_by_source_and_overview_is_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        let grouped = registry.catalog_grouped(10);
+        assert!(grouped[0].starts_with("[user] "));
+        assert!(grouped
+            .iter()
+            .any(|line| line.starts_with("- english-writing — ")));
+
+        let overview = registry.catalog_overview(1);
+        assert_eq!(overview.len(), 1);
+        assert!(overview[0].starts_with("- user ("));
+        assert!(overview[0].contains("… +"));
     }
 
     #[test]

@@ -82,7 +82,7 @@ docs/
 5. Nếu model gọi tool, với từng call:
    a. chạy hook `PreToolUse` — có thể chặn thẳng;
    b. permission pipeline: deny-list → ask → allow;
-   c. nếu `ask`, gọi `Approver` (dialog desktop hoặc terminal CLI);
+   c. nếu `ask`, gọi `Approver` (dialog desktop hoặc terminal CLI; CLI in unified diff trước khi hỏi với `write_file`/`edit_file`);
    d. thực thi tool với timeout riêng của tool;
    e. cắt output theo `max_tool_output`;
    f. chạy hook `PostToolUse` — có thể thay output (ví dụ che secret);
@@ -151,7 +151,7 @@ gọi `chat` rồi gửi toàn bộ text một lần.
 
 Desktop nối sender đó vào event `tez://chat-delta` (`{ session_id, text }`);
 frontend ghép dần vào một message tạm, rồi thay bằng message cuối khi lượt chạy
-xong. CLI hiện chưa stream. Permission, hook và compaction không phụ thuộc vào
+xong. CLI dùng cùng sender qua `with_stream` và một task `spawn_blocking` in từng delta ra stdout; tool trace và thống kê vẫn đi stderr. Permission, hook và compaction không phụ thuộc vào
 cách provider trả dữ liệu.
 
 ### 3.4 Kết thúc
@@ -174,12 +174,12 @@ Agent dừng khi:
 |---|---|---|
 | **System** | Vai trò chat/code, ngôn ngữ, chỉ dẫn bổ sung của người dùng | Pinned |
 | **Project** | `AGENTS.md`/`CLAUDE.md` và `.tez/` của workspace, render thành `<project-instructions>`, tối đa 24 KB | Cao |
-| **Skills** | Catalog ngắn (id, tên, mô tả); model gọi tool `skill` để nạp toàn bộ hướng dẫn | Cao |
+| **Skills** | Catalog rút gọn theo nguồn (tối đa 12 id/nguồn); tool `skill` không tên trả danh mục đầy đủ, có tên trả body | Cao |
 | **Memory** | Memory recall theo từ khóa | Cao |
 | **Todos** | Kế hoạch hiện tại của phiên | Pinned |
 | **RAG** | Top-k chunk tài liệu liên quan, kèm citation | Cao |
 | **Summary** | Tóm tắt các lượt cũ khi compaction | Trung bình |
-| **Recent turns** | 6–10 lượt gần nhất nguyên văn; lượt hiện tại có thể kèm ảnh (image parts) | Cao |
+| **Recent turns** | Lượt gần nhất nguyên văn (CLI mặc định 12 message, desktop tối đa 40); lượt hiện tại có thể kèm ảnh, và tối đa 2 lượt user gần nhất được gửi lại ảnh trong ngân sách 6 ảnh/8 MB | Cao |
 | **Tool specs** | Schema các tool được phép | Pinned |
 
 ### 4.2 Token budget
@@ -264,30 +264,49 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
 
 - **Registry**: `ToolRegistry` giữ tool built-in, tool MCP (`mcp__server__tool`)
   và tool harness (`todo_write`, `task`, `memory_*`, `compact`). Mỗi subject
-  pack lọc allowlist; chế độ Code dùng `code_registry(root)`.
-- **Skill tool** (`tools/skill.rs`): nhận `name`, tìm theo id rồi tên, trả body
-  trong thẻ `<skill>` (cap 12 KB). Catalog lấy từ
-  `SkillRegistry::catalog_lines`; skill dự án đứng trước user/plugin/built-in và
-  được đánh dấu `[project]`; đây là progressive disclosure một tầng.
+  pack lọc allowlist; chế độ Code dùng `code_registry(root)`; chế độ Plan dùng
+  `PLAN_TOOLS` + `skill`/`web_fetch` và chỉ thêm tool MCP được khai báo
+  read-only.
+- **Skill tool** (`tools/skill.rs`): `name` là tùy chọn. Không có `name`, tool
+  trả danh mục đầy đủ nhóm theo nguồn (`catalog_grouped`, tối đa 200 skill và
+  24.000 ký tự). Có `name`, tool tìm theo id rồi tên và trả body trong thẻ
+  `<skill>` (cap 12.000 ký tự). System prompt chỉ nhận `catalog_overview`:
+  mỗi nguồn một dòng, tối đa 12 id tiêu biểu. Skill dự án đứng trước
+  user/plugin/built-in; đây là progressive disclosure hai tầng.
 - **Web fetch** (`tools/web.rs`): chỉ http/https, chặn userinfo, localhost và IP
-  nội bộ (kể cả CGNAT, dải tài liệu IPv6, 6to4). Mỗi redirect được resolve DNS
-  lại, kiểm tra IP rồi pin địa chỉ vào client; timeout 20 s, tối đa 5 redirect,
-  body cap 512 KB có đánh dấu khi cắt, charset UTF-8/Latin-1/Windows-1252, lọc
-  HTML và giải mã entity số. Policy mặc định hỏi trước `web_fetch` vì đây là
-  truy cập mạng ngoài.
+  nội bộ (kể cả CGNAT, dải tài liệu IPv6, 6to4). Ở chế độ static, mỗi redirect
+  được resolve DNS lại, kiểm tra toàn bộ địa chỉ rồi pin bằng
+  `resolve_to_addrs`; timeout 20 s, tối đa 5 redirect, body static cap 512 KB có
+  đánh dấu khi cắt, charset UTF-8/Latin-1/Windows-1252, lọc HTML và giải mã
+  entity số. Ở static, content
+  type `application/pdf`, `audio/*`, `video/*` bị từ chối rõ ràng. Chế độ
+  `render: "browser"` chạy Chromium/Chrome/Edge headless tùy chọn (`TEZ_CHROMIUM`, hoặc
+  `chromium`/`chrome`/`msedge` trên `PATH`) để lấy DOM sau JavaScript, timeout
+  25 s; nếu thiếu browser hoặc browser lỗi, tool tự fallback sang static và ghi
+  rõ lý do. `--no-sandbox` chỉ bật khi `TEZ_BROWSER_NO_SANDBOX=1`. Browser map
+  toàn bộ địa chỉ qua `--host-resolver-rules` nhưng chỉ kiểm tra URL/host ban
+  đầu, không revalidate từng redirect. Policy mặc định hỏi trước `web_fetch` vì đây
+  là truy cập mạng ngoài.
 - **Permission pipeline** (`crates/tez-core/src/permission.rs`) có bốn mode:
   `read_only`, `strict`, `standard` (mặc định), `trust`. Mỗi call đi qua:
-  deny-list (lệnh phá hủy) → rule `deny` của người dùng → chặn `read_only` →
-  rule `allow` → ask mặc định (xóa, `git reset --hard`, cài package,
-  `curl | sh`, tool MCP…) → rule `ask` → `strict`. Rule lưu trong
-  `harness.json` dưới dạng `{action, tool, pattern}`; `tool` nhận `*`, pattern
-  là glob khớp path (tool file) hoặc command (`run_command`). Deny-list lệnh phá
-  hủy luôn thắng rule, và `read_only` không bị rule `allow` vượt qua.
+  deny-list (lệnh phá hủy) → rule `deny` của người dùng → tool MCP read-only
+  được cho qua → chặn `read_only` → rule `allow` → ask mặc định (xóa,
+  `git reset --hard`, cài package, `curl | sh`, tool MCP…) → rule `ask` →
+  `strict`. Rule lưu trong `harness.json` dưới dạng `{action, tool, pattern}`;
+  `tool` nhận `*`, pattern là glob khớp path (tool file) hoặc command
+  (`run_command`). Deny-list lệnh phá hủy luôn thắng rule, và `read_only` không
+  bị rule `allow` vượt qua; tool MCP read-only cũng không vượt được deny-list
+  hay rule `deny`.
 - **Approver**: trait async. Desktop hiển thị dialog và trả lời qua event
-  `tez://approval-request` + command `respond_approval`; với `write_file` và
-  `edit_file`, desktop đọc file cũ trong workspace và gửi kèm unified diff ở
-  `preview` để người dùng duyệt trước khi ghi. CLI dùng `dialoguer::Confirm`,
-  có `--yes` để tự duyệt và `--permission` để ghi đè mode.
+  `tez://approval-request` + command `respond_approval({ id, approved, remember })`;
+  với `write_file` và `edit_file`, desktop đọc file cũ trong
+  workspace và gửi kèm unified diff ở `preview` để người dùng duyệt trước khi
+  ghi. Checkbox **Cho phép thao tác này trong phiên hiện tại** khiến broker nhớ
+  khóa `session_id|tool|path` (hoặc command với `run_command`) và tự duyệt các
+  request khớp sau đó; bộ nhớ này chỉ nằm trong tiến trình app. CLI dùng
+  `dialoguer::Confirm`, in unified diff trước prompt cho `write_file`/
+  `edit_file` (cap 24.000 ký tự), có `--yes` để tự duyệt và `--permission` để
+  ghi đè mode.
 - **Hooks** (`crates/tez-core/src/hooks.rs`): `UserPromptSubmit`, `PreToolUse`,
   `PostToolUse`, `Stop`. Hook built-in ghi audit JSONL
   (`<data_dir>/audit.jsonl`) và che API key/private key trong output tool.
@@ -395,15 +414,27 @@ tool file/lệnh; `CODE_TOOL_NAMES` là danh sách chuẩn. `Mode::Code` trong
 ### 5.6 Chế độ Plan
 
 `Mode::Plan` dùng cùng workspace với Code nhưng chỉ đăng ký `PLAN_TOOLS`
-(`read_file`, `list_files`, `glob`, `grep`, `todo_write`, `memory_search`);
-không có tool ghi, chạy lệnh, `task` hay MCP. Policy bị ép về `read_only` bất kể
-cấu hình, nên kể cả rule `allow` cũng không mở được thao tác thay đổi. Prompt
-`plan_system_prompt` yêu cầu agent khảo sát, nêu mục tiêu/phạm vi, file sẽ sửa,
-các bước, rủi ro và cách kiểm chứng, rồi dừng để người dùng chuyển sang Code.
-Desktop dùng chung `ChatView` với cờ `planMode`; CLI nhận `--mode plan`.
+(`read_file`, `list_files`, `glob`, `grep`, `todo_write`, `memory_search`),
+cộng thêm `skill`, `web_fetch` (mặc định vẫn hỏi duyệt vì truy cập mạng) và các
+tool MCP được khai báo read-only. Tool ghi, chạy lệnh, `task`, `compact`,
+`memory_save`/`memory_forget` và MCP thay đổi trạng thái không vào Plan. Policy
+bị ép về `read_only` bất kể cấu hình, nên kể cả rule `allow` cũng không mở được
+thao tác thay đổi; riêng tool MCP read-only được policy cho qua sau deny-list và
+rule `deny`. Prompt `plan_system_prompt` yêu cầu agent khảo sát, nêu mục
+tiêu/phạm vi, file sẽ sửa, các bước, rủi ro và cách kiểm chứng, rồi dừng để
+người dùng chuyển sang Code.
+
+Mỗi lượt Plan, văn bản cuối được lưu vào `plans/<session>.md` qua
+`crates/tez-core/src/plan.rs`; file bị cap 200.000 ký tự và tên session được làm
+sạch (chỉ ASCII chữ/số, `-`, `_`) để không thoát khỏi thư mục `plans/`. Desktop
+dùng chung `ChatView` với cờ `planMode`; nút **Kế hoạch** trên header mở
+`PlanDialog`, gọi `load_session_plan`/`save_session_plan` để xem, sửa và lưu plan
+mà không cần chạy lại agent. CLI nhận `--mode plan` và cũng lưu plan.
 Khi chuyển Plan → Code, desktop giữ nguyên `session_id`, cập nhật mode trong
-SQLite (`Store::update_session_mode`) và chèn chỉ dẫn “thực thi theo kế hoạch”
-vào system prompt; todos và lịch sử vẫn được nạp lại như một phiên bình thường.
+SQLite (`Store::update_session_mode`), nạp lại plan đã lưu và chèn chỉ dẫn “thực
+thi theo kế hoạch” vào system prompt; todos và lịch sử vẫn được nạp lại như một
+phiên bình thường. CLI nạp plan đã lưu ở mỗi lượt Code (tối đa 20.000 ký tự khi
+chèn), không chỉ ở lần chuyển mode.
 
 ## 6. Subject packs
 
@@ -494,8 +525,12 @@ pub trait LlmProvider: Send + Sync {
 - `ChatRequest`: model, messages, tools, temperature, top_p, max_tokens.
 - `Message` có `content: Option<String>` và `images: Vec<String>`; khi có ảnh,
   `message_json` gửi content dạng array `text` + `image_url` (data URL hoặc URL
-  công khai). Không có ảnh thì wire format giữ nguyên như cũ. Desktop lưu ảnh
-  dạng data URL trong cột `messages.images` để resume hiển thị lại; chỉ lượt hiện tại gửi ảnh lên model.
+  công khai). Không có ảnh thì wire format giữ nguyên như cũ. `tez-store` ghi ảnh
+  thành file trong `images/<session>/<message>-<index>.<ext>` và chỉ giữ ref
+  `tez-image:` trong cột `messages.images`; `load_messages` giải mã ref thành data
+  URL khi resume. Khi dựng history, desktop chỉ gửi lại ảnh của tối đa 2 lượt user
+  gần nhất; ngân sách của cả request là 6 ảnh và 8 MB, ưu tiên ảnh của lượt hiện
+  tại (tối đa 4 ảnh).
 - `ChatResponse`: text hoặc tool calls + usage.
 - `chat_stream`: phát text delta qua `tx`, trả `ChatResponse` cuối; tool call
   được gom đủ theo `index` trước khi trả.
@@ -534,7 +569,8 @@ document_chunks_fts (FTS5: content, search_text, chunk_id, document_id)
   lại khi resume và ghi sau mỗi lượt.
 - `context_snapshots` giữ chỗ cho context inspector; bản hiện tại chưa ghi.
 - Artifact compaction nằm ngoài DB: `sessions/<id>/tool-results/*.txt` và
-  `sessions/<id>/transcripts/*.json`.
+  `sessions/<id>/transcripts/*.json`. Plan của phiên nằm ở `plans/<session>.md`
+  (cap 200.000 ký tự, tên file đã làm sạch).
 - Không lưu secret; tool args có thể chứa dữ liệu học sinh → retention ngắn,
   cho phép xóa.
 - SQLite WAL + `busy_timeout=5000`; desktop và CLI có thể mở đồng thời, tranh
@@ -592,16 +628,20 @@ GET  /v1/usage
     `open_workspace`.
 - **Approval flow:** agent gặp call cần duyệt → `DesktopApprover` emit event
   `tez://approval-request` kèm `ApprovalRequest { id, tool, args, reason,
-  session_id }` → React mở modal → `respond_approval({ id, approved })` →
-  oneshot trả kết quả cho agent. Timeout 180 s thì từ chối.
+  session_id }` → React mở modal → `respond_approval({ id, approved, remember })`
+  → oneshot trả kết quả cho agent. Nếu `remember` và được duyệt, broker nhớ
+  `session_id|tool|path` (hoặc command) trong bộ nhớ tiến trình và tự duyệt các
+  request khớp sau đó. Timeout 180 s thì từ chối.
 - `ChatReply` trả thêm `todos`, `compactions`, `permission_denials`,
   `stop_reason`; `SessionDetail` trả `todos` đã lưu.
 - Màn hình hiện tại:
   - **Chat** — trò chuyện tổng quát, không bắt chọn môn.
+  - **Plan** — chỉ đọc workspace, lưu plan vào `plans/<session>.md`.
   - **Code** — workspace tools, tool trace, todo/context dock, approval modal.
   - **Settings** — Providers, Skills, MCP, Plugins, **Harness**, Update, Data.
-  - **Harness** — permission mode, giới hạn agent, compaction, memory + xoá bản
-    ghi, hook shell; hiển thị đường dẫn `harness.json`/memory/audit.
+  - **Harness** — permission mode, permission rule (validate từng dòng, tắt
+    **Lưu** khi lỗi), giới hạn agent, compaction, memory + xoá bản ghi, hook
+    shell; hiển thị đường dẫn `harness.json`/memory/audit.
 - Tool call card: tên, args, kết quả, thời gian, trạng thái ok/error.
 - Security: Tauri capabilities allowlist, CSP, không load remote content.
 
@@ -635,17 +675,19 @@ tez update --check-only
 
 - `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
   tương tác; có pipe thì đọc một lần từ stdin.
-- `--mode code` dùng workspace tools; `--workspace` mặc định là thư mục hiện
-  tại. `--session` khôi phục mode/môn học đã lưu của session.
+- `--mode code` dùng workspace tools; `--mode plan` chỉ đọc và lưu kế hoạch vào
+  `plans/<session>.md`; `--workspace` mặc định là thư mục hiện tại. `--session`
+  khôi phục mode/môn học đã lưu của session.
 - `--yes` tự duyệt mọi thao tác cần permission (CI/script); `--permission`
   ghi đè `harness.json`; `--max-steps` và `--no-memory` ghi đè giới hạn và
-  auto-recall cho riêng lượt chạy.
+  auto-recall cho riêng lượt chạy. Khi hỏi duyệt `write_file`/`edit_file`, CLI
+  in unified diff (cap 24.000 ký tự) trước prompt lý do/tool/args.
 - `tez memory list|search|forget` đọc/xoá bản ghi Markdown trong
   `<data_dir>/memory`; `tez harness` in permission mode, giới hạn agent,
   compaction, memory, hook và đường dẫn audit.
-- Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
-  thống kê nén đi ra stderr để pipe stdout vẫn sạch. CLI chưa stream token;
-  desktop stream text qua event `tez://chat-delta`.
+- Text được stream ra stdout trong lúc agent chạy; tool trace, cảnh báo permission
+  và thống kê nén đi ra stderr để pipe stdout vẫn sạch. Desktop stream qua event
+  `tez://chat-delta`, CLI dùng `with_stream` + task in delta.
 - Lỗi trả exit code 1 kèm thông báo; `tez doctor` kiểm tra data dir, provider,
   DB, skill, MCP, plugin, harness và dung lượng.
 
@@ -672,6 +714,7 @@ tez update --check-only
 | Rủi ro | Biện pháp |
 |---|---|
 | Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; đây không phải sandbox OS |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; app tin khai báo, không xác minh hành vi |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
 | Key rò rỉ | Keychain + AES-GCM; redaction; không trả secret |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
@@ -685,12 +728,15 @@ tez update --check-only
 ## 14. Testing & eval
 
 - **Unit:** tool math/chemistry/workspace; permission (deny/ask/allow, trust,
-  read-only); compaction 4 bước; memory lưu/tìm/xoá; todo; hook block +
-  redaction; harness config sanitize; store migration v5 và `session_todos`.
+  read-only, MCP read-only); compaction 4 bước; memory lưu/tìm/xoá; todo; plan
+  save/load + cap + sanitize tên file; hook block + redaction; harness config
+  sanitize; store migration v5, `session_todos`, image file refs; web_fetch
+  parser, DNS pinning, browser resolver/fallback.
 - **Integration:** mock provider + agent loop; tool call → result → final;
   permission denial; subagent trả text cuối; MCP stdio.
-- **Số test hiện tại:** `tez-core` 84 + 1 MCP stdio, `tez-cli` 12,
-  `tez-auth` 9, `tez-update` 2. `cargo test --workspace` xanh.
+- **Số test hiện tại:** `tez-core` 183 + 1 MCP stdio, `tez-auth` 20,
+  `tez-llm` 14, `tez-store` 27, `tez-update` 3; tổng 248. `cargo test
+  --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
   `cargo fmt --all -- --check` sạch.
 - **Frontend:** `pnpm exec tsc --noEmit` và `pnpm build` (Vite) sạch; preview
@@ -710,7 +756,7 @@ tez update --check-only
 | Phase | Thời lượng | Nội dung | Kết quả |
 |---|---|---|---|
 | 0. Rust basics | 1–2 tuần | Ownership, Result, trait, async, serde, SQLite | Viết được CLI nhỏ |
-| 1. Core + CLI | 2–3 tuần | workspace, provider OpenAI-compatible, `tez chat` | Chat streaming (desktop) |
+| 1. Core + CLI | 2–3 tuần | workspace, provider OpenAI-compatible, `tez chat` | Chat streaming (desktop + CLI) |
 | 2. Auth + store | 2 tuần | SQLite, keychain, vault, `tez connect/models` | BYOK hoạt động |
 | 3. Agent loop | 2–3 tuần | context builder, tool registry, 6 tool chung | Agent biết gọi tool |
 | 4. Subject packs | 2–3 tuần | 4 pack mỏng, RAG, evidence, eval | Dạy được 4 môn cơ bản |

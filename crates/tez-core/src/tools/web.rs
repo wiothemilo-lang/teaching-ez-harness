@@ -1,6 +1,8 @@
 //! Tool `web_fetch`: tải và đọc nội dung HTTP(S) trong giới hạn an toàn.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,6 +51,11 @@ impl Tool for WebFetchTool {
                         "minimum": MIN_MAX_CHARS,
                         "maximum": MAX_MAX_CHARS,
                         "description": "Số ký tự text tối đa trả về (mặc định 20000)"
+                    },
+                    "render": {
+                        "type": "string",
+                        "enum": ["static", "browser"],
+                        "description": "static (mặc định) tải HTML; browser dùng Chromium headless nếu có để chạy JavaScript"
                     }
                 },
                 "required": ["url"],
@@ -69,7 +76,17 @@ impl Tool for WebFetchTool {
                 .ok_or_else(|| ToolError::InvalidArgs("max_chars phải là số nguyên".into()))?
                 .clamp(MIN_MAX_CHARS, MAX_MAX_CHARS) as usize,
         };
-        fetch_url(url, max_chars, false).await
+        let render = args
+            .get("render")
+            .and_then(Value::as_str)
+            .unwrap_or("static");
+        match render {
+            "static" => fetch_url(url, max_chars, false).await,
+            "browser" => fetch_with_browser(url, max_chars).await,
+            other => Err(ToolError::InvalidArgs(format!(
+                "render phải là 'static' hoặc 'browser', nhận '{other}'"
+            ))),
+        }
     }
 }
 
@@ -89,8 +106,8 @@ async fn fetch_url(
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT);
-        if let Some((host, address)) = &pin {
-            builder = builder.resolve(host, *address);
+        if let Some((host, addresses)) = &pin {
+            builder = builder.resolve_to_addrs(host, addresses);
         }
         let client = builder.build().map_err(|error| {
             ToolError::Execution(format!("không tạo được HTTP client: {error}"))
@@ -161,10 +178,20 @@ async fn fetch_url(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let is_html = content_type
+    let lower_content_type = content_type
         .as_deref()
-        .map(|value| value.to_ascii_lowercase().contains("html"))
-        .unwrap_or(false);
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if lower_content_type.starts_with("application/pdf")
+        || lower_content_type.starts_with("audio/")
+        || lower_content_type.starts_with("video/")
+    {
+        return Ok(ToolOutput::error(format!(
+            "chưa hỗ trợ nội dung '{lower_content_type}': web_fetch chỉ đọc HTML/text. \
+             Hãy tải file trực tiếp nếu cần."
+        )));
+    }
+    let is_html = lower_content_type.contains("html");
 
     let (body, body_truncated) = match read_body_capped(&mut response, MAX_BODY_BYTES).await {
         Ok(body) => body,
@@ -185,10 +212,165 @@ async fn fetch_url(
 }
 
 /// Kiểm tra scheme, userinfo và đích đến trước khi gửi request.
+async fn fetch_with_browser(raw_url: &str, max_chars: usize) -> Result<ToolOutput, ToolError> {
+    let Some(binary) = browser_binary() else {
+        return fallback_to_static(raw_url, max_chars, "không tìm thấy Chromium/Chrome").await;
+    };
+    let (_url, pin) = match validate_url(raw_url, false).await {
+        Ok(value) => value,
+        Err(error) => return fallback_to_static(raw_url, max_chars, &error.to_string()).await,
+    };
+    let output = match pin {
+        Some((host, addresses)) => {
+            run_browser(binary, raw_url, Some(&host), &addresses, max_chars).await?
+        }
+        None => run_browser(binary, raw_url, None, &[], max_chars).await?,
+    };
+    if !output.is_error {
+        Ok(output)
+    } else {
+        fallback_to_static(raw_url, max_chars, &output.content).await
+    }
+}
+
+/// Browser không chạy được thì vẫn trả nội dung tĩnh, kèm lý do để người dùng biết.
+async fn fallback_to_static(
+    raw_url: &str,
+    max_chars: usize,
+    reason: &str,
+) -> Result<ToolOutput, ToolError> {
+    let mut output = fetch_url(raw_url, max_chars, false).await?;
+    let reason: String = reason.chars().take(300).collect();
+    output.content = format!("[browser fallback: {reason}]\n\n{}", output.content);
+    Ok(output)
+}
+
+/// Chạy browser với binary đã chọn. `host`/`addresses` là kết quả phân giải đã
+/// kiểm tra, dùng để pin DNS qua `--host-resolver-rules`.
+async fn run_browser(
+    binary: &Path,
+    url: &str,
+    host: Option<&str>,
+    addresses: &[SocketAddr],
+    max_chars: usize,
+) -> Result<ToolOutput, ToolError> {
+    let profile = std::env::temp_dir().join(format!(
+        "tez-browser-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+    let resolver = browser_resolver_rules(host, addresses);
+    let mut command = tokio::process::Command::new(binary);
+    command.arg("--headless=new").arg("--disable-gpu");
+    if browser_no_sandbox() {
+        command.arg("--no-sandbox");
+    }
+    command
+        .arg("--disable-dev-shm-usage")
+        .arg("--virtual-time-budget=5000")
+        .arg(format!("--host-resolver-rules={resolver}"))
+        .arg("--user-data-dir")
+        .arg(&profile)
+        .arg("--dump-dom")
+        .arg(url)
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(Duration::from_secs(25), command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            let _ = std::fs::remove_dir_all(&profile);
+            return Ok(ToolOutput::error(format!(
+                "không chạy được browser: {error}"
+            )));
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&profile);
+            return Ok(ToolOutput::error("browser quá thời gian (25s)".to_string()));
+        }
+    };
+    let _ = std::fs::remove_dir_all(&profile);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let preview: String = stderr.chars().take(MAX_ERROR_PREVIEW_CHARS).collect();
+        return Ok(ToolOutput::error(format!(
+            "browser thoát với lỗi {}: {preview}",
+            output.status
+        )));
+    }
+    let html = String::from_utf8_lossy(&output.stdout);
+    let text = strip_html(&html);
+    let (text, truncated) = truncate_chars(&text, max_chars);
+    let mut content = format!("URL: {url}\nStatus: browser\n\n{text}");
+    if truncated {
+        content.push_str("\n\n… (đã cắt bớt)");
+    }
+    Ok(ToolOutput::ok(content))
+}
+
+fn browser_resolver_rules(host: Option<&str>, addresses: &[SocketAddr]) -> String {
+    match host {
+        Some(host) if !addresses.is_empty() => {
+            let mut rules = vec!["MAP * ~NOTFOUND".to_string(), format!("EXCLUDE {host}")];
+            for address in addresses {
+                rules.push(format!("MAP {host} {address}"));
+            }
+            rules.join(", ")
+        }
+        _ => "MAP * ~NOTFOUND".to_string(),
+    }
+}
+
+fn browser_no_sandbox() -> bool {
+    std::env::var("TEZ_BROWSER_NO_SANDBOX")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn browser_binary() -> Option<&'static PathBuf> {
+    static BROWSER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BROWSER
+        .get_or_init(|| {
+            if let Some(path) = std::env::var_os("TEZ_CHROMIUM") {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+            for name in [
+                "chromium",
+                "chromium-browser",
+                "google-chrome",
+                "google-chrome-stable",
+                "chrome",
+                "msedge",
+            ] {
+                if let Some(path) = find_in_path(name) {
+                    return Some(path);
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 async fn validate_url(
     raw: &str,
     allow_private: bool,
-) -> Result<(reqwest::Url, Option<(String, SocketAddr)>), ToolError> {
+) -> Result<(reqwest::Url, Option<(String, Vec<SocketAddr>)>), ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(ToolError::InvalidArgs("URL rỗng".into()));
@@ -245,7 +427,7 @@ async fn validate_url(
         .map_err(|error| {
             ToolError::Execution(format!("không phân giải được host '{host}': {error}"))
         })?;
-    let mut pin = None;
+    let mut addresses_out = Vec::new();
     for address in addresses {
         if is_forbidden_ip(address.ip()) {
             return Err(ToolError::InvalidArgs(format!(
@@ -253,16 +435,14 @@ async fn validate_url(
                 address.ip()
             )));
         }
-        if pin.is_none() {
-            pin = Some((host.clone(), address));
-        }
+        addresses_out.push(address);
     }
-    match pin {
-        Some(pin) => Ok((url, Some(pin))),
-        None => Err(ToolError::Execution(format!(
+    if addresses_out.is_empty() {
+        return Err(ToolError::Execution(format!(
             "không phân giải được host '{host}'"
-        ))),
+        )));
     }
+    Ok((url, Some((host, addresses_out))))
 }
 
 /// Kiểm tra hình dạng URL không cần DNS; dùng trong test redirect.
@@ -401,7 +581,64 @@ async fn read_body_capped(
     Ok((body, truncated))
 }
 
+/// Tìm `>` kết thúc thẻ, bỏ qua `>` nằm trong giá trị thuộc tính có nháy.
+fn find_tag_end(input: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in input[start..].char_indices() {
+        match quote {
+            Some(expected) => {
+                if ch == expected {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '>' => return Some(start + offset),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Thẻ mở có tự đóng bằng `/>` hay không. Trong HTML, `/` dính liền sau giá trị
+/// thuộc tính không nháy (`src=foo/`) là một phần giá trị, không phải tự đóng.
+fn is_self_closing(tag_text: &str) -> bool {
+    let Some(before_slash) = tag_text.trim_end().strip_suffix('/') else {
+        return false;
+    };
+    match before_slash.chars().last() {
+        Some('"' | '\'') => true,
+        Some(ch) if ch.is_whitespace() => true,
+        _ => {
+            let tag_name_end = before_slash
+                .find(|ch: char| ch.is_ascii_whitespace() || ch == '/')
+                .unwrap_or(before_slash.len());
+            before_slash.len() == tag_name_end
+        }
+    }
+}
+
+/// Bỏ hoàn toàn comment HTML, kể cả khi bên trong có dấu `>`.
+fn remove_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        match after.find("-->") {
+            Some(end) => rest = &after[end + 3..],
+            // Comment không đóng: bỏ phần còn lại để tránh lộ nội dung.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Bỏ `<script>...</script>` và `<style>...</style>` (không phân biệt hoa thường).
+/// Comment được giữ nguyên và bỏ qua khi tìm thẻ, để `<script>` nằm trong
+/// comment không bị coi là thẻ thật.
 fn remove_tag_blocks(input: &str, tag: &str) -> String {
     let lower = input.to_ascii_lowercase();
     let open = format!("<{tag}");
@@ -409,7 +646,26 @@ fn remove_tag_blocks(input: &str, tag: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0usize;
 
-    while let Some(relative) = lower[cursor..].find(&open) {
+    while cursor < input.len() {
+        let open_relative = lower[cursor..].find(&open);
+        let comment_relative = lower[cursor..].find("<!--");
+        if let Some(comment_relative) = comment_relative {
+            if open_relative.is_none_or(|open_relative| comment_relative < open_relative) {
+                let comment_start = cursor + comment_relative;
+                let Some(end_relative) = lower[comment_start + 4..].find("-->") else {
+                    // Comment không đóng: giữ phần còn lại cho `remove_comments` xử lý.
+                    out.push_str(&input[cursor..]);
+                    return out;
+                };
+                let comment_end = comment_start + 4 + end_relative + 3;
+                out.push_str(&input[cursor..comment_end]);
+                cursor = comment_end;
+                continue;
+            }
+        }
+        let Some(relative) = open_relative else {
+            break;
+        };
         let start = cursor + relative;
         let after = lower[start + open.len()..].chars().next();
         let is_boundary =
@@ -420,13 +676,27 @@ fn remove_tag_blocks(input: &str, tag: &str) -> String {
             continue;
         }
 
-        let Some(close_relative) = lower[start..].find(&close) else {
+        let Some(open_end) = find_tag_end(&lower, start) else {
+            // Không có `>` kết thúc thẻ mở: bỏ phần còn lại cho an toàn.
+            out.push_str(&input[cursor..start]);
+            cursor = input.len();
+            break;
+        };
+        if is_self_closing(&lower[start..open_end]) {
+            // Thẻ tự đóng không có nội dung: chỉ bỏ thẻ, giữ phần còn lại.
+            out.push_str(&input[cursor..start]);
+            out.push(' ');
+            cursor = open_end + 1;
+            continue;
+        }
+
+        let Some(close_relative) = lower[open_end..].find(&close) else {
             // Không có thẻ đóng: bỏ phần còn lại để tránh lộ nội dung script/style.
             out.push_str(&input[cursor..start]);
             cursor = input.len();
             break;
         };
-        let close_start = start + close_relative;
+        let close_start = open_end + close_relative;
         let Some(gt_relative) = lower[close_start..].find('>') else {
             out.push_str(&input[cursor..start]);
             cursor = input.len();
@@ -490,6 +760,23 @@ fn decode_entities(input: &str) -> String {
         ("&#39;", '\''),
         ("&apos;", '\''),
         ("&nbsp;", ' '),
+        ("&copy;", '©'),
+        ("&reg;", '®'),
+        ("&trade;", '™'),
+        ("&mdash;", '—'),
+        ("&ndash;", '–'),
+        ("&hellip;", '…'),
+        ("&laquo;", '«'),
+        ("&raquo;", '»'),
+        ("&lsquo;", '‘'),
+        ("&rsquo;", '’'),
+        ("&ldquo;", '“'),
+        ("&rdquo;", '”'),
+        ("&euro;", '€'),
+        ("&pound;", '£'),
+        ("&deg;", '°'),
+        ("&middot;", '·'),
+        ("&bull;", '•'),
     ];
 
     let mut out = String::with_capacity(input.len());
@@ -600,9 +887,12 @@ fn collapse_whitespace(text: &str) -> String {
 }
 
 fn strip_html(html: &str) -> String {
+    // Bỏ script/style trước (bỏ qua comment), rồi mới bỏ comment. Nhờ vậy dấu
+    // `<!--` nằm trong script không nuốt phần còn lại của trang.
     let without_scripts = remove_tag_blocks(html, "script");
     let without_styles = remove_tag_blocks(&without_scripts, "style");
-    let text = replace_tags_with_space(&without_styles);
+    let without_comments = remove_comments(&without_styles);
+    let text = replace_tags_with_space(&without_comments);
     let decoded = decode_entities(&text);
     collapse_whitespace(&decoded)
 }
@@ -676,6 +966,53 @@ mod tests {
         assert!(text.contains("Xin chào"), "{text}");
         assert!(text.contains("A & B < C D 'ok' \"q\""), "{text}");
         assert!(!text.contains("\n\n"), "{text}");
+    }
+
+    #[test]
+    fn strips_comments_even_when_they_contain_gt() {
+        let html = "<p>before</p><!-- note > hidden <script>bad()</script> --><p>after</p>";
+        let text = strip_html(html);
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(!text.contains("bad()"), "{text}");
+        assert!(!text.contains("-->"), "{text}");
+    }
+
+    #[test]
+    fn script_comment_marker_does_not_drop_following_content() {
+        let html = "<script>var marker = \"<!--\";</script><p>After script</p>";
+        let text = strip_html(html);
+        assert!(text.contains("After script"), "{text}");
+        assert!(!text.contains("marker"), "{text}");
+    }
+
+    #[test]
+    fn self_closing_script_and_style_keep_following_content() {
+        let html = "<body><script src=\"app.js\"/><p>After script</p>\
+                    <style media=\"screen\"/><p>After style</p></body>";
+        let text = strip_html(html);
+        assert!(text.contains("After script"), "{text}");
+        assert!(text.contains("After style"), "{text}");
+    }
+
+    #[test]
+    fn unclosed_script_and_style_drop_remainder() {
+        for html in [
+            "<p>Visible</p><script>alert('secret')",
+            "<p>Visible</p><style>.secret { color: red; }",
+        ] {
+            let text = strip_html(html);
+            assert!(text.contains("Visible"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+    }
+
+    #[test]
+    fn decodes_common_named_entities() {
+        let input = "&copy; &reg; &trade; &mdash; &ndash; &hellip; &laquo; &raquo; \
+                     &lsquo; &rsquo; &ldquo; &rdquo; &euro; &pound; &deg; &middot; &bull;";
+        assert_eq!(decode_entities(input), "© ® ™ — – … « » ‘ ’ “ ” € £ ° · •");
     }
 
     #[test]
@@ -850,5 +1187,53 @@ mod tests {
             output.content
         );
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_fallback_uses_injected_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("fake-chromium");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '<html><body>Rendered page</body></html>'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = run_browser(&binary, "https://example.com/", None, &[], 20_000)
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("Rendered page"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("Status: browser"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[test]
+    fn browser_resolver_rules_pin_all_addresses() {
+        let addresses = [
+            SocketAddr::from(([93, 184, 216, 34], 443)),
+            SocketAddr::from(([93, 184, 216, 35], 443)),
+        ];
+        let rules = browser_resolver_rules(Some("example.com"), &addresses);
+        assert!(rules.contains("MAP * ~NOTFOUND"));
+        assert!(rules.contains("EXCLUDE example.com"));
+        assert!(rules.contains("MAP example.com 93.184.216.34:443"));
+        assert!(rules.contains("MAP example.com 93.184.216.35:443"));
+    }
+
+    #[test]
+    fn browser_resolver_rules_without_host_blocks_all() {
+        assert_eq!(browser_resolver_rules(None, &[]), "MAP * ~NOTFOUND");
     }
 }

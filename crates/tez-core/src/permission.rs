@@ -8,6 +8,7 @@
 //! Workspace tools đã tự chặn đường dẫn ngoài workspace; lớp này bổ sung
 //! chính sách cho `run_command` và các tool có tác dụng phụ.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -200,6 +201,7 @@ impl Approver for DenyApprover {
 pub struct PermissionPolicy {
     mode: PermissionMode,
     rules: Vec<PermissionRule>,
+    read_only_tools: HashSet<String>,
 }
 
 impl Default for PermissionPolicy {
@@ -213,6 +215,7 @@ impl PermissionPolicy {
         Self {
             mode,
             rules: Vec::new(),
+            read_only_tools: HashSet::new(),
         }
     }
 
@@ -220,6 +223,17 @@ impl PermissionPolicy {
     pub fn with_rules(mut self, rules: Vec<PermissionRule>) -> Self {
         self.rules = rules;
         self
+    }
+
+    /// Các tool MCP được server khai báo chỉ đọc. Chúng được phép ngay cả
+    /// trong chế độ ReadOnly, nhưng vẫn chịu deny-list và rule deny của người dùng.
+    pub fn with_read_only_tools(mut self, tools: Vec<String>) -> Self {
+        self.read_only_tools = tools.into_iter().collect();
+        self
+    }
+
+    pub fn read_only_tools(&self) -> &HashSet<String> {
+        &self.read_only_tools
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -247,6 +261,10 @@ impl PermissionPolicy {
                     .trim()
                     .to_string(),
             };
+        }
+
+        if self.read_only_tools.contains(tool) {
+            return PermissionDecision::Allow;
         }
 
         if self.mode == PermissionMode::ReadOnly && is_mutating(tool) {
@@ -692,6 +710,31 @@ mod tests {
         ));
         assert!(matches!(
             policy.evaluate("run_command", &json!({"command": "ls"})),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn read_only_mcp_tools_are_allowed_even_in_read_only_mode() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_read_only_tools(vec!["mcp__fs__read".to_string()]);
+        assert!(policy
+            .evaluate("mcp__fs__read", &json!({"path": "a"}))
+            .is_allowed());
+        assert!(matches!(
+            policy.evaluate("mcp__fs__write", &json!({"path": "a"})),
+            PermissionDecision::Deny { .. }
+        ));
+
+        let deny_rule = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_read_only_tools(vec!["mcp__fs__read".to_string()])
+            .with_rules(vec![PermissionRule::new(
+                RuleAction::Deny,
+                "mcp__fs__read",
+                "*",
+            )]);
+        assert!(matches!(
+            deny_rule.evaluate("mcp__fs__read", &json!({"path": "a"})),
             PermissionDecision::Deny { .. }
         ));
     }

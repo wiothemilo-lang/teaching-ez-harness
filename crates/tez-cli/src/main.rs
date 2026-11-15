@@ -1,5 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use tez_auth::Vault;
 use tez_core::agent::{Agent, AgentConfig, RunContext};
 use tez_core::compaction::{session_artifact_dir, CompactSettings, Compactor};
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::diff;
 use tez_core::harness;
 use tez_core::hooks::{self, HookRegistry};
 use tez_core::mcp;
@@ -23,6 +25,7 @@ use tez_core::modes::{self, Mode, PLAN_TOOLS};
 use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
+use tez_core::plan;
 use tez_core::plugins;
 use tez_core::project;
 use tez_core::skills::SkillRegistry;
@@ -40,7 +43,7 @@ use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::skill::SkillTool;
 use tez_core::tools::web::WebFetchTool;
-use tez_core::tools::{code_registry, ToolError, ToolRegistry};
+use tez_core::tools::{code_registry, Tool, ToolError, ToolRegistry};
 use tez_llm::{LlmError, LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
@@ -747,11 +750,72 @@ fn resolve_chat_connection(
 }
 
 /// Hỏi người dùng ngay trong terminal trước khi chạy tool rủi ro.
-struct CliApprover;
+struct CliApprover {
+    workspace: PathBuf,
+}
+
+fn cli_approval_preview(root: &Path, request: &ApprovalRequest) -> Option<String> {
+    if !matches!(request.tool.as_str(), "write_file" | "edit_file") {
+        return None;
+    }
+    let raw = request.args.get("path")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        root.join(raw)
+    };
+    let root_canon = root.canonicalize().ok()?;
+    let full = candidate.canonicalize().ok().or_else(|| {
+        let parent = candidate.parent()?.canonicalize().ok()?;
+        Some(parent.join(candidate.file_name()?))
+    })?;
+    if !full.starts_with(&root_canon) {
+        return None;
+    }
+
+    let old = std::fs::read_to_string(&full).unwrap_or_default();
+    let new = match request.tool.as_str() {
+        "write_file" => request.args.get("content")?.as_str()?.to_string(),
+        "edit_file" => {
+            let old_string = request.args.get("old_string")?.as_str()?;
+            let new_string = request.args.get("new_string")?.as_str()?;
+            let replace_all = request
+                .args
+                .get("replace_all")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if old_string.is_empty() || !old.contains(old_string) {
+                return None;
+            }
+            if !replace_all && old.matches(old_string).count() != 1 {
+                return None;
+            }
+            if replace_all {
+                old.replace(old_string, new_string)
+            } else {
+                old.replacen(old_string, new_string, 1)
+            }
+        }
+        _ => return None,
+    };
+
+    let mut preview = diff::unified_diff(&old, &new, raw);
+    if preview.chars().count() > 24_000 {
+        preview = preview.chars().take(24_000).collect::<String>();
+        preview.push_str("\n… diff đã rút gọn\n");
+    }
+    (!preview.is_empty()).then_some(preview)
+}
 
 #[async_trait]
 impl Approver for CliApprover {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
+        if let Some(preview) = cli_approval_preview(&self.workspace, request) {
+            println!("\n{preview}");
+        }
         let prompt = format!(
             "⚠ {} — công cụ: {} {}",
             request.reason, request.tool, request.args
@@ -829,7 +893,7 @@ impl TurnContext<'_> {
         let mut recent = conversation.clone();
         recent.push(Message::user(prompt));
 
-        let skill_catalog = self.skills.catalog_lines(50);
+        let skill_catalog = self.skills.catalog_overview(12);
 
         let recalled = if self.memory_settings.enabled && self.memory_settings.auto_recall {
             let records = self
@@ -842,6 +906,21 @@ impl TurnContext<'_> {
         let todos = self.todos.snapshot();
 
         let workspace_label = self.workspace.display().to_string();
+        let saved_plan = if self.mode == Mode::Code {
+            plan::load_plan(self.dir, self.session_id).ok().flatten()
+        } else {
+            None
+        };
+        let project_context = match saved_plan {
+            Some(plan) => {
+                let mut text = self.project_instructions.to_string();
+                text.push_str("\nKế hoạch đã lưu của phiên:\n<plan>\n");
+                text.extend(plan.chars().take(20_000));
+                text.push_str("\n</plan>\n");
+                text
+            }
+            None => self.project_instructions.to_string(),
+        };
         let messages = ContextBuilder.build(ContextInput {
             excerpts: &excerpts,
             recent: &recent,
@@ -851,12 +930,26 @@ impl TurnContext<'_> {
             mode: self.mode,
             workspace: Some(&workspace_label),
             instructions: self.system_prompt,
-            project: self.project_instructions,
+            project: &project_context,
             language: self.language,
         });
 
         let artifact_dir = session_artifact_dir(self.dir, self.session_id);
         let compactor = Compactor::new(self.compaction.clone(), Some(artifact_dir.clone()));
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let streamed = Arc::new(AtomicBool::new(false));
+        let streamed_flag = Arc::clone(&streamed);
+        let printer = tokio::task::spawn_blocking(move || {
+            let mut stdout = std::io::stdout();
+            while let Some(text) = delta_rx.blocking_recv() {
+                if text.is_empty() {
+                    continue;
+                }
+                streamed_flag.store(true, Ordering::Relaxed);
+                let _ = stdout.write_all(text.as_bytes());
+                let _ = stdout.flush();
+            }
+        });
         let agent = Agent::new(Arc::clone(&self.provider), self.tools.clone())
             .with_config(AgentConfig {
                 max_steps: self.max_steps,
@@ -866,7 +959,8 @@ impl TurnContext<'_> {
             .with_approver(Arc::clone(&self.approver))
             .with_hooks(Arc::clone(&self.hooks))
             .with_compactor(compactor)
-            .with_todos(Arc::clone(&self.todos));
+            .with_todos(Arc::clone(&self.todos))
+            .with_stream(delta_tx);
         let started = Instant::now();
         let outcome = agent
             .run_with(
@@ -876,8 +970,20 @@ impl TurnContext<'_> {
             )
             .await?;
         let latency_ms = started.elapsed().as_millis() as u64;
+        drop(agent);
+        let _ = printer.await;
 
-        println!("{}", outcome.text);
+        if self.mode == Mode::Plan {
+            if let Err(error) = plan::save_plan(self.dir, self.session_id, &outcome.text) {
+                eprintln!("[plan] không lưu được kế hoạch: {error}");
+            }
+        }
+
+        if !streamed.load(Ordering::Relaxed) {
+            println!("{}", outcome.text);
+        } else if !outcome.text.is_empty() {
+            println!();
+        }
         for step in &outcome.steps {
             let status = if step.ok { "ok" } else { "error" };
             eprintln!(
@@ -1035,12 +1141,12 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     } else {
         config.permission_mode
     };
-    let policy =
-        Arc::new(PermissionPolicy::new(policy_mode).with_rules(config.permission_rules.clone()));
     let approver: Arc<dyn Approver> = if args.yes || policy_mode == PermissionMode::Trust {
         Arc::new(AutoApprover)
     } else {
-        Arc::new(CliApprover)
+        Arc::new(CliApprover {
+            workspace: workspace.clone(),
+        })
     };
     let hooks = Arc::new(hooks::build_registry(Some(&dir), &config.hooks));
     let memory = MemoryStore::new(dir.join("memory"));
@@ -1052,6 +1158,41 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     ));
 
     let mut tools = registry_for_mode(pack, mode, &workspace)?;
+    let mut read_only_tools = Vec::new();
+    let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
+    let mut mcp_count = 0;
+    for server in &discovery.servers {
+        if !server.ok {
+            eprintln!(
+                "[mcp] {}: {}",
+                server.name,
+                server.error.as_deref().unwrap_or("không khả dụng")
+            );
+        }
+    }
+    for tool in discovery.tools {
+        let read_only = tool.is_read_only();
+        if mode == Mode::Plan && !read_only {
+            continue;
+        }
+        if read_only {
+            read_only_tools.push(tool.spec().name);
+        }
+        tools.register(tool);
+        mcp_count += 1;
+    }
+    if mcp_count > 0 {
+        eprintln!(
+            "[mcp] {mcp_count} tool từ {} server",
+            discovery.servers.len()
+        );
+    }
+
+    let policy = Arc::new(
+        PermissionPolicy::new(policy_mode)
+            .with_rules(config.permission_rules.clone())
+            .with_read_only_tools(read_only_tools),
+    );
     if mode != Mode::Plan {
         tools.register(MemorySave::new(memory.clone()));
     }
@@ -1072,28 +1213,6 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             compaction: config.compaction.clone(),
         });
         tools.register(TaskTool::new(runtime));
-    }
-    if mode != Mode::Plan {
-        let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
-        let mcp_count = discovery.tools.len();
-        for server in &discovery.servers {
-            if !server.ok {
-                eprintln!(
-                    "[mcp] {}: {}",
-                    server.name,
-                    server.error.as_deref().unwrap_or("không khả dụng")
-                );
-            }
-        }
-        for tool in discovery.tools {
-            tools.register(tool);
-        }
-        if mcp_count > 0 {
-            eprintln!(
-                "[mcp] {mcp_count} tool từ {} server",
-                discovery.servers.len()
-            );
-        }
     }
     let mut skills = SkillRegistry::load_with_plugins(&dir)?;
     skills.load_project(&workspace)?;

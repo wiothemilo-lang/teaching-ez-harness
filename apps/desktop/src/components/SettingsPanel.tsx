@@ -76,6 +76,7 @@ type McpDraft = {
   cwd: string;
   envText: string;
   enabled: boolean;
+  read_only: boolean;
 };
 
 const PRESETS: Preset[] = [
@@ -363,6 +364,7 @@ export function SettingsPanel({
       cwd: "",
       envText: "",
       enabled: true,
+      read_only: false,
     });
   };
 
@@ -378,6 +380,7 @@ export function SettingsPanel({
         .map(([key, value]) => `${key}=${value}`)
         .join("\n"),
       enabled: server.enabled,
+      read_only: server.read_only,
     });
   };
 
@@ -411,6 +414,7 @@ export function SettingsPanel({
         env,
         cwd: mcpDraft.cwd.trim() || null,
         enabled: mcpDraft.enabled,
+        read_only: mcpDraft.read_only,
       });
       setMcpDraft(null);
       await reload();
@@ -857,6 +861,7 @@ export function SettingsPanel({
                           {server.source === "user" ? "Tự thêm" : `Plugin · ${server.source}`}
                         </Tag>
                         {!server.enabled && <Tag tone="neutral">Đang tắt</Tag>}
+                        {server.read_only && <Tag tone="forest">Chỉ đọc</Tag>}
                       </div>
                       <code className="server-command">
                         {server.command} {server.args.join(" ")}
@@ -1024,6 +1029,18 @@ export function SettingsPanel({
                     }
                   />
                   <span>Bật server này</span>
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={mcpDraft.read_only}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous ? { ...previous, read_only: event.target.checked } : previous,
+                      )
+                    }
+                  />
+                  <span>Chỉ đọc (cho phép trong Plan)</span>
                 </label>
                 <div className="form-actions">
                   <button className="btn" onClick={() => setMcpDraft(null)}>

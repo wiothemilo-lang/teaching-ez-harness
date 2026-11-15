@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -332,7 +333,141 @@ fn retry_busy<T>(mut operation: impl FnMut() -> Result<T, StoreError>) -> Result
     unreachable!("retry_busy luôn trả về trong vòng lặp")
 }
 
+const IMAGE_REF_PREFIX: &str = "tez-image:";
+
+fn image_component(value: &str) -> String {
+    let mut out: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect();
+    if out.is_empty() {
+        out.push_str("image");
+    }
+    out
+}
+
+fn image_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+fn image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Tách data URL base64 thành mime + bytes. Trả `None` nếu không phải base64.
+fn decode_data_url(value: &str) -> Option<(String, Vec<u8>)> {
+    let rest = value.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    let mime = meta.split(';').next().unwrap_or("").trim();
+    let mime = if mime.contains('/') {
+        mime
+    } else {
+        "application/octet-stream"
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()?;
+    Some((mime.to_string(), bytes))
+}
+
 impl Store {
+    fn image_root(&self) -> Option<PathBuf> {
+        if self.path == Path::new(":memory:") {
+            return None;
+        }
+        Some(
+            self.path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("images"),
+        )
+    }
+
+    /// Ghi ảnh ra file riêng và trả về tham chiếu `tez-image:<relative>`.
+    /// Nếu không giải mã/ghi được thì giữ nguyên data URL để không mất ảnh.
+    fn persist_images(&self, message_id: &str, session_id: &str, images: &[String]) -> Vec<String> {
+        let Some(root) = self.image_root() else {
+            return images.to_vec();
+        };
+        let dir = root.join(image_component(session_id));
+        let mut stored = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let Some((mime, bytes)) = decode_data_url(image) else {
+                stored.push(image.clone());
+                continue;
+            };
+            let name = format!(
+                "{}-{index}.{}",
+                image_component(message_id),
+                image_extension(&mime)
+            );
+            let path = dir.join(&name);
+            if std::fs::create_dir_all(&dir).is_err() || std::fs::write(&path, &bytes).is_err() {
+                stored.push(image.clone());
+                continue;
+            }
+            let _ = set_private_permissions(&path);
+            let base = root.parent().unwrap_or_else(|| Path::new("."));
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            stored.push(format!("{IMAGE_REF_PREFIX}{relative}"));
+        }
+        stored
+    }
+
+    fn resolve_images(&self, images: &[String]) -> Vec<String> {
+        let Some(root) = self.image_root() else {
+            return images.to_vec();
+        };
+        let base = root.parent().unwrap_or_else(|| Path::new("."));
+        images
+            .iter()
+            .map(|image| {
+                let Some(relative) = image.strip_prefix(IMAGE_REF_PREFIX) else {
+                    return image.clone();
+                };
+                let path = base.join(relative);
+                let Ok(bytes) = std::fs::read(&path) else {
+                    return image.clone();
+                };
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                format!("data:{};base64,{encoded}", image_mime(&path))
+            })
+            .collect()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         let in_memory = path == Path::new(":memory:");
@@ -575,7 +710,8 @@ impl Store {
         images: &[String],
     ) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
-        let images_json = serde_json::to_string(images)?;
+        let stored_images = self.persist_images(&id, message.session_id, images);
+        let images_json = serde_json::to_string(&stored_images)?;
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO messages (id, session_id, role, content, images, model, tokens_in, tokens_out)
@@ -777,7 +913,7 @@ impl Store {
         let rows = statement.query_map(params![session_id, limit as i64], |row| {
             let images_json: String = row.get(2)?;
             let images = match serde_json::from_str::<Vec<String>>(&images_json) {
-                Ok(images) => images,
+                Ok(images) => self.resolve_images(&images),
                 Err(error) => {
                     eprintln!(
                         "[tez-store] images JSON hỏng, giữ message với danh sách ảnh rỗng: {error}"
@@ -1376,6 +1512,48 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "xem ảnh này");
         assert_eq!(loaded[0].images, images);
+    }
+
+    #[test]
+    fn stores_images_as_files_and_keeps_refs_in_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Người dùng").unwrap();
+        let session_id = store
+            .create_session_mode("default", None, None, "chat")
+            .unwrap();
+        let images = vec!["data:image/png;base64,AAAA".to_string()];
+        store
+            .append_message_with_images(
+                NewMessage {
+                    session_id: &session_id,
+                    role: "user",
+                    content: "xem ảnh này",
+                    model: None,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+                &images,
+            )
+            .unwrap();
+
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT images FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.contains("tez-image:"), "{stored}");
+        assert!(!stored.contains("data:image"), "{stored}");
+
+        let loaded = store.load_messages(&session_id, 10).unwrap();
+        assert_eq!(loaded[0].images, images);
+
+        let image_dir = dir.path().join("images").join(&session_id);
+        assert!(image_dir.is_dir());
+        assert_eq!(std::fs::read_dir(&image_dir).unwrap().count(), 1);
     }
 
     #[test]

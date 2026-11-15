@@ -54,6 +54,9 @@ pub struct McpServerConfig {
     pub cwd: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Ép mọi tool của server này được coi là chỉ đọc (dùng cho Plan).
+    #[serde(default, alias = "readOnly")]
+    pub read_only: bool,
 }
 
 fn default_true() -> bool {
@@ -78,6 +81,7 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,7 +225,10 @@ pub async fn discover_with_project(
         match McpClient::connect(&entry.name, &entry.config).await {
             Ok((client, infos)) => {
                 let tool_names = infos.iter().map(|info| info.name.clone()).collect();
-                for info in infos {
+                for mut info in infos {
+                    if entry.config.read_only {
+                        info.read_only = true;
+                    }
                     tools.push(McpTool::new(entry.name.clone(), info, Arc::clone(&client)));
                 }
                 servers.push(McpServerStatus {
@@ -251,6 +258,7 @@ pub struct McpTool {
     tool_name: String,
     description: String,
     parameters: Value,
+    read_only: bool,
     client: Arc<McpClient>,
 }
 
@@ -264,6 +272,7 @@ impl McpTool {
             tool_name,
             description,
             parameters: info.input_schema,
+            read_only: info.read_only,
             client,
         }
     }
@@ -274,6 +283,10 @@ impl McpTool {
 
     pub fn raw_name(&self) -> &str {
         &self.raw_name
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -509,10 +522,18 @@ fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    let read_only = item
+                        .get("annotations")
+                        .and_then(|value| value.get("readOnlyHint"))
+                        .and_then(Value::as_bool)
+                        .or_else(|| item.get("readOnly").and_then(Value::as_bool))
+                        .or_else(|| item.get("read_only").and_then(Value::as_bool))
+                        .unwrap_or(false);
                     Some(McpToolInfo {
                         name,
                         description,
                         input_schema,
+                        read_only,
                     })
                 })
                 .collect()
@@ -665,6 +686,7 @@ mod tests {
                 env: HashMap::new(),
                 cwd: None,
                 enabled: true,
+                read_only: false,
             },
         );
         save_config(dir.path(), &config).unwrap();
@@ -686,6 +708,7 @@ mod tests {
                 env: HashMap::new(),
                 cwd: None,
                 enabled: true,
+                read_only: false,
             },
         );
         save_config(data.path(), &config).unwrap();

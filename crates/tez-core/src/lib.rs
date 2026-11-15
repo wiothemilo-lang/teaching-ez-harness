@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod memory;
 pub mod modes;
 pub mod permission;
+pub mod plan;
 pub mod plugins;
 pub mod project;
 pub mod skills;
