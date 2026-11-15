@@ -16,7 +16,9 @@ Nguyên tắc: trả lời đúng trọng tâm; nói rõ khi không chắc; khô
 pub struct ContextInput<'a> {
     pub recent: &'a [Message],
     pub excerpts: &'a [String],
-    /// Skill đã render sẵn (xem [`crate::skills::render`]).
+    /// Kỹ năng khả dụng, mỗi phần tử là một dòng catalog (xem
+    /// [`crate::skills::SkillRegistry::catalog_lines`]). Nội dung đầy đủ được
+    /// nạp qua tool `skill`.
     pub skills: &'a [String],
     /// Memory liên quan đã render sẵn (xem [`crate::memory::render_recalled`]).
     pub memory: &'a [String],
@@ -94,7 +96,9 @@ impl ContextBuilder {
         }
 
         if !input.skills.is_empty() {
-            system.push_str("\nKỹ năng đang bật (là chỉ dẫn bổ sung, hãy áp dụng khi phù hợp):\n");
+            system.push_str(
+                "\nKỹ năng khả dụng (danh mục ngắn; gọi tool `skill` với name để nạp toàn bộ hướng dẫn khi phù hợp):\n",
+            );
             for skill in input.skills {
                 system.push_str(skill);
                 system.push('\n');

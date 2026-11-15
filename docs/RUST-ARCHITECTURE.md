@@ -174,12 +174,12 @@ Agent dừng khi:
 |---|---|---|
 | **System** | Vai trò chat/code, ngôn ngữ, chỉ dẫn bổ sung của người dùng | Pinned |
 | **Project** | `AGENTS.md`/`CLAUDE.md` và `.tez/` của workspace, render thành `<project-instructions>`, tối đa 24 KB | Cao |
-| **Skills** | Skill khớp từ khóa trong câu hỏi, render sẵn | Cao |
+| **Skills** | Catalog ngắn (id, tên, mô tả); model gọi tool `skill` để nạp toàn bộ hướng dẫn | Cao |
 | **Memory** | Memory recall theo từ khóa | Cao |
 | **Todos** | Kế hoạch hiện tại của phiên | Pinned |
 | **RAG** | Top-k chunk tài liệu liên quan, kèm citation | Cao |
 | **Summary** | Tóm tắt các lượt cũ khi compaction | Trung bình |
-| **Recent turns** | 6–10 lượt gần nhất nguyên văn | Cao |
+| **Recent turns** | 6–10 lượt gần nhất nguyên văn; lượt hiện tại có thể kèm ảnh (image parts) | Cao |
 | **Tool specs** | Schema các tool được phép | Pinned |
 
 ### 4.2 Token budget
@@ -265,6 +265,16 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
 - **Registry**: `ToolRegistry` giữ tool built-in, tool MCP (`mcp__server__tool`)
   và tool harness (`todo_write`, `task`, `memory_*`, `compact`). Mỗi subject
   pack lọc allowlist; chế độ Code dùng `code_registry(root)`.
+- **Skill tool** (`tools/skill.rs`): nhận `name`, tìm theo id rồi tên, trả body
+  trong thẻ `<skill>` (cap 12 KB). Catalog lấy từ
+  `SkillRegistry::catalog_lines`; skill dự án đứng trước user/plugin/built-in và
+  được đánh dấu `[project]`; đây là progressive disclosure một tầng.
+- **Web fetch** (`tools/web.rs`): chỉ http/https, chặn userinfo, localhost và IP
+  nội bộ (kể cả CGNAT, dải tài liệu IPv6, 6to4). Mỗi redirect được resolve DNS
+  lại, kiểm tra IP rồi pin địa chỉ vào client; timeout 20 s, tối đa 5 redirect,
+  body cap 512 KB có đánh dấu khi cắt, charset UTF-8/Latin-1/Windows-1252, lọc
+  HTML và giải mã entity số. Policy mặc định hỏi trước `web_fetch` vì đây là
+  truy cập mạng ngoài.
 - **Permission pipeline** (`crates/tez-core/src/permission.rs`) có bốn mode:
   `read_only`, `strict`, `standard` (mặc định), `trust`. Mỗi call đi qua:
   deny-list (lệnh phá hủy) → rule `deny` của người dùng → chặn `read_only` →
@@ -482,6 +492,10 @@ pub trait LlmProvider: Send + Sync {
 ```
 
 - `ChatRequest`: model, messages, tools, temperature, top_p, max_tokens.
+- `Message` có `content: Option<String>` và `images: Vec<String>`; khi có ảnh,
+  `message_json` gửi content dạng array `text` + `image_url` (data URL hoặc URL
+  công khai). Không có ảnh thì wire format giữ nguyên như cũ. Desktop lưu ảnh
+  dạng data URL trong cột `messages.images` để resume hiển thị lại; chỉ lượt hiện tại gửi ảnh lên model.
 - `ChatResponse`: text hoặc tool calls + usage.
 - `chat_stream`: phát text delta qua `tx`, trả `ChatResponse` cuối; tool call
   được gom đủ theo `index` trước khi trả.

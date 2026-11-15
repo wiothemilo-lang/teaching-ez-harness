@@ -21,6 +21,10 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// URL ảnh đính kèm (data URL hoặc http(s)), theo định dạng vision của
+    /// OpenAI-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl Message {
@@ -30,6 +34,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -39,6 +44,18 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// Message user kèm ảnh. `images` là URL (http(s) hoặc data URL).
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            images,
         }
     }
 
@@ -48,6 +65,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -57,6 +75,7 @@ impl Message {
             content,
             tool_calls: Some(calls),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -66,6 +85,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
         }
     }
 }
@@ -246,8 +266,23 @@ impl OpenAiCompatible {
 
 fn message_json(m: &Message) -> Value {
     let mut obj = json!({ "role": m.role });
-    if let Some(content) = &m.content {
-        obj["content"] = json!(content);
+    if m.images.is_empty() {
+        // Không có ảnh: giữ nguyên content dạng string/null như cũ.
+        if let Some(content) = &m.content {
+            obj["content"] = json!(content);
+        }
+    } else {
+        // Có ảnh: content phải là mảng parts theo chuẩn vision.
+        let mut parts: Vec<Value> = Vec::new();
+        if let Some(content) = &m.content {
+            if !content.is_empty() {
+                parts.push(json!({ "type": "text", "text": content }));
+            }
+        }
+        for url in &m.images {
+            parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+        }
+        obj["content"] = Value::Array(parts);
     }
     if let Some(calls) = &m.tool_calls {
         obj["tool_calls"] = json!(calls);
@@ -605,5 +640,62 @@ mod tests {
             }
             other => panic!("expected tool calls, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plain_message_keeps_string_content() {
+        let value = message_json(&Message::user("Xin chào"));
+        assert_eq!(value, json!({ "role": "user", "content": "Xin chào" }));
+
+        let serialized = serde_json::to_value(Message::user("hi")).unwrap();
+        assert!(serialized.get("images").is_none());
+    }
+
+    #[test]
+    fn user_with_images_builds_text_then_image_parts() {
+        let message = Message::user_with_images(
+            "Mô tả ảnh này",
+            vec![
+                "https://example.com/a.png".to_string(),
+                "data:image/png;base64,AAA".to_string(),
+            ],
+        );
+        let value = message_json(&message);
+        assert_eq!(
+            value,
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Mô tả ảnh này" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAA" } },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn empty_content_with_images_has_only_image_parts() {
+        let message = Message::user_with_images("", vec!["https://example.com/a.png".to_string()]);
+        let value = message_json(&message);
+        assert_eq!(
+            value,
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_legacy_message_without_images() {
+        let message: Message =
+            serde_json::from_str(r#"{"role":"user","content":"Xin chào","tool_calls":null}"#)
+                .unwrap();
+        assert_eq!(message.role, "user");
+        assert_eq!(message.content.as_deref(), Some("Xin chào"));
+        assert!(message.images.is_empty());
     }
 }

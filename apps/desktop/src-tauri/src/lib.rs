@@ -21,7 +21,7 @@ use tez_core::permission::{
 };
 use tez_core::plugins;
 use tez_core::project;
-use tez_core::skills::{self, SkillRegistry};
+use tez_core::skills::SkillRegistry;
 use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects;
 use tez_core::todo::{TodoItem, TodoState, TodoWrite};
@@ -32,6 +32,8 @@ use tez_core::tools::check_step::CheckStep;
 use tez_core::tools::convert_units::ConvertUnits;
 use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
+use tez_core::tools::skill::SkillTool;
+use tez_core::tools::web::WebFetchTool;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::{code_registry, ToolRegistry};
@@ -177,6 +179,8 @@ struct AppStatus {
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
     message: String,
+    #[serde(default)]
+    images: Vec<String>,
     session_id: Option<String>,
     provider_id: Option<String>,
     #[serde(default)]
@@ -194,6 +198,7 @@ struct SessionRequest {
 struct StoredMessageInfo {
     role: String,
     content: String,
+    images: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1290,6 +1295,7 @@ fn load_session(request: SessionRequest) -> Result<SessionDetail, String> {
         .map(|message| StoredMessageInfo {
             role: message.role,
             content: message.content,
+            images: message.images,
         })
         .collect();
 
@@ -1339,6 +1345,19 @@ async fn chat_inner(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ChatReply> {
     let stream_app = app.clone();
+    if request.images.len() > 4 {
+        anyhow::bail!("tối đa 4 ảnh mỗi lượt");
+    }
+    if request
+        .images
+        .iter()
+        .any(|image| !image.starts_with("data:image/"))
+    {
+        anyhow::bail!("ảnh phải là data URL image/*");
+    }
+    if request.images.iter().map(String::len).sum::<usize>() > 8 * 1024 * 1024 {
+        anyhow::bail!("tổng dung lượng ảnh vượt 8 MB");
+    }
     let dir = data_dir()?;
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
     let workspace = match mode {
@@ -1393,6 +1412,8 @@ async fn chat_inner(
                     .load_messages(id, 40)?
                     .into_iter()
                     .filter_map(|message| match message.role.as_str() {
+                        // Ảnh cũ vẫn hiện trong UI/resume nhưng không gửi lại
+                        // toàn bộ lịch sử để tránh request phình to.
                         "user" => Some(Message::user(message.content)),
                         "assistant" => Some(Message::assistant(message.content)),
                         _ => None,
@@ -1441,25 +1462,30 @@ async fn chat_inner(
         .map(|hit| format!("[{}] {}", hit.title, hit.snippet))
         .collect();
 
-    store.append_message(NewMessage {
-        session_id: &session_id,
-        role: "user",
-        content: &request.message,
-        model: None,
-        tokens_in: 0,
-        tokens_out: 0,
-    })?;
+    store.append_message_with_images(
+        NewMessage {
+            session_id: &session_id,
+            role: "user",
+            content: &request.message,
+            model: None,
+            tokens_in: 0,
+            tokens_out: 0,
+        },
+        &request.images,
+    )?;
     drop(store);
 
     let mut recent = history;
-    recent.push(Message::user(request.message.clone()));
+    recent.push(Message::user_with_images(
+        request.message.clone(),
+        request.images.clone(),
+    ));
 
     let mut registry = SkillRegistry::load_with_plugins(&dir)?;
     if let Some(root) = workspace.as_deref() {
         registry.load_project(root)?;
     }
-    let matched = registry.matching_query(&request.message, 2);
-    let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
+    let skill_catalog = registry.catalog_lines(50);
 
     let recalled = if config.memory.enabled && config.memory.auto_recall {
         let records = memory_store.search(&request.message, config.memory.recall_limit);
@@ -1481,7 +1507,7 @@ async fn chat_inner(
     let mut messages = ContextBuilder.build(ContextInput {
         recent: &recent,
         excerpts: &excerpts,
-        skills: &skill_snippets,
+        skills: &skill_catalog,
         memory: &recalled,
         todos: &todo_snapshot,
         mode,
@@ -1521,6 +1547,8 @@ async fn chat_inner(
         tools.register(MemoryForget::new(memory_store.clone()));
     }
     tools.register(TodoWrite::new(Arc::clone(&todos)));
+    tools.register(SkillTool::new(registry.clone()));
+    tools.register(WebFetchTool::new());
     if !plan_mode {
         let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
         for tool in discovery.tools {

@@ -7,7 +7,7 @@
 
 ## 1. Skills — prompt pack Markdown
 
-Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Khi người dùng hỏi, tez khớp **ngữ cảnh** (`subjects`) và **từ khóa** rồi chèn tối đa 2 skill vào system prompt của lượt đó. Skill không chạy code và không có quyền truy cập dữ liệu.
+Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Tez đưa một catalog ngắn (id, tên, mô tả) vào system prompt; khi phù hợp, model gọi tool `skill` để nạp toàn bộ nội dung. Cách này giữ context nhẹ và cho model tự chọn skill. Skill không chạy code và không có quyền truy cập dữ liệu.
 
 ### Vị trí
 
@@ -40,7 +40,7 @@ triggers: giải, bước, chứng minh, tính
 | `name` | Tên hiển thị. Nếu thiếu `id`, tên thư mục được dùng làm id. |
 | `description` | Mô tả ngắn trong Cài đặt → Kỹ năng. |
 | `subjects` | Danh sách id ngữ cảnh, phân tách bằng dấu phẩy. `all` hoặc bỏ trống = mọi ngữ cảnh. |
-| `triggers` | Từ khóa xuất hiện trong câu hỏi (không phân biệt hoa thường). Bỏ trống = luôn khớp ngữ cảnh. |
+| `triggers` | Metadata từ khóa (không phân biệt hoa thường), dùng cho gợi ý/tương lai; catalog hiện đưa toàn bộ skill để model tự chọn. |
 | `id` | Tùy chọn, dùng để đặt id ổn định. |
 
 Phần thân sau `---` được render thành `<skill name="…">…</skill>` và cắt ở 4KB.

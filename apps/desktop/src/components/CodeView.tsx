@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import type { KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { ChangeEvent, KeyboardEvent } from "react";
 import type { ChatMessage, CompactReport, ConnectionInfo, TodoItem } from "../types";
 import { CODE_SUGGESTIONS, placeholderFor } from "../lib";
 import {
@@ -7,6 +7,7 @@ import {
   IconArrowUp,
   IconCode,
   IconFolder,
+  IconImage,
   IconKey,
   IconSliders,
   IconStop,
@@ -20,6 +21,8 @@ import { Spinner } from "./ui";
 type Props = {
   connection: ConnectionInfo | null;
   messages: ChatMessage[];
+  images: string[];
+  onImagesChange: (images: string[]) => void;
   input: string;
   busy: boolean;
   streaming: boolean;
@@ -41,9 +44,24 @@ type Props = {
   onDismissError: () => void;
 };
 
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+function readImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("không đọc được ảnh"));
+    reader.readAsDataURL(file);
+  });
+}
+
 export function CodeView({
   connection,
   messages,
+  images,
+  onImagesChange,
   input,
   busy,
   streaming,
@@ -65,6 +83,8 @@ export function CodeView({
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -72,6 +92,39 @@ export function CodeView({
     element.style.height = "0px";
     element.style.height = `${Math.min(element.scrollHeight, 220)}px`;
   }, [input]);
+
+  const addFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    const room = MAX_IMAGES - images.length;
+    if (room <= 0) {
+      setAttachmentError(`Tối đa ${MAX_IMAGES} ảnh mỗi lượt.`);
+      event.target.value = "";
+      return;
+    }
+    const picked = Array.from(files).slice(0, room);
+    const valid = picked.filter((file) => IMAGE_TYPES.has(file.type));
+    const oversized = valid.find((file) => file.size > MAX_IMAGE_BYTES);
+    if (oversized) {
+      setAttachmentError(`Ảnh "${oversized.name}" vượt quá 5 MB.`);
+      event.target.value = "";
+      return;
+    }
+    if (valid.length === 0) {
+      setAttachmentError("Chỉ hỗ trợ PNG, JPEG, WebP hoặc GIF.");
+      event.target.value = "";
+      return;
+    }
+    try {
+      const urls = await Promise.all(valid.map(readImage));
+      onImagesChange([...images, ...urls]);
+      setAttachmentError(null);
+    } catch (readError) {
+      setAttachmentError(readError instanceof Error ? readError.message : "Không đọc được ảnh.");
+    } finally {
+      event.target.value = "";
+    }
+  };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -200,6 +253,13 @@ export function CodeView({
               <article key={message.id} className={`msg msg-${message.role}`}>
                 <div className="msg-role">{message.role === "user" ? "Bạn" : "tez"}</div>
                 <div className="msg-body">
+                  {message.images && message.images.length > 0 && (
+                    <div className="msg-images">
+                      {message.images.map((src, index) => (
+                        <img key={index} src={src} alt={`Ảnh ${index + 1}`} />
+                      ))}
+                    </div>
+                  )}
                   <div className="msg-text">{message.text}</div>
                   {message.tools && message.tools.length > 0 && (
                     <ToolTraces tools={message.tools} />
@@ -237,6 +297,23 @@ export function CodeView({
 
       <div className="composer-wrap">
         <div className="composer">
+          {images.length > 0 && (
+            <div className="attachments">
+              {images.map((src, index) => (
+                <div className="attachment" key={index}>
+                  <img src={src} alt={`Ảnh ${index + 1}`} />
+                  <button
+                    type="button"
+                    className="attachment-remove"
+                    onClick={() => onImagesChange(images.filter((_, at) => at !== index))}
+                    aria-label={`Bỏ ảnh ${index + 1}`}
+                  >
+                    <IconX size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             value={input}
@@ -247,8 +324,28 @@ export function CodeView({
             aria-label="Yêu cầu cho code agent"
             disabled={loadingSession}
           />
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/*"
+            multiple
+            hidden
+            onChange={(event) => void addFiles(event)}
+          />
           <div className="composer-foot">
             <div className="composer-hint">
+              {!busy && (
+                <button
+                  type="button"
+                  className="attach-button"
+                  onClick={() => fileRef.current?.click()}
+                  disabled={loadingSession || images.length >= MAX_IMAGES}
+                  title={`Đính kèm ảnh (tối đa ${MAX_IMAGES})`}
+                >
+                  <IconImage size={14} />
+                  Ảnh
+                </button>
+              )}
               {busy ? (
                 <span>Agent đang chạy…</span>
               ) : (
@@ -275,6 +372,7 @@ export function CodeView({
             </div>
           </div>
         </div>
+        {attachmentError && <p className="composer-error">{attachmentError}</p>}
         <p className="composer-note">
           Agent có thể sửa file. Kiểm tra diff và chạy test trước khi commit.
         </p>

@@ -10,6 +10,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -86,6 +88,8 @@ pub struct SearchHit {
 pub struct StoredMessage {
     pub role: String,
     pub content: String,
+    /// Data URL ảnh đính kèm (tối đa do client giới hạn).
+    pub images: Vec<String>,
 }
 
 const SCHEMA: &str = r#"
@@ -142,6 +146,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
+    images TEXT NOT NULL DEFAULT '[]',
     model TEXT,
     tokens_in INTEGER,
     tokens_out INTEGER,
@@ -273,6 +278,12 @@ impl Store {
                 "TEXT NOT NULL DEFAULT 'chat'",
             )?;
             Self::add_column_if_missing(&self.conn, "documents", "subject", "TEXT")?;
+            Self::add_column_if_missing(
+                &self.conn,
+                "messages",
+                "images",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
             Self::ensure_fts_schema(&self.conn)?;
             Ok(())
         })();
@@ -416,16 +427,27 @@ impl Store {
     }
 
     pub fn append_message(&self, message: NewMessage<'_>) -> Result<String, StoreError> {
+        self.append_message_with_images(message, &[])
+    }
+
+    /// Như `append_message`, kèm ảnh dạng data URL để resume không mất ảnh.
+    pub fn append_message_with_images(
+        &self,
+        message: NewMessage<'_>,
+        images: &[String],
+    ) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
+        let images_json = serde_json::to_string(images)?;
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO messages (id, session_id, role, content, model, tokens_in, tokens_out)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO messages (id, session_id, role, content, images, model, tokens_in, tokens_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 message.session_id,
                 message.role,
                 message.content,
+                images_json,
                 message.model,
                 message.tokens_in as i64,
                 message.tokens_out as i64,
@@ -588,8 +610,8 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT role, content FROM (
-                SELECT role, content, rowid AS rid
+            "SELECT role, content, images FROM (
+                SELECT role, content, images, rowid AS rid
                 FROM messages
                 WHERE session_id = ?1
                 ORDER BY rowid DESC
@@ -597,9 +619,11 @@ impl Store {
              ) ORDER BY rid ASC",
         )?;
         let rows = statement.query_map(params![session_id, limit as i64], |row| {
+            let images_json: String = row.get(2)?;
             Ok(StoredMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
+                images: serde_json::from_str(&images_json).unwrap_or_default(),
             })
         })?;
 
@@ -1111,6 +1135,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.get_session(&id).unwrap().unwrap().state, "active");
+    }
+
+    #[test]
+    fn persists_images_with_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Người dùng").unwrap();
+        let id = store
+            .create_session_mode("default", None, None, "chat")
+            .unwrap();
+        let images = vec!["data:image/png;base64,AAAA".to_string()];
+
+        store
+            .append_message_with_images(
+                NewMessage {
+                    session_id: &id,
+                    role: "user",
+                    content: "xem ảnh này",
+                    model: None,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+                &images,
+            )
+            .unwrap();
+
+        let loaded = store.load_messages(&id, 10).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "xem ảnh này");
+        assert_eq!(loaded[0].images, images);
     }
 
     #[test]

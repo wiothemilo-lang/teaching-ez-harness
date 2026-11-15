@@ -559,6 +559,10 @@ fn ask_reason(tool: &str, args: &Value) -> Option<String> {
         return None;
     }
 
+    if tool == "web_fetch" {
+        return Some("truy cập mạng bên ngoài".to_string());
+    }
+
     if tool.starts_with("mcp__") {
         return Some("tool từ MCP server bên ngoài".to_string());
     }
@@ -762,6 +766,19 @@ mod tests {
             policy.evaluate("write_file", &json!({"path": "README.md"})),
             PermissionDecision::Ask { .. }
         ));
+    }
+
+    #[test]
+    fn asks_before_network_fetch() {
+        let policy = PermissionPolicy::default();
+        assert!(matches!(
+            policy.evaluate("web_fetch", &json!({"url": "https://example.com"})),
+            PermissionDecision::Ask { .. }
+        ));
+        let trust = PermissionPolicy::new(PermissionMode::Trust);
+        assert!(trust
+            .evaluate("web_fetch", &json!({"url": "https://example.com"}))
+            .is_allowed());
     }
 
     #[tokio::test]

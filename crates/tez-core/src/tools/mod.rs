@@ -18,6 +18,8 @@ pub mod molar_mass;
 pub mod physics_formula;
 pub mod plot_function;
 pub mod readability;
+pub mod skill;
+pub mod web;
 pub mod workspace;
 
 #[derive(Debug, Error)]

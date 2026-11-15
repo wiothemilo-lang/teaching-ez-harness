@@ -187,6 +187,7 @@ export type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  images?: string[];
   tools?: ToolTrace[];
 };
 
@@ -202,7 +203,7 @@ export type SessionInfo = {
 
 export type SessionDetail = {
   id: string;
-  messages: { role: string; content: string }[];
+  messages: { role: string; content: string; images?: string[] }[];
   todos: TodoItem[];
 };
 
@@ -296,6 +297,7 @@ export type SaveMcpPayload = {
 
 export type ChatPayload = {
   message: string;
+  images: string[];
   session_id: string | null;
   provider_id: string | null;
   mode: AppMode;

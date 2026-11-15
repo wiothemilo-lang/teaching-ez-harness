@@ -289,6 +289,16 @@ export function IconChat(props: IconProps) {
   );
 }
 
+export function IconImage(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+      <circle cx="9" cy="9.5" r="1.5" />
+      <path d="m4 17 5-4.5 4 3.5 2.5-2 4.5 4" />
+    </Glyph>
+  );
+}
+
 export function IconPlan(props: IconProps) {
   return (
     <Glyph {...props}>

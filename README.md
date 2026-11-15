@@ -78,7 +78,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 |---|---|
 | Rust workspace (`tez-llm`, `tez-core`, `tez-store`, `tez-auth`, `tez-update`, `tez-cli`) | ✅ |
 | Agent loop: tool call, timeout 60s, cap output 8KB, tối đa 12 bước (chỉnh được) | ✅ |
-| Chat tổng quát (không giới hạn môn) + 4 preset Toán/Lý/Hóa/Anh | ✅ |
+| Chat tổng quát (không giới hạn môn) + 4 preset Toán/Lý/Hóa/Anh; gửi kèm ảnh | ✅ |
 | Plan mode: chỉ đọc workspace, khảo sát và trình kế hoạch trước khi sửa | ✅ |
 | Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
 | Harness: permission pipeline 4 mức + rule theo tool/path, approval kèm diff, hook audit + che bí mật | ✅ |
@@ -87,8 +87,10 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
 | SQLite: session (kèm mode), message, tool call, todo, token usage | ✅ |
 | Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
-| Skills Markdown: 4 built-in, khớp ngữ cảnh + từ khóa, chèn vào context, tạo bằng AI | ✅ |
+| Skills Markdown: 4 built-in, catalog trong prompt + tool `skill` để model tự nạp, tạo bằng AI | ✅ |
 | Ngữ cảnh dự án: `AGENTS.md`/`CLAUDE.md`, `.tez/skills`, `.tez/mcp.json` | ✅ |
+| Web: tool `web_fetch` tải http/https, chặn host nội bộ/DNS rebinding, redirect có kiểm tra lại, lọc HTML, cap 512 KB | ✅ |
+| Ảnh: đính kèm PNG/JPEG/WebP/GIF (tối đa 4, 5 MB/ảnh), lưu vào SQLite để resume không mất | ✅ |
 | MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace | ✅ |
 | Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
@@ -309,7 +311,7 @@ scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 
 **Sử dụng:** mở **tez — Chat & Code** từ menu → **Cài đặt → Model** → chọn preset (Groq, Gemini, OpenRouter, OpenAI, Ollama) hoặc Custom → dán API key (để trống nếu endpoint không cần key) → **Lưu nhà cung cấp** → **Kiểm tra**.
 
-Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar gọn với workspace, danh sách phiên và công tắc **Chat / Code**; `Ctrl K` mở command palette để chuyển chế độ, mở cài đặt hoặc tạo extension.
+Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar gọn với workspace, danh sách phiên và công tắc **Chat / Plan / Code**; `Ctrl K` mở command palette để chuyển chế độ, mở cài đặt hoặc tạo extension.
 
 - **Chat:** trợ lý tổng quát, không bắt chọn môn hay lớp; câu trả lời stream dần, nút gửi đổi thành nút **dừng** khi agent đang chạy; tool trace có args/kết quả/thời gian, token usage.
 - **Plan:** chỉ đọc workspace; agent khảo sát, đặt câu hỏi và trình kế hoạch (mục tiêu, file, bước, rủi ro, cách kiểm chứng) trước khi bạn chuyển sang Code. Chuyển Plan → Code giữ nguyên phiên, todos và hội thoại.
@@ -341,10 +343,12 @@ Chạy không cần FUSE:
 
 - Streaming phát text theo từng đoạn; tool call vẫn được gom đủ trong một lượt. Nút dừng có hiệu lực giữa các bước, lệnh đang chạy chưa bị kill.
 - RAG chỉ nhận `.txt`/`.md`; PDF/DOCX/OCR chưa có.
+- `web_fetch` chưa render JavaScript; HTML parser đơn giản (comment/entity số đã xử lý nhưng thẻ lỗi có thể còn sót). DNS được kiểm tra lại và pin địa chỉ ở từng redirect; chỉ dùng địa chỉ đầu tiên khi host có nhiều bản ghi. Charset hỗ trợ UTF-8, Latin-1 và Windows-1252; body vẫn cap 512 KB.
+- Ảnh lưu dạng data URL trong SQLite nên làm DB lớn lên (giới hạn 4 ảnh, tổng 8 MB/lượt). Ảnh cũ hiện lại trong UI khi resume nhưng chỉ lượt hiện tại được gửi lên model; chưa hỗ trợ PDF/audio/video.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
 - MCP chỉ hỗ trợ stdio; server spawn mỗi lượt chat, timeout 20 giây, chưa sandbox.
 - Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.
-- Skill khớp từ khóa đơn giản, tối đa 2 skill mỗi lượt.
+- Skill dùng catalog ngắn trong system prompt; model gọi tool `skill` để nạp nội dung. Chưa có progressive disclosure nhiều tầng hoặc skill tự chạy code.
 - Code mode giới hạn đường dẫn ở tầng ứng dụng, chưa phải sandbox OS; `run_command` chạy bằng quyền của user.
 - Permission pipeline và hook là lớp kiểm soát của app, không thay thế sandbox hệ điều hành; deny-list chỉ chặn các mẫu phá hủy rõ ràng.
 - Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu).
@@ -368,5 +372,5 @@ Chạy không cần FUSE:
 1. RAG PDF/DOCX + OCR, `context inspect` để xem token từng phần.
 2. Lưu connection vào SQLite + OS keychain (thay master key file).
 3. Thêm tool Anh (`vocabulary_lookup`) và eval 8 case/môn.
-4. Skill tool do model tự gọi (thay keyword-match), web fetch và multimodal input.
+4. MCP HTTP/SSE + resources/prompts, multimodal đầy đủ (PDF/audio) và render JavaScript cho web_fetch.
 5. Ký số installer Windows và bật auto-update có xác minh chữ ký.

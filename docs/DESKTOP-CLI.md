@@ -59,7 +59,7 @@
 
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
-- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp từ khóa trong câu hỏi (tối đa 2) và đăng ký tool MCP vào cùng registry với tool built-in.
+- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat đưa catalog skill vào system prompt và đăng ký tool `skill` để model tự nạp nội dung, cùng tool MCP trong một registry.
 - Khi có workspace, chat nạp thêm `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), skill ở `.tez/skills/`, MCP ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
 - Desktop và CLI đều mở SQLite trực tiếp; WAL + `busy_timeout` xử lý tranh chấp ngắn. Không có process server riêng.
@@ -198,9 +198,9 @@ tez doctor
 
 | Màn hình | Chức năng |
 |---|---|
-| **Chat** | Trợ lý tổng quát (không bắt chọn môn), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
+| **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh (lưu vào SQLite để resume), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
 | **Code** | Workspace chip, `read_file`/`write_file`/`edit_file`/`list_files`/`glob`/`grep`/`run_command`, todo/context dock, approval modal |
-| **Approval modal** | Hiện lý do + tool + args JSON; từ chối hoặc cho phép; timeout 180 s thì từ chối |
+| **Approval modal** | Hiện lý do + tool + diff trước khi ghi (hoặc args JSON); từ chối hoặc cho phép; timeout 180 s thì từ chối |
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
