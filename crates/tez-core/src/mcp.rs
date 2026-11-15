@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tez_llm::ToolSpec;
@@ -1056,6 +1057,7 @@ struct HttpConnection {
     oauth: Option<OAuthConfig>,
     server: String,
     token_dir: Option<PathBuf>,
+    get_stream: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HttpConnection {
@@ -1107,7 +1109,24 @@ impl HttpConnection {
             oauth: config.oauth.clone(),
             server: server.to_string(),
             token_dir: token_dir.map(Path::to_path_buf),
+            get_stream: None,
         })
+    }
+
+    /// Mở GET SSE stream để nhận request/notification do server khởi tạo.
+    /// Stream là best-effort: server không hỗ trợ, trả lỗi hoặc đóng kết nối
+    /// đều không làm hỏng các request POST hiện có.
+    fn start_get_stream(&mut self) {
+        if self.get_stream.is_some() {
+            return;
+        }
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        let session_id = self.session_id.clone();
+        self.get_stream = Some(tokio::spawn(async move {
+            run_get_stream(client, url, headers, session_id).await;
+        }));
     }
 
     async fn send(&mut self, payload: &Value) -> Result<reqwest::Response, McpError> {
@@ -1215,8 +1234,132 @@ impl McpTransport for HttpConnection {
             }))
             .await?;
         let _ = response.bytes().await;
+        if method == "notifications/initialized" {
+            self.start_get_stream();
+        }
         Ok(())
     }
+}
+
+impl Drop for HttpConnection {
+    fn drop(&mut self) {
+        if let Some(task) = &self.get_stream {
+            task.abort();
+        }
+    }
+}
+
+/// Đọc GET SSE stream và trả lời các request server khởi tạo.
+async fn run_get_stream(
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Option<String>,
+) {
+    let mut request = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache");
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    if let Some(session) = &session_id {
+        request = request.header("Mcp-Session-Id", session);
+    }
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(_) => return,
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.contains("text/event-stream") {
+        return;
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut data = String::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        buffer.extend_from_slice(&chunk);
+        while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes: Vec<u8> = buffer.drain(..=position).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if !data.is_empty() {
+                    if let Ok(value) = serde_json::from_str::<Value>(data.trim_end()) {
+                        handle_server_message(&client, &url, &headers, &session_id, value).await;
+                    }
+                    data.clear();
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                if data.len() > MAX_MCP_LINE_BYTES {
+                    data.clear();
+                }
+            }
+        }
+        if buffer.len() > MAX_MCP_LINE_BYTES {
+            buffer.clear();
+        }
+    }
+}
+
+/// Trả lời request do server khởi tạo. Client tez không khai báo sampling,
+/// elicitation hay roots, nên chỉ hỗ trợ `ping` và trả lỗi rõ cho phần còn lại.
+async fn handle_server_message(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HashMap<String, String>,
+    session_id: &Option<String>,
+    value: Value,
+) {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(id) = value.get("id").cloned() else {
+        return;
+    };
+    let payload = match method {
+        "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+        "roots/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"roots": []}}),
+        other => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("tez không hỗ trợ request '{other}' từ MCP server")
+            }
+        }),
+    };
+    let mut request = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .json(&payload);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(session) = session_id {
+        request = request.header("Mcp-Session-Id", session);
+    }
+    let _ = request.send().await;
 }
 
 fn parse_json_result(bytes: &[u8], id: u64) -> Result<Value, McpError> {
@@ -1704,7 +1847,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Value> {
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 2048];
             loop {
@@ -1718,6 +1861,13 @@ mod tests {
                     continue;
                 };
                 let header = String::from_utf8_lossy(&buffer[..header_end]);
+                if header
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("GET "))
+                {
+                    return None;
+                }
                 let content_length = header
                     .lines()
                     .find_map(|line| {
@@ -1731,7 +1881,7 @@ mod tests {
                     .unwrap_or(0);
                 if buffer.len() >= header_end + 4 + content_length {
                     let body = &buffer[header_end + 4..header_end + 4 + content_length];
-                    return serde_json::from_slice(body).unwrap();
+                    return Some(serde_json::from_slice(body).unwrap());
                 }
             }
             panic!("HTTP request không có body JSON");
@@ -1753,9 +1903,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_request(&mut stream).await;
+                let Some(request) = read_request(&mut stream).await else {
+                    write_response(&mut stream, "405 Method Not Allowed", "", "").await;
+                    continue;
+                };
                 let method = request["method"].as_str().unwrap_or_default();
                 match method {
                     "initialize" => {
@@ -1862,7 +2015,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Value> {
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 2048];
             loop {
@@ -1876,6 +2029,13 @@ mod tests {
                     continue;
                 };
                 let header = String::from_utf8_lossy(&buffer[..header_end]);
+                if header
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("GET "))
+                {
+                    return None;
+                }
                 let content_length = header
                     .lines()
                     .find_map(|line| {
@@ -1889,7 +2049,7 @@ mod tests {
                     .unwrap_or(0);
                 if buffer.len() >= header_end + 4 + content_length {
                     let body = &buffer[header_end + 4..header_end + 4 + content_length];
-                    return serde_json::from_slice(body).unwrap();
+                    return Some(serde_json::from_slice(body).unwrap());
                 }
             }
             panic!("HTTP request không có body JSON");
@@ -1911,9 +2071,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..7 {
+            for _ in 0..8 {
                 let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_request(&mut stream).await;
+                let Some(request) = read_request(&mut stream).await else {
+                    write_response(&mut stream, "405 Method Not Allowed", "", "").await;
+                    continue;
+                };
                 let method = request["method"].as_str().unwrap_or_default();
                 let result = match method {
                     "initialize" => {
@@ -2012,6 +2175,138 @@ mod tests {
             .unwrap();
         assert!(output.content.contains("user: hi"));
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_get_stream_answers_server_ping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Value> {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&buffer[..header_end]);
+                if header
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("GET "))
+                {
+                    return None;
+                }
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + content_length {
+                    let body = &buffer[header_end + 4..header_end + 4 + content_length];
+                    return Some(serde_json::from_slice(body).unwrap());
+                }
+            }
+            panic!("HTTP request không có body JSON");
+        }
+
+        async fn write_json(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let Some(request) = read_request(&mut stream).await else {
+                    let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    continue;
+                };
+                let method = request["method"].as_str().unwrap_or_default();
+                match method {
+                    "initialize" => {
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "serverInfo": {"name": "test", "version": "0"}
+                            }
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                    "notifications/initialized" => {
+                        write_json(&mut stream, "202 Accepted", "").await;
+                    }
+                    "tools/list" => {
+                        write_json(
+                            &mut stream,
+                            "200 OK",
+                            &json!({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": []}})
+                                .to_string(),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        tx.send(request).unwrap();
+                        write_json(&mut stream, "202 Accepted", "").await;
+                    }
+                }
+            }
+        });
+
+        let config = McpServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            read_only: false,
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+            bearer_token_env: None,
+            oauth: None,
+            sandbox: McpSandboxSettings::default(),
+        };
+        let (client, tools) = McpClient::connect("http", &config, None).await.unwrap();
+        assert!(tools.is_empty());
+        let response = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("không nhận được response cho ping")
+            .expect("server đóng kênh");
+        assert_eq!(response["id"], json!("srv-1"));
+        assert_eq!(response["result"], json!({}));
+        drop(client);
         server.await.unwrap();
     }
 

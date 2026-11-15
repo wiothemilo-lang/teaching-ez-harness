@@ -1473,6 +1473,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "evalexpr",
+ "futures-util",
  "glob",
  "libc",
  "regex",
