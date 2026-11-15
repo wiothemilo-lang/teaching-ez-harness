@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -254,8 +255,8 @@ struct ChatReply {
 }
 
 const APPROVAL_FILE: &str = "approvals.json";
-const APPROVAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-const APPROVAL_MAX_ENTRIES: usize = 200;
+const APPROVAL_DEFAULT_TTL_HOURS: u64 = 168;
+const APPROVAL_DEFAULT_MAX_ENTRIES: usize = 200;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredApproval {
@@ -273,11 +274,24 @@ struct StoredApprovals {
 ///
 /// Quyết định "cho phép trong phiên" được lưu vào `approvals.json` để sống qua
 /// lần khởi động lại. Mỗi mục có TTL 7 ngày và file tối đa 200 mục.
-#[derive(Default)]
 struct ApprovalBroker {
     pending: Mutex<HashMap<String, PendingApproval>>,
     remembered: Mutex<HashMap<String, u64>>,
     path: Option<PathBuf>,
+    ttl_secs: AtomicU64,
+    max_entries: AtomicUsize,
+}
+
+impl Default for ApprovalBroker {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            remembered: Mutex::new(HashMap::new()),
+            path: None,
+            ttl_secs: AtomicU64::new(APPROVAL_DEFAULT_TTL_HOURS * 3600),
+            max_entries: AtomicUsize::new(APPROVAL_DEFAULT_MAX_ENTRIES),
+        }
+    }
 }
 
 struct PendingApproval {
@@ -286,6 +300,35 @@ struct PendingApproval {
 }
 
 impl ApprovalBroker {
+    fn ttl_secs(&self) -> u64 {
+        self.ttl_secs.load(Ordering::Relaxed)
+    }
+
+    fn max_entries(&self) -> usize {
+        self.max_entries.load(Ordering::Relaxed)
+    }
+
+    fn set_limits(&self, ttl_hours: u64, max_entries: usize) {
+        self.ttl_secs
+            .store(ttl_hours.clamp(1, 8_760).saturating_mul(3600), Ordering::Relaxed);
+        self.max_entries
+            .store(max_entries.clamp(10, 2_000), Ordering::Relaxed);
+        let now = now_secs();
+        if let Ok(mut remembered) = self.remembered.lock() {
+            remembered.retain(|_, created_at| {
+                now.saturating_sub(*created_at) <= self.ttl_secs()
+            });
+        }
+        self.persist();
+    }
+
+    fn clear(&self) {
+        if let Ok(mut remembered) = self.remembered.lock() {
+            remembered.clear();
+        }
+        self.persist();
+    }
+
     fn load(path: Option<PathBuf>) -> Self {
         let broker = Self {
             path,
@@ -313,7 +356,7 @@ impl ApprovalBroker {
         let remembered: HashMap<String, u64> = stored
             .entries
             .into_iter()
-            .filter(|entry| now.saturating_sub(entry.created_at) <= APPROVAL_TTL_SECS)
+            .filter(|entry| now.saturating_sub(entry.created_at) <= self.ttl_secs())
             .map(|entry| (entry.key, entry.created_at))
             .collect();
         if let Ok(mut current) = self.remembered.lock() {
@@ -339,7 +382,7 @@ impl ApprovalBroker {
             })
             .unwrap_or_default();
         entries.sort_by_key(|entry| entry.created_at);
-        let keep_from = entries.len().saturating_sub(APPROVAL_MAX_ENTRIES);
+        let keep_from = entries.len().saturating_sub(self.max_entries());
         let entries = entries.split_off(keep_from);
         let payload = match serde_json::to_vec_pretty(&StoredApprovals { entries }) {
             Ok(payload) => payload,
@@ -409,7 +452,7 @@ impl ApprovalBroker {
             .remembered
             .lock()
             .map(|mut remembered| match remembered.get(key) {
-                Some(created_at) if now.saturating_sub(*created_at) <= APPROVAL_TTL_SECS => true,
+                Some(created_at) if now.saturating_sub(*created_at) <= self.ttl_secs() => true,
                 Some(_) => {
                     remembered.remove(key);
                     expired = true;
@@ -520,11 +563,24 @@ fn approval_key(request: &ApprovalRequest) -> String {
             .trim()
     };
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         request.session_id.as_deref().unwrap_or(""),
         request.tool,
-        target
+        target,
+        approval_args_fingerprint(&request.args)
     )
+}
+
+/// Băm toàn bộ args để "cho phép trong phiên" không áp dụng cho nội dung
+/// khác trên cùng đường dẫn hoặc cùng tên tool.
+fn approval_args_fingerprint(args: &serde_json::Value) -> String {
+    let serialized = serde_json::to_string(args).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in serialized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[async_trait]
@@ -1862,6 +1918,10 @@ async fn chat_inner(
         }
         tools.register(tool);
     }
+    for tool in discovery.extras {
+        read_only_tools.push(tool.spec().name);
+        tools.register(tool);
+    }
     let policy = Arc::new(
         PermissionPolicy::new(policy_mode)
             .with_rules(config.permission_rules.clone())
@@ -2035,6 +2095,12 @@ fn respond_approval(
     broker.respond(&request.id, request.approved, request.remember)
 }
 
+#[tauri::command]
+fn clear_approvals(broker: State<'_, Arc<ApprovalBroker>>) -> bool {
+    broker.clear();
+    true
+}
+
 fn harness_info(dir: &Path) -> HarnessInfo {
     let config = harness::load(dir);
     let memory = MemoryStore::new(dir.join("memory"))
@@ -2064,9 +2130,13 @@ fn get_harness() -> Result<HarnessInfo, String> {
 }
 
 #[tauri::command]
-fn save_harness(config: HarnessConfig) -> Result<HarnessInfo, String> {
+fn save_harness(
+    broker: State<'_, Arc<ApprovalBroker>>,
+    config: HarnessConfig,
+) -> Result<HarnessInfo, String> {
     let dir = data_dir().map_err(friendly)?;
     harness::save(&dir, &config)?;
+    broker.set_limits(config.approval_ttl_hours, config.approval_max_entries);
     Ok(harness_info(&dir))
 }
 
@@ -2157,6 +2227,7 @@ pub fn run() {
             load_session_plan,
             save_session_plan,
             respond_approval,
+            clear_approvals,
             get_harness,
             save_harness,
             delete_memory,
@@ -2288,6 +2359,25 @@ mod tests {
     }
 
     #[test]
+    fn approval_key_includes_args_fingerprint() {
+        let mut request = ApprovalRequest::new(
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+            "ghi file",
+            Some("sess".into()),
+        );
+        let first = approval_key(&request);
+        assert!(first.starts_with("sess|write_file|a.txt|"));
+
+        request.args = serde_json::json!({"path": "a.txt", "content": "two"});
+        assert_ne!(first, approval_key(&request));
+
+        // Thứ tự key trong object không được làm đổi fingerprint.
+        request.args = serde_json::json!({"content": "one", "path": "a.txt"});
+        assert_eq!(first, approval_key(&request));
+    }
+
+    #[test]
     fn approval_remember_persists_across_reload() {
         let dir = std::env::temp_dir().join(format!(
             "tez-approval-test-{}-{}",
@@ -2316,7 +2406,7 @@ mod tests {
         if let Ok(mut remembered) = broker.remembered.lock() {
             remembered.insert(
                 key.to_string(),
-                now_secs().saturating_sub(APPROVAL_TTL_SECS + 1),
+                now_secs().saturating_sub(broker.ttl_secs() + 1),
             );
         }
         assert!(!broker.is_remembered(key));

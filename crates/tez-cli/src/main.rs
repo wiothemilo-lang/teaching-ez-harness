@@ -1520,6 +1520,11 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         tools.register(tool);
         mcp_count += 1;
     }
+    for tool in discovery.extras {
+        read_only_tools.push(tool.spec().name);
+        tools.register(tool);
+        mcp_count += 1;
+    }
     if mcp_count > 0 {
         eprintln!(
             "[mcp] {mcp_count} tool từ {} server",

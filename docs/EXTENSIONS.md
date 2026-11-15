@@ -71,7 +71,7 @@ tez skills show step-by-step
 
 ## 2. MCP — công cụ ngoài qua stdio hoặc HTTP
 
-tez là MCP client tối giản: gọi `initialize`, `tools/list`, `tools/call`, rồi đóng kết nối khi lượt chat kết thúc. Tool MCP được đăng ký cùng registry với tool built-in và xuất hiện trong trace của desktop/CLI.
+tez là MCP client tối giản: gọi `initialize`, `tools/list`, `tools/call`, rồi đóng kết nối khi lượt chat kết thúc. Tool MCP được đăng ký cùng registry với tool built-in và xuất hiện trong trace của desktop/CLI. Server khai báo capability `resources` hoặc `prompts` được thêm một tool chỉ đọc `mcp__<server>__extras` để liệt kê/đọc resources và prompts.
 
 Có hai transport:
 
@@ -123,13 +123,26 @@ Ngoài `read_only` ở cấp server, tool có thể tự khai báo chỉ đọc 
 
 Desktop có checkbox **Chỉ đọc (cho phép trong Plan)** trong form MCP.
 
+### Resources và prompts
+
+Nếu server khai báo capability `resources` hoặc `prompts`, tez đăng ký thêm một tool chỉ đọc tên `mcp__<server>__extras`:
+
+| `action` | Việc thực hiện |
+|---|---|
+| `list_resources` | Gọi `resources/list`, trả về danh sách resource. |
+| `read_resource` | Gọi `resources/read` với `uri`; trả text hoặc mô tả blob. |
+| `list_prompts` | Gọi `prompts/list`, trả về danh sách prompt. |
+| `get_prompt` | Gọi `prompts/get` với `name` và `arguments` tùy chọn. |
+
+Tool extras luôn được coi là chỉ đọc, nên dùng được trong Plan và không hỏi lại quyền. Nội dung trả về được giới hạn 64 KB. Đây vẫn là dữ liệu do server cung cấp; chỉ cài server bạn tin tưởng.
+
 ### Tên tool
 
 Tool được đặt tên `mcp__<server>__<tool>` và làm sạch ký tự để tương thích OpenAI function calling, tối đa 64 ký tự. Ví dụ server `study`, tool `echo` → `mcp__study__echo`.
 
 ### Giới hạn hiện tại
 
-- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated, resources/prompts hay OAuth. Header auth phải cấu hình tĩnh trong `headers`.
+- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated hay OAuth. Header auth phải cấu hình tĩnh trong `headers`. Resources/prompts chỉ đọc qua tool extras, không có UI riêng.
 - Timeout khởi động/gọi: 20 giây; stderr của server stdio bị bỏ qua.
 - Server stdio chạy dưới quyền user hiện tại, **chưa có sandbox**. Chỉ cài server bạn tin tưởng.
 - Server stdio được spawn lại mỗi lượt chat; chưa giữ process dài hạn. HTTP dùng client mới mỗi lượt.

@@ -382,6 +382,66 @@ export function HarnessPanel({ notify, onChanged }: Props) {
 
           <div className="harness-block">
             <div className="harness-block-head">
+              <h4>Approval đã nhớ</h4>
+              <p>
+                Quyết định “cho phép trong phiên” được lưu vào <code>approvals.json</code>. TTL và
+                số mục tối đa áp dụng từ lần lưu cấu hình này.
+              </p>
+            </div>
+            <div className="field-grid">
+              <label className="field">
+                <span>TTL (giờ)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={8760}
+                  value={draft.approval_ttl_hours}
+                  onChange={(event) =>
+                    patch({ approval_ttl_hours: Number(event.target.value) || 1 })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span>Số mục tối đa</span>
+                <input
+                  type="number"
+                  min={10}
+                  max={2000}
+                  value={draft.approval_max_entries}
+                  onChange={(event) =>
+                    patch({ approval_max_entries: Number(event.target.value) || 10 })
+                  }
+                />
+              </label>
+            </div>
+            <div className="head-actions">
+              <button
+                className="btn btn-sm"
+                onClick={() => {
+                  void api.clearApprovals().then(
+                    () =>
+                      notify(
+                        "success",
+                        "Đã xoá approval đã nhớ",
+                        "Các thao tác sẽ hỏi lại từ đầu.",
+                      ),
+                    (error) =>
+                      notify("error", "Không xoá được approval", api.errorMessage(error)),
+                  );
+                }}
+              >
+                <IconTrash size={14} />
+                Xoá approval đã nhớ
+              </button>
+            </div>
+            <p className="field-note">
+              Key gồm session, tool, đường dẫn/lệnh và fingerprint của toàn bộ args. Cùng đường dẫn
+              nhưng nội dung khác sẽ hỏi lại.
+            </p>
+          </div>
+
+          <div className="harness-block">
+            <div className="harness-block-head">
               <h4>Hành vi & ngôn ngữ</h4>
               <p>
                 Chỉ dẫn bổ sung được nối vào system prompt. Dùng cho phong cách trả lời, quy ước

@@ -66,6 +66,10 @@ export function saveHarness(config: HarnessConfig): Promise<HarnessInfo> {
   return invoke("save_harness", { config });
 }
 
+export function clearApprovals(): Promise<boolean> {
+  return invoke("clear_approvals");
+}
+
 export function deleteMemory(name: string): Promise<boolean> {
   return invoke("delete_memory", { request: { name } });
 }
