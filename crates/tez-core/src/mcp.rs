@@ -1,8 +1,9 @@
-//! MCP client tối giản qua stdio (JSON-RPC 2.0).
+//! MCP client tối giản qua stdio hoặc Streamable HTTP (JSON-RPC 2.0).
 //!
-//! Hỗ trợ đủ cho MVP: `initialize`, `tools/list`, `tools/call`. Mỗi server là
-//! một process con được giữ sống trong lúc agent chạy; tool MCP được đăng ký
-//! vào cùng [`crate::tools::ToolRegistry`] với tool built-in.
+//! Hỗ trợ `initialize`, `tools/list`, `tools/call`. Server stdio là process con
+//! được giữ sống trong lúc agent chạy; server HTTP dùng POST JSON-RPC và nhận
+//! response JSON hoặc SSE. Tool MCP được đăng ký vào cùng
+//! [`crate::tools::ToolRegistry`] với tool built-in.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,12 +40,16 @@ pub enum McpError {
     Closed,
     #[error("MCP timeout")]
     Timeout,
+    #[error("MCP HTTP: {0}")]
+    Http(String),
     #[error("MCP error: {0}")]
     Rpc(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Bỏ trống khi dùng `url` (Streamable HTTP).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -57,6 +62,12 @@ pub struct McpServerConfig {
     /// Ép mọi tool của server này được coi là chỉ đọc (dùng cho Plan).
     #[serde(default, alias = "readOnly")]
     pub read_only: bool,
+    /// Endpoint Streamable HTTP. Có `url` thì bỏ qua `command`/`args`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Header bổ sung cho HTTP, ví dụ Authorization. Không ghi log.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -308,15 +319,15 @@ impl Tool for McpTool {
     }
 }
 
-pub struct McpClient {
-    inner: Mutex<McpConnection>,
+#[async_trait]
+trait McpTransport: Send {
+    fn protocol_version(&self) -> &'static str;
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError>;
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError>;
 }
 
-struct McpConnection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
+pub struct McpClient {
+    inner: Mutex<Box<dyn McpTransport>>,
 }
 
 impl McpClient {
@@ -324,6 +335,74 @@ impl McpClient {
         _server: &str,
         config: &McpServerConfig,
     ) -> Result<(Arc<Self>, Vec<McpToolInfo>), McpError> {
+        let use_http = config
+            .url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|url| !url.is_empty());
+        let mut transport: Box<dyn McpTransport> = if use_http {
+            Box::new(HttpConnection::connect(config).await?)
+        } else {
+            Box::new(StdioConnection::connect(config)?)
+        };
+
+        let protocol = transport.protocol_version();
+        transport
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": protocol,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "tez",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await?;
+        transport
+            .notify("notifications/initialized", json!({}))
+            .await?;
+        let result = transport.request("tools/list", json!({})).await?;
+        let tools = parse_tools(&result);
+
+        Ok((
+            Arc::new(Self {
+                inner: Mutex::new(transport),
+            }),
+            tools,
+        ))
+    }
+
+    pub async fn call(&self, tool: &str, args: Value) -> Result<ToolOutput, McpError> {
+        let mut connection = self.inner.lock().await;
+        let result = connection
+            .request(
+                "tools/call",
+                json!({
+                    "name": tool,
+                    "arguments": args
+                }),
+            )
+            .await?;
+        Ok(parse_call_result(&result))
+    }
+}
+
+struct StdioConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl StdioConnection {
+    fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        if config.command.trim().is_empty() {
+            return Err(McpError::Spawn(
+                "thiếu command và url cho MCP server".into(),
+            ));
+        }
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -348,63 +427,38 @@ impl McpClient {
             .take()
             .ok_or_else(|| McpError::Spawn("không mở được stdout".into()))?;
 
-        let mut connection = McpConnection {
+        Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
-        };
-
-        connection
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "tez",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
-            .await?;
-        connection
-            .notify("notifications/initialized", json!({}))
-            .await?;
-        let result = connection.request("tools/list", json!({})).await?;
-        let tools = parse_tools(&result);
-
-        Ok((
-            Arc::new(Self {
-                inner: Mutex::new(connection),
-            }),
-            tools,
-        ))
-    }
-
-    pub async fn call(&self, tool: &str, args: Value) -> Result<ToolOutput, McpError> {
-        let mut connection = self.inner.lock().await;
-        let result = connection
-            .request(
-                "tools/call",
-                json!({
-                    "name": tool,
-                    "arguments": args
-                }),
-            )
-            .await?;
-        Ok(parse_call_result(&result))
+        })
     }
 }
 
-impl Drop for McpConnection {
+#[async_trait]
+impl McpTransport for StdioConnection {
+    fn protocol_version(&self) -> &'static str {
+        "2024-11-05"
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        self.send_request(method, params).await
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
+        self.send_notify(method, params).await
+    }
+}
+
+impl Drop for StdioConnection {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
 }
 
-impl McpConnection {
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+impl StdioConnection {
+    async fn send_request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id;
         self.next_id += 1;
         self.write(&json!({
@@ -417,7 +471,7 @@ impl McpConnection {
         self.read_result(id).await
     }
 
-    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
+    async fn send_notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
         self.write(&json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -502,6 +556,179 @@ impl McpConnection {
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
     }
+}
+
+struct HttpConnection {
+    client: reqwest::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Option<String>,
+    next_id: u64,
+}
+
+impl HttpConnection {
+    async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        let raw = config
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| McpError::Spawn("thiếu url cho MCP HTTP".into()))?;
+        let url = reqwest::Url::parse(raw)
+            .map_err(|error| McpError::Spawn(format!("URL MCP không hợp lệ: {error}")))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(McpError::Spawn(
+                "MCP HTTP chỉ hỗ trợ http/https".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(MCP_TIMEOUT)
+            .user_agent("tez/0.1 (+local)")
+            .build()
+            .map_err(|error| McpError::Http(format!("không tạo được HTTP client: {error}")))?;
+        Ok(Self {
+            client,
+            url: raw.to_string(),
+            headers: config.headers.clone(),
+            session_id: None,
+            next_id: 1,
+        })
+    }
+
+    async fn post(&mut self, payload: &Value) -> Result<reqwest::Response, McpError> {
+        let mut request = self
+            .client
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::ACCEPT,
+                "application/json, text/event-stream",
+            )
+            .json(payload);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        if let Some(session) = &self.session_id {
+            request = request.header("Mcp-Session-Id", session);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| McpError::Http(error.to_string()))?;
+        if let Some(session) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+        {
+            self.session_id = Some(session.to_string());
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let preview: String = body.chars().take(500).collect();
+            return Err(McpError::Rpc(format!("HTTP {status}: {preview}")));
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl McpTransport for HttpConnection {
+    fn protocol_version(&self) -> &'static str {
+        "2025-03-26"
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self
+            .post(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            }))
+            .await?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| McpError::Http(error.to_string()))?;
+        if bytes.len() > MAX_MCP_LINE_BYTES {
+            return Err(McpError::Rpc(format!(
+                "response MCP vượt quá {} KB",
+                MAX_MCP_LINE_BYTES / 1024
+            )));
+        }
+        if content_type.contains("text/event-stream") {
+            parse_sse_result(&bytes, id)
+        } else {
+            parse_json_result(&bytes, id)
+        }
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), McpError> {
+        let response = self
+            .post(&json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params
+            }))
+            .await?;
+        let _ = response.bytes().await;
+        Ok(())
+    }
+}
+
+fn parse_json_result(bytes: &[u8], id: u64) -> Result<Value, McpError> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    rpc_result(&value, id)
+}
+
+fn parse_sse_result(bytes: &[u8], id: u64) -> Result<Value, McpError> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut data_lines: Vec<String> = Vec::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            if data_lines.is_empty() {
+                continue;
+            }
+            let payload = data_lines.join("\n");
+            data_lines.clear();
+            let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                return rpc_result(&value, id);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start().to_string());
+        }
+    }
+    Err(McpError::Rpc(format!("SSE không có response khớp id {id}")))
+}
+
+fn rpc_result(value: &Value, id: u64) -> Result<Value, McpError> {
+    if value.get("id").and_then(Value::as_u64) != Some(id) {
+        return Err(McpError::Rpc(format!("response MCP không khớp id {id}")));
+    }
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Err(McpError::Rpc(message.to_string()));
+    }
+    Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
 fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
@@ -704,6 +931,8 @@ mod tests {
                 cwd: None,
                 enabled: true,
                 read_only: false,
+                url: None,
+                headers: HashMap::new(),
             },
         );
         save_config(dir.path(), &config).unwrap();
@@ -726,6 +955,8 @@ mod tests {
                 cwd: None,
                 enabled: true,
                 read_only: false,
+                url: None,
+                headers: HashMap::new(),
             },
         );
         save_config(data.path(), &config).unwrap();
@@ -748,5 +979,165 @@ mod tests {
 
         let extra = entries.iter().find(|entry| entry.name == "extra").unwrap();
         assert_eq!(extra.source, "project");
+    }
+
+    #[test]
+    fn http_config_accepts_url_and_headers() {
+        let config: McpServerConfig = serde_json::from_value(json!({
+            "url": "https://mcp.example.com/mcp",
+            "headers": {"Authorization": "Bearer test"},
+            "enabled": true
+        }))
+        .unwrap();
+        assert!(config.command.is_empty());
+        assert_eq!(config.url.as_deref(), Some("https://mcp.example.com/mcp"));
+        assert_eq!(config.headers["Authorization"], "Bearer test");
+    }
+
+    #[test]
+    fn parses_json_and_sse_results() {
+        let json_body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let value = parse_json_result(json_body, 1).unwrap();
+        assert_eq!(value["tools"], json!([]));
+
+        let sse_body =
+            b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n\n";
+        let value = parse_sse_result(sse_body, 2).unwrap();
+        assert_eq!(value["ok"], json!(true));
+
+        assert!(parse_sse_result(sse_body, 3).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_transport_lists_and_calls_tools() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + content_length {
+                    let body = &buffer[header_end + 4..header_end + 4 + content_length];
+                    return serde_json::from_slice(body).unwrap();
+                }
+            }
+            panic!("HTTP request không có body JSON");
+        }
+
+        async fn write_response(
+            stream: &mut tokio::net::TcpStream,
+            status: &str,
+            extra_headers: &str,
+            body: &str,
+        ) {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let method = request["method"].as_str().unwrap_or_default();
+                match method {
+                    "initialize" => {
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {},
+                                "serverInfo": {"name": "test", "version": "0"}
+                            }
+                        })
+                        .to_string();
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            "Mcp-Session-Id: test-session\r\n",
+                            &body,
+                        )
+                        .await;
+                    }
+                    "notifications/initialized" => {
+                        write_response(&mut stream, "202 Accepted", "", "").await;
+                    }
+                    "tools/list" => {
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "tools": [{
+                                    "name": "echo",
+                                    "description": "Echo",
+                                    "inputSchema": {"type": "object", "properties": {}}
+                                }]
+                            }
+                        })
+                        .to_string();
+                        write_response(&mut stream, "200 OK", "", &body).await;
+                    }
+                    "tools/call" => {
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "content": [{"type": "text", "text": "pong"}],
+                                "isError": false
+                            }
+                        })
+                        .to_string();
+                        write_response(&mut stream, "200 OK", "", &body).await;
+                    }
+                    _ => write_response(&mut stream, "404 Not Found", "", "").await,
+                }
+            }
+        });
+
+        let config = McpServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            read_only: false,
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+        };
+        let (client, tools) = McpClient::connect("http", &config).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+
+        let output = client.call("echo", json!({"text": "ping"})).await.unwrap();
+        assert_eq!(output.content, "pong");
+        assert!(!output.is_error);
+        server.await.unwrap();
     }
 }

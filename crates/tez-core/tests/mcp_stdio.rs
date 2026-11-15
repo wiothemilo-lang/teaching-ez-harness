@@ -25,6 +25,8 @@ async fn discovers_and_calls_demo_server() {
         cwd: None,
         enabled: true,
         read_only: false,
+        url: None,
+        headers: HashMap::new(),
     };
 
     let (client, tools) = McpClient::connect("demo", &config).await.unwrap();

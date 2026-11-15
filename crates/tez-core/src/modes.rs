@@ -66,12 +66,16 @@ pub fn plan_system_prompt(workspace: &Path) -> String {
          Chế độ Plan chỉ đọc: không ghi file, không chạy lệnh, không gọi tool thay đổi trạng thái.\n\
          Nhiệm vụ: khảo sát workspace bằng read_file/list_files/glob/grep, xác định file và ràng buộc liên quan, \
          rồi trình một kế hoạch ngắn gọn để người dùng duyệt trước khi chuyển sang Code.\n\n\
-         Kế hoạch cần có:\n\
-         - Mục tiêu và phạm vi (ngoài phạm vi thì không làm).\n\
-         - File/thư mục sẽ đọc hoặc sửa, kèm lý do.\n\
-         - Các bước thực hiện theo thứ tự, mỗi bước nhỏ và kiểm chứng được.\n\
-         - Rủi ro, điểm chưa chắc chắn và câu hỏi cần người dùng trả lời.\n\
-         - Cách kiểm chứng sau khi thực thi (build, test, lệnh cụ thể).\n\n\
+         Kế hoạch phải dùng đúng các mục Markdown cấp 2 sau, theo thứ tự, mỗi mục có nội dung:\n\
+         ## Mục tiêu\n\
+         ## Phạm vi\n\
+         ## File và thay đổi\n\
+         ## Các bước\n\
+         ## Rủi ro\n\
+         ## Kiểm chứng\n\n\
+         Trong đó: phạm vi nêu rõ việc không làm; file/thư mục sẽ đọc hoặc sửa kèm lý do; \
+         các bước theo thứ tự, mỗi bước nhỏ và kiểm chứng được; rủi ro gồm điểm chưa chắc chắn \
+         và câu hỏi cần người dùng trả lời; kiểm chứng ghi build, test hoặc lệnh cụ thể.\n\n\
          Dùng todo_write để lưu kế hoạch. Không tự chuyển sang thực thi; khi người dùng chuyển sang Code, \
          kế hoạch sẽ là nguồn chỉ dẫn.\n\
          Trả lời ngắn gọn; code và tên định danh giữ nguyên tiếng Anh.\n",
@@ -141,6 +145,8 @@ mod tests {
         let prompt = plan_system_prompt(Path::new("/tmp/project"));
         assert!(prompt.contains("/tmp/project"));
         assert!(prompt.contains("Chế độ Plan chỉ đọc"));
+        assert!(prompt.contains("## Mục tiêu"));
+        assert!(prompt.contains("## Kiểm chứng"));
         assert!(prompt.contains("todo_write"));
         assert!(!PLAN_TOOLS.contains(&"write_file"));
         assert!(!PLAN_TOOLS.contains(&"run_command"));

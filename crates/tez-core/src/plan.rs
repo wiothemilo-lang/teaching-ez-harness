@@ -10,10 +10,119 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::agent::{AgentOutcome, StopReason};
 
 /// Giới hạn kế hoạch để file và prompt không phình quá mức.
 pub const MAX_PLAN_CHARS: usize = 200_000;
+
+/// Các mục bắt buộc của một kế hoạch có cấu trúc.
+pub const PLAN_SECTIONS: &[&str] = &[
+    "Mục tiêu",
+    "Phạm vi",
+    "File và thay đổi",
+    "Các bước",
+    "Rủi ro",
+    "Kiểm chứng",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSection {
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDocument {
+    pub sections: Vec<PlanSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanValidation {
+    pub valid: bool,
+    pub missing: Vec<String>,
+}
+
+impl PlanDocument {
+    /// Tách kế hoạch Markdown theo heading cấp 2 (`##`). Heading cấp 3 vẫn nằm
+    /// trong nội dung của mục cha.
+    pub fn parse(text: &str) -> Self {
+        let mut sections: Vec<PlanSection> = Vec::new();
+        let mut current: Option<(String, Vec<&str>)> = None;
+
+        for line in text.lines() {
+            if let Some(title) = heading_title(line) {
+                if let Some((title, lines)) = current.take() {
+                    sections.push(PlanSection {
+                        title,
+                        content: lines.join("\n").trim().to_string(),
+                    });
+                }
+                current = Some((title, Vec::new()));
+            } else if let Some((_, lines)) = current.as_mut() {
+                lines.push(line);
+            }
+        }
+
+        if let Some((title, lines)) = current {
+            sections.push(PlanSection {
+                title,
+                content: lines.join("\n").trim().to_string(),
+            });
+        }
+
+        Self { sections }
+    }
+
+    pub fn section(&self, title: &str) -> Option<&PlanSection> {
+        let wanted = normalize_title(title);
+        self.sections
+            .iter()
+            .find(|section| normalize_title(&section.title) == wanted)
+    }
+
+    /// Mục bị thiếu hoặc có nội dung rỗng.
+    pub fn missing(&self) -> Vec<String> {
+        PLAN_SECTIONS
+            .iter()
+            .filter(|title| {
+                self.section(title)
+                    .map(|section| section.content.trim().is_empty())
+                    .unwrap_or(true)
+            })
+            .map(|title| (*title).to_string())
+            .collect()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.missing().is_empty()
+    }
+}
+
+/// Kiểm tra nhanh văn bản kế hoạch mà không cần giữ `PlanDocument`.
+pub fn validate(text: &str) -> PlanValidation {
+    let document = PlanDocument::parse(text);
+    let missing = document.missing();
+    PlanValidation {
+        valid: missing.is_empty(),
+        missing,
+    }
+}
+
+fn heading_title(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("## ")?;
+    let title = rest.trim().trim_end_matches(':').trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
+fn normalize_title(title: &str) -> String {
+    title.trim().trim_end_matches(':').trim().to_lowercase()
+}
 
 /// Đường dẫn file kế hoạch của một phiên.
 pub fn plan_path(dir: impl AsRef<Path>, session_id: &str) -> PathBuf {
@@ -168,5 +277,38 @@ mod tests {
         save_plan(dir.path(), "sess-1", &text).unwrap();
         let loaded = load_plan(dir.path(), "sess-1").unwrap().unwrap();
         assert_eq!(loaded.chars().count(), MAX_PLAN_CHARS);
+    }
+
+    #[test]
+    fn parses_structured_plan_sections() {
+        let text = "## Mục tiêu\nThêm test\n\n## Phạm vi\nChỉ tez-core\n\n\
+                    ## File và thay đổi\nplan.rs\n\n## Các bước\n1. Viết test\n2. Chạy test\n\n\
+                    ## Rủi ro\nKhông có\n\n## Kiểm chứng\ncargo test\n";
+        let document = PlanDocument::parse(text);
+        assert_eq!(document.sections.len(), 6);
+        assert!(document.is_complete());
+        assert_eq!(
+            document.section("Các bước").unwrap().content,
+            "1. Viết test\n2. Chạy test"
+        );
+        assert_eq!(document.section("Mục tiêu").unwrap().content, "Thêm test");
+    }
+
+    #[test]
+    fn validation_reports_missing_or_empty_sections() {
+        let text = "## Mục tiêu\n\n## Các bước\nLàm việc\n### Ghi chú\nvẫn thuộc bước\n";
+        let validation = validate(text);
+        assert!(!validation.valid);
+        assert!(validation.missing.contains(&"Mục tiêu".to_string()));
+        assert!(validation.missing.contains(&"Phạm vi".to_string()));
+        assert!(!validation.missing.contains(&"Các bước".to_string()));
+        assert!(!validation.missing.contains(&"Ghi chú".to_string()));
+    }
+
+    #[test]
+    fn validation_is_case_and_colon_insensitive() {
+        let text = "## mục tiêu:\nX\n## PHẠM VI\nY\n## file và thay đổi\nZ\n\
+                    ## Các bước\n1\n## Rủi ro\nR\n## Kiểm chứng\nK\n";
+        assert!(validate(text).valid);
     }
 }

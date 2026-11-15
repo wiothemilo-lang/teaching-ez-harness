@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,7 @@ struct SaveProviderRequest {
 #[derive(Debug, Deserialize)]
 struct SaveMcpRequest {
     name: String,
+    #[serde(default)]
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -98,6 +99,10 @@ struct SaveMcpRequest {
     enabled: bool,
     #[serde(default)]
     read_only: bool,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -248,11 +253,31 @@ struct ChatReply {
     stop_reason: String,
 }
 
+const APPROVAL_FILE: &str = "approvals.json";
+const APPROVAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const APPROVAL_MAX_ENTRIES: usize = 200;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredApproval {
+    key: String,
+    created_at: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredApprovals {
+    #[serde(default)]
+    entries: Vec<StoredApproval>,
+}
+
 /// Kênh chờ người dùng bấm duyệt trong desktop.
+///
+/// Quyết định "cho phép trong phiên" được lưu vào `approvals.json` để sống qua
+/// lần khởi động lại. Mỗi mục có TTL 7 ngày và file tối đa 200 mục.
 #[derive(Default)]
 struct ApprovalBroker {
     pending: Mutex<HashMap<String, PendingApproval>>,
-    remembered: Mutex<HashSet<String>>,
+    remembered: Mutex<HashMap<String, u64>>,
+    path: Option<PathBuf>,
 }
 
 struct PendingApproval {
@@ -261,6 +286,91 @@ struct PendingApproval {
 }
 
 impl ApprovalBroker {
+    fn load(path: Option<PathBuf>) -> Self {
+        let broker = Self {
+            path,
+            ..Self::default()
+        };
+        broker.reload();
+        broker
+    }
+
+    fn reload(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let stored = match serde_json::from_str::<StoredApprovals>(&raw) {
+            Ok(stored) => stored,
+            Err(error) => {
+                eprintln!("[approval] bỏ qua approvals.json hỏng: {error}");
+                return;
+            }
+        };
+        let now = now_secs();
+        let remembered: HashMap<String, u64> = stored
+            .entries
+            .into_iter()
+            .filter(|entry| now.saturating_sub(entry.created_at) <= APPROVAL_TTL_SECS)
+            .map(|entry| (entry.key, entry.created_at))
+            .collect();
+        if let Ok(mut current) = self.remembered.lock() {
+            *current = remembered;
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let mut entries: Vec<StoredApproval> = self
+            .remembered
+            .lock()
+            .map(|remembered| {
+                remembered
+                    .iter()
+                    .map(|(key, created_at)| StoredApproval {
+                        key: key.clone(),
+                        created_at: *created_at,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by_key(|entry| entry.created_at);
+        let keep_from = entries.len().saturating_sub(APPROVAL_MAX_ENTRIES);
+        let entries = entries.split_off(keep_from);
+        let payload = match serde_json::to_vec_pretty(&StoredApprovals { entries }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("[approval] không serialize được approvals.json: {error}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!("[approval] không tạo được thư mục: {error}");
+                return;
+            }
+        }
+        let temporary = path.with_extension("json.tmp");
+        if let Err(error) = write_private(&temporary, &payload) {
+            eprintln!("[approval] không ghi được approvals.json: {error}");
+            return;
+        }
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            eprintln!("[approval] không thay được approvals.json: {error}");
+        }
+    }
+
+    fn remember(&self, key: &str) {
+        if let Ok(mut remembered) = self.remembered.lock() {
+            remembered.insert(key.to_string(), now_secs());
+        }
+        self.persist();
+    }
+
     fn register(&self, id: &str, key: &str) -> tokio::sync::oneshot::Receiver<bool> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -284,9 +394,7 @@ impl ApprovalBroker {
         match pending {
             Some(pending) => {
                 if approved && remember {
-                    if let Ok(mut remembered) = self.remembered.lock() {
-                        remembered.insert(pending.key);
-                    }
+                    self.remember(&pending.key);
                 }
                 pending.sender.send(approved).is_ok()
             }
@@ -295,16 +403,57 @@ impl ApprovalBroker {
     }
 
     fn is_remembered(&self, key: &str) -> bool {
-        self.remembered
+        let now = now_secs();
+        let mut expired = false;
+        let found = self
+            .remembered
             .lock()
-            .map(|remembered| remembered.contains(key))
-            .unwrap_or(false)
+            .map(|mut remembered| match remembered.get(key) {
+                Some(created_at) if now.saturating_sub(*created_at) <= APPROVAL_TTL_SECS => true,
+                Some(_) => {
+                    remembered.remove(key);
+                    expired = true;
+                    false
+                }
+                None => false,
+            })
+            .unwrap_or(false);
+        if expired {
+            self.persist();
+        }
+        found
     }
 
     fn cancel(&self, id: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(id);
         }
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 
@@ -523,6 +672,8 @@ struct SkillInfo {
 struct PlanInfo {
     path: String,
     text: String,
+    valid: bool,
+    missing: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -535,6 +686,8 @@ struct McpServerInfo {
     env: HashMap<String, String>,
     enabled: bool,
     read_only: bool,
+    url: Option<String>,
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -956,6 +1109,8 @@ fn list_extensions() -> Result<ExtensionsInfo, String> {
             env: entry.config.env,
             enabled: entry.config.enabled,
             read_only: entry.config.read_only,
+            url: entry.config.url,
+            headers: entry.config.headers,
         })
         .collect();
 
@@ -983,8 +1138,14 @@ fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
     if request.name.trim().is_empty() {
         return Err("Tên MCP server không được để trống.".into());
     }
-    if request.command.trim().is_empty() {
-        return Err("Command không được để trống.".into());
+    let url = request
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if request.command.trim().is_empty() && url.is_none() {
+        return Err("Cần command (stdio) hoặc URL (HTTP).".into());
     }
 
     let dir = data_dir().map_err(friendly)?;
@@ -998,6 +1159,8 @@ fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
             cwd: request.cwd.filter(|value| !value.trim().is_empty()),
             enabled: request.enabled,
             read_only: request.read_only,
+            url,
+            headers: request.headers,
         },
     );
     mcp::save_config(&dir, &config).map_err(|error| error.to_string())
@@ -1234,6 +1397,7 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
         #[derive(Deserialize)]
         struct DraftMcp {
             name: String,
+            #[serde(default)]
             command: String,
             #[serde(default)]
             args: Vec<String>,
@@ -1245,6 +1409,10 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
             enabled: bool,
             #[serde(default)]
             read_only: bool,
+            #[serde(default)]
+            url: Option<String>,
+            #[serde(default)]
+            headers: HashMap<String, String>,
         }
 
         let file = request
@@ -1255,8 +1423,14 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
             .ok_or_else(|| "Thiếu file cấu hình MCP.".to_string())?;
         let draft: DraftMcp = serde_json::from_str(&file.content)
             .map_err(|error| format!("MCP JSON không hợp lệ: {error}"))?;
-        if draft.name.trim().is_empty() || draft.command.trim().is_empty() {
-            return Err("MCP cần có name và command.".into());
+        let url = draft
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if draft.name.trim().is_empty() || (draft.command.trim().is_empty() && url.is_none()) {
+            return Err("MCP cần có name và command hoặc URL.".into());
         }
         let mut config = mcp::load_config(&dir).map_err(|error| error.to_string())?;
         config.servers.insert(
@@ -1268,6 +1442,8 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
                 cwd: draft.cwd.filter(|value| !value.trim().is_empty()),
                 enabled: draft.enabled,
                 read_only: draft.read_only,
+                url,
+                headers: draft.headers,
             },
         );
         mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;
@@ -1825,7 +2001,13 @@ fn load_session_plan(session_id: String) -> Result<PlanInfo, String> {
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     let path = plan::plan_path(&dir, &session_id).display().to_string();
-    Ok(PlanInfo { path, text })
+    let validation = plan::validate(&text);
+    Ok(PlanInfo {
+        path,
+        text,
+        valid: validation.valid,
+        missing: validation.missing,
+    })
 }
 
 #[tauri::command]
@@ -1836,7 +2018,13 @@ fn save_session_plan(session_id: String, text: String) -> Result<PlanInfo, Strin
         .unwrap_or_else(|| plan::plan_path(&dir, &session_id))
         .display()
         .to_string();
-    Ok(PlanInfo { path, text })
+    let validation = plan::validate(&text);
+    Ok(PlanInfo {
+        path,
+        text,
+        valid: validation.valid,
+        missing: validation.missing,
+    })
 }
 
 #[tauri::command]
@@ -1958,8 +2146,9 @@ fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let approvals = data_dir().ok().map(|dir| dir.join(APPROVAL_FILE));
     tauri::Builder::default()
-        .manage(Arc::new(ApprovalBroker::default()))
+        .manage(Arc::new(ApprovalBroker::load(approvals)))
         .manage(Arc::new(StopBroker::default()))
         .invoke_handler(tauri::generate_handler![
             app_status,
@@ -2096,5 +2285,55 @@ mod tests {
         assert!(!is_safe_external_url("http://example.com"));
         assert!(!is_safe_external_url("file:///etc/passwd"));
         assert!(!is_safe_external_url("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn approval_remember_persists_across_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "tez-approval-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let path = dir.join(APPROVAL_FILE);
+        let broker = ApprovalBroker::load(Some(path.clone()));
+        let key = "sess|write_file|a.txt";
+        let receiver = broker.register("a1", key);
+        assert!(broker.respond("a1", true, true));
+        assert!(broker.is_remembered(key));
+        drop(receiver);
+        drop(broker);
+
+        let reloaded = ApprovalBroker::load(Some(path));
+        assert!(reloaded.is_remembered(key));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expired_approval_is_forgotten() {
+        let broker = ApprovalBroker::load(None);
+        let key = "sess|run_command|cargo test";
+        broker.remember(key);
+        if let Ok(mut remembered) = broker.remembered.lock() {
+            remembered.insert(
+                key.to_string(),
+                now_secs().saturating_sub(APPROVAL_TTL_SECS + 1),
+            );
+        }
+        assert!(!broker.is_remembered(key));
+    }
+
+    #[test]
+    fn corrupt_approval_file_is_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "tez-approval-corrupt-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(APPROVAL_FILE);
+        std::fs::write(&path, "không phải json").unwrap();
+        let broker = ApprovalBroker::load(Some(path));
+        assert!(!broker.is_remembered("sess|write_file|a.txt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
