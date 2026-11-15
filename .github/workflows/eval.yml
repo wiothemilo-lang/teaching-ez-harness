@@ -1,0 +1,39 @@
+name: eval
+
+on:
+  schedule:
+    # 03:17 UTC mỗi ngày; tránh đầu giờ để không dồn với CI/release.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: provider regression
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Run eval suite
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TEZ_EVAL_MODEL: ${{ vars.TEZ_EVAL_MODEL }}
+        run: |
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "Bỏ qua eval: chưa cấu hình secret GROQ_API_KEY."
+            exit 0
+          fi
+          MODEL="${TEZ_EVAL_MODEL:-llama-3.3-70b-versatile}"
+          cargo run -q -p tez-cli -- eval \
+            --provider groq \
+            --model "$MODEL" \
+            --suite evals/basic.json \
+            --json

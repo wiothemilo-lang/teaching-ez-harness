@@ -17,10 +17,12 @@ directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tez-auth = { path = "../tez-auth" }
+tez-backup = { path = "../tez-backup" }
 tez-core = { path = "../tez-core" }
 tez-llm = { path = "../tez-llm" }
 tez-store = { path = "../tez-store" }
 tez-update = { path = "../tez-update" }
+time.workspace = true
 tokio.workspace = true
 
 # Khôi phục SIGPIPE mặc định của Unix để `tez ... | head` không panic.

@@ -642,6 +642,41 @@ impl Store {
         &self.conn
     }
 
+    /// Kiểm tra toàn vẹn nhanh; trả về `"ok"` hoặc mô tả lỗi của SQLite.
+    pub fn quick_check(&self) -> Result<String, StoreError> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        Ok(result)
+    }
+
+    /// Sao lưu DB đang mở sang file khác bằng SQLite backup API.
+    ///
+    /// API này đọc nhất quán cả nội dung trong WAL, thay vì copy `tez.db` đơn
+    /// thuần (có thể thiếu giao dịch mới nhất hoặc dính trạng thái dở dang).
+    pub fn backup_to(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(path);
+        create_private_file(path)?;
+
+        let result = (|| {
+            let mut destination = Connection::open(path)?;
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut destination)?;
+            backup.run_to_completion(64, Duration::from_millis(10), None)?;
+            Ok::<(), StoreError>(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+            return result;
+        }
+        set_private_permissions(path)?;
+        Ok(())
+    }
+
     /// Dung lượng file DB (gồm cả WAL và SHM nếu có).
     pub fn size_bytes(&self) -> Result<u64, StoreError> {
         if self.path == Path::new(":memory:") {

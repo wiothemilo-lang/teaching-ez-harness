@@ -20,6 +20,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Thời gian chờ tối đa giữa hai lần đọc của một stream.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Số lần thử lại cho lỗi tạm thời (429/5xx, lỗi kết nối/timeout).
+const MAX_RETRIES: usize = 2;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+/// `Retry-After` do server trả có thể rất lớn; không chờ lâu hơn mức này.
+const RETRY_AFTER_MAX: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
@@ -261,6 +268,46 @@ impl OpenAiCompatible {
         self
     }
 
+    /// Gửi request không streaming, thử lại lỗi tạm thời với backoff.
+    async fn send_with_retry(&self, body: &Value) -> Result<reqwest::Response, LlmError> {
+        let mut attempt = 0usize;
+        loop {
+            // Giữ query string của base_url (vd Azure `?api-version=...`) ở cuối URL.
+            let mut request = self.client.post(self.endpoint());
+            if !self.api_key.is_empty() {
+                request = request.bearer_auth(&self.api_key);
+            }
+            match request.timeout(REQUEST_TIMEOUT).json(body).send().await {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
+                    let text = response.text().await.unwrap_or_default();
+                    // Giới hạn body để không flood UI/log và không lộ toàn bộ phản hồi.
+                    let error = LlmError::Api {
+                        status: status.as_u16(),
+                        body: body_preview(&text),
+                    };
+                    if attempt < MAX_RETRIES && retryable(&error) {
+                        tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = LlmError::Http(error);
+                    if attempt < MAX_RETRIES && retryable(&error) {
+                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     /// URL chat completions, giữ nguyên query string của `base_url`.
     fn endpoint(&self) -> String {
         let (base, query) = match self.base_url.split_once('?') {
@@ -314,6 +361,56 @@ fn message_json(m: &Message) -> Value {
 /// Rút gọn body lỗi để không flood UI/log.
 fn body_preview(text: &str) -> String {
     text.chars().take(500).collect()
+}
+
+fn request_body(req: &ChatRequest, stream: bool) -> Value {
+    let mut body = json!({
+        "model": req.model,
+        "messages": req.messages.iter().map(message_json).collect::<Vec<_>>(),
+    });
+    if stream {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    if !req.tools.is_empty() {
+        body["tools"] = json!(req
+            .tools
+            .iter()
+            .map(ToolSpec::to_openai)
+            .collect::<Vec<_>>());
+    }
+    if let Some(temperature) = req.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    body
+}
+
+fn retryable(error: &LlmError) -> bool {
+    match error {
+        LlmError::Api { status, .. } => *status == 429 || (500..=599).contains(status),
+        LlmError::Http(error) => error.is_connect() || error.is_timeout(),
+        _ => false,
+    }
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        RETRY_BASE_DELAY
+            .saturating_mul(1u32 << attempt.min(8))
+            .min(RETRY_MAX_DELAY)
+    })
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds).min(RETRY_AFTER_MAX))
 }
 
 #[derive(Default)]
@@ -487,46 +584,9 @@ impl LlmProvider for OpenAiCompatible {
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let mut body = json!({
-            "model": req.model,
-            "messages": req.messages.iter().map(message_json).collect::<Vec<_>>(),
-        });
-
-        if !req.tools.is_empty() {
-            body["tools"] = json!(req
-                .tools
-                .iter()
-                .map(ToolSpec::to_openai)
-                .collect::<Vec<_>>());
-        }
-        if let Some(temperature) = req.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(top_p) = req.top_p {
-            body["top_p"] = json!(top_p);
-        }
-        if let Some(max_tokens) = req.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-
-        // Giữ query string của base_url (vd Azure `?api-version=...`) ở cuối URL.
-        let url = self.endpoint();
-        let mut request = self.client.post(url);
-        if !self.api_key.is_empty() {
-            request = request.bearer_auth(&self.api_key);
-        }
-        let response = request.timeout(REQUEST_TIMEOUT).json(&body).send().await?;
-
-        let status = response.status();
+        let body = request_body(&req, false);
+        let response = self.send_with_retry(&body).await?;
         let text = response.text().await?;
-        if !status.is_success() {
-            // Giới hạn body để không flood UI/log và không lộ toàn bộ phản hồi.
-            let body = body_preview(&text);
-            return Err(LlmError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
 
         let value: Value =
             serde_json::from_str(&text).map_err(|e| LlmError::Invalid(format!("json: {e}")))?;
@@ -594,49 +654,58 @@ impl LlmProvider for OpenAiCompatible {
             return self.chat(req).await;
         };
 
-        let mut body = json!({
-            "model": req.model,
-            "messages": req.messages.iter().map(message_json).collect::<Vec<_>>(),
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if !req.tools.is_empty() {
-            body["tools"] = json!(req
-                .tools
-                .iter()
-                .map(ToolSpec::to_openai)
-                .collect::<Vec<_>>());
-        }
-        if let Some(temperature) = req.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(top_p) = req.top_p {
-            body["top_p"] = json!(top_p);
-        }
-        if let Some(max_tokens) = req.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-
-        let mut request = self.client.post(self.endpoint());
-        if !self.api_key.is_empty() {
-            request = request.bearer_auth(&self.api_key);
-        }
+        let body = request_body(&req, true);
+        let mut attempt = 0usize;
         // Chỉ chờ headers; phần thân stream được đọc với idle timeout từng
         // chunk nên câu trả lời dài không bị cắt ở một mốc tổng cố định.
-        let response = tokio::time::timeout(self.idle_timeout, request.json(&body).send())
-            .await
-            .map_err(|_| LlmError::Invalid("stream timeout waiting for response".into()))??;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = tokio::time::timeout(self.idle_timeout, response.text())
-                .await
-                .map_err(|_| LlmError::Invalid("timeout reading error response".into()))??;
-            return Err(LlmError::Api {
-                status: status.as_u16(),
-                body: body_preview(&text),
-            });
-        }
+        // Thử lại chỉ diễn ra trước khi server gửi byte SSE đầu tiên.
+        let response = loop {
+            let mut request = self.client.post(self.endpoint());
+            if !self.api_key.is_empty() {
+                request = request.bearer_auth(&self.api_key);
+            }
+            match tokio::time::timeout(self.idle_timeout, request.json(&body).send()).await {
+                Ok(Ok(response)) if response.status().is_success() => break response,
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    let retry_after = parse_retry_after(response.headers());
+                    let text = tokio::time::timeout(self.idle_timeout, response.text())
+                        .await
+                        .map_err(|_| {
+                            LlmError::Invalid("timeout reading error response".into())
+                        })??;
+                    let error = LlmError::Api {
+                        status: status.as_u16(),
+                        body: body_preview(&text),
+                    };
+                    if attempt < MAX_RETRIES && retryable(&error) {
+                        tokio::time::sleep(retry_delay(attempt, retry_after)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Ok(Err(error)) => {
+                    let error = LlmError::Http(error);
+                    if attempt < MAX_RETRIES && retryable(&error) {
+                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(retry_delay(attempt, None)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(LlmError::Invalid(
+                        "stream timeout waiting for response".into(),
+                    ));
+                }
+            }
+        };
 
         // 200 nhưng không phải SSE thường là body JSON lỗi của gateway.
         // Trước đây các body này bị bỏ qua và trả về Ok rỗng/một phần.
@@ -777,6 +846,22 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// Server trả lần lượt từng response, mỗi connection một response.
+    async fn serve_responses(responses: Vec<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket.write_all(&response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
     async fn serve_sse(body: &str) -> String {
         let mut response = SSE_HEADERS.to_vec();
         response.extend_from_slice(body.as_bytes());
@@ -846,6 +931,46 @@ mod tests {
                 assert_eq!(usage.input_tokens, 7);
                 assert_eq!(usage.output_tokens, 2);
             }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_transient_api_errors() {
+        let responses = vec![
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}".to_vec(),
+        ];
+        let base_url = serve_responses(responses).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+
+        let response = provider.chat(request()).await.unwrap();
+
+        match response {
+            ChatResponse::Text { content, .. } => assert_eq!(content, "ok"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_transient_stream_errors_before_first_byte() {
+        let mut ok = SSE_HEADERS.to_vec();
+        ok.extend_from_slice(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+        );
+        let responses = vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ok,
+        ];
+        let base_url = serve_responses(responses).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
+
+        assert_eq!(drain(&mut rx), vec!["ok".to_string()]);
+        match response {
+            ChatResponse::Text { content, .. } => assert_eq!(content, "ok"),
             other => panic!("expected text response, got {other:?}"),
         }
     }

@@ -414,12 +414,13 @@ Gateway khai báo capability `tool_calling: native | prompted | none`.
 | `list_files` | liệt kê ≤ 300 entry, 1–4 tầng, bỏ `node_modules`/`target`/`.git` |
 | `glob` | tìm file theo pattern `src/**/*.rs`, bỏ thư mục build |
 | `grep` | tìm regex trong file text; lọc `include`, `ignore_case`, trả `path:dòng: nội_dung` |
-| `run_command` | `sh -c` (`cmd /C` trên Windows), timeout 130 s, cwd trong workspace |
+| `run_command` | `sh -c` (`cmd /C` trên Windows), timeout 130 s, cwd trong workspace; trên Linux bọc bubblewrap (ẩn data dir/credential, chặn mạng mặc định) |
 | `compact` | agent chủ động yêu cầu nén lịch sử sau một giai đoạn |
 
 `Workspace::resolve` ghép path tương đối với root, chuẩn hóa `.`/`..`, rồi
 canonicalize phần đã tồn tại để chặn symlink trỏ ra ngoài. Đây là giới hạn ở
-tầng ứng dụng, không phải sandbox OS. `tools::code_registry(root)` đăng ký các
+tầng ứng dụng; trên Linux `run_command` còn được bọc bubblewrap để ẩn data dir,
+credential trong HOME và chặn mạng mặc định. `tools::code_registry(root)` đăng ký các
 tool file/lệnh; `CODE_TOOL_NAMES` là danh sách chuẩn. `Mode::Code` trong
 `crates/tez-core/src/modes.rs` chọn prompt system gắn workspace và allowlist
 `CODE_TOOLS`, bao gồm cả `todo_write`, `task`, `compact` và `memory_*`.
@@ -737,10 +738,10 @@ tez update --check-only
 
 | Rủi ro | Biện pháp |
 |---|---|
-| Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; đây không phải sandbox OS |
-| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers hỗ trợ ${VAR}/bearer_token_env) |
+| Tool nguy hiểm | Trên Linux, `run_command` chạy trong bubblewrap: workspace read-write, data dir/credential bị ẩn, network bị tách mặc định, fail-closed nếu thiếu `bwrap`; vẫn qua permission pipeline (deny → ask → allow) và audit/redaction. macOS/Windows chỉ có giới hạn đường dẫn ở tầng ứng dụng, chưa có sandbox OS |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers hỗ trợ ${VAR}/bearer_token_env). Server stdio có sandbox bubblewrap tùy chọn (Linux): ẩn secret, chặn mạng mặc định, chỉ bind `writable_paths` |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
-| Key rò rỉ | Keychain + AES-GCM; redaction; không trả secret |
+| Key rò rỉ | AES-GCM với `master.key` quyền `0600` trong data dir (chưa dùng OS keychain); redaction; không trả secret. Bản backup chứa `master.key` nên phải bảo vệ |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
 | Ghi dữ liệu sai | Write tool cần confirmation; audit; undo nếu có thể |
 | Lộ đáp án | Policy Socratic + kiểm tra hint level; eval |
@@ -760,22 +761,28 @@ tez update --check-only
   session header, env header expansion/bearer env and resources/prompts
   formatting; approval fingerprint.
 - **Integration:** mock provider + agent loop; tool call → result → final;
-  permission denial; subagent trả text cuối; MCP stdio; MCP HTTP JSON/SSE +
-  session header + env headers/bearer + resources/prompts.
-- **Số test hiện tại:** `tez-core` 253 + 1 MCP stdio, `tez-auth` 32,
-  `tez-cli` 18, `tez-llm` 14, `tez-store` 28, `tez-update` 16; tổng 362.
-  Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test. `cargo test
-  --workspace` xanh.
+  permission denial; subagent trả text cuối; MCP stdio; MCP stdio sandbox
+  (bubblewrap, Linux); MCP HTTP JSON/SSE + session header + env
+  headers/bearer + resources/prompts.
+- **Số test hiện tại:** `tez-core` 271 + 2 MCP stdio, `tez-auth` 32,
+  `tez-backup` 4, `tez-cli` 22, `tez-llm` 16, `tez-store` 28, `tez-update` 16;
+  tổng 392. Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test.
+  `cargo test --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
   `cargo fmt --all -- --check` sạch.
 - **Frontend:** `pnpm exec tsc --noEmit` và `pnpm build` (Vite) sạch; preview
   tĩnh với Tauri mock dùng để kiểm tra approval modal, Harness dock và
   Settings → Harness.
+- **Eval provider:** `tez eval --suite evals/*.json` chạy từng case qua
+  provider thật/mock, kiểm tra `contains`/`not_contains`, xuất text hoặc JSON,
+  trả mã thoát khác 0 khi fail; workflow `.github/workflows/eval.yml` chạy
+  nightly nếu có secret. Bộ mẫu 8 case trong `evals/basic.json`.
 - **Trajectory eval:** model có gọi đúng tool? có bỏ qua tool cần thiết? có lộ đáp án?
 - **CLI e2e:** `assert_cmd`; connect/chat/tools/context (mở rộng cho memory và
   permission).
 - **Desktop smoke:** Playwright/Tauri driver (sau).
-- **Eval bộ môn:** 8 case/môn + 20 case chung; promptfoo hoặc harness Rust.
+- **Eval bộ môn:** mở rộng lên 8 case/môn + 20 case chung; có thể dùng promptfoo
+  hoặc giữ harness Rust hiện tại.
 - **Regression:** mỗi prompt/tool change chạy lại; so sánh pass rate.
 
 ---

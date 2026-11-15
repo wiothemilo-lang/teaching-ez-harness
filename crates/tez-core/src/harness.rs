@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::compaction::CompactSettings;
 use crate::hooks::{HookConfig, HookEvent};
 use crate::permission::{PermissionMode, PermissionRule};
+use crate::sandbox::SandboxSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySettings {
@@ -76,6 +77,8 @@ pub struct HarnessConfig {
     pub memory: MemorySettings,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
+    #[serde(default)]
+    pub sandbox: SandboxSettings,
 }
 
 fn default_max_steps() -> usize {
@@ -125,6 +128,7 @@ impl Default for HarnessConfig {
             compaction: CompactSettings::default(),
             memory: MemorySettings::default(),
             hooks: Vec::new(),
+            sandbox: SandboxSettings::default(),
         }
     }
 }
@@ -252,6 +256,7 @@ pub fn load(data_dir: impl AsRef<Path>) -> HarnessConfig {
         compaction: field(object, "compaction", defaults.compaction),
         memory: field(object, "memory", defaults.memory),
         hooks: parse_hooks(object.get("hooks")),
+        sandbox: field(object, "sandbox", defaults.sandbox),
     };
     config.sanitized()
 }

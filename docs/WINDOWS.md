@@ -74,4 +74,4 @@ Dữ liệu trong `%APPDATA%\dev.teaching-ez.tez` (hoặc `%APPDATA%\tez` tùy b
 
 ## Ghi chú an toàn
 
-Chế độ Code chỉ thao tác trong workspace bạn chọn. Đây là giới hạn đường dẫn ở tầng ứng dụng, không phải sandbox hệ điều hành. Không chạy tez bằng tài khoản Administrator cho công việc thường ngày.
+Chế độ Code chỉ thao tác trong workspace bạn chọn. Trên Windows chưa có sandbox hệ điều hành cho `run_command` hoặc MCP stdio; đây chỉ là giới hạn đường dẫn ở tầng ứng dụng. Trên Linux, `run_command` dùng bubblewrap và chặn mạng mặc định; MCP stdio có sandbox bubblewrap tùy chọn theo server. Không chạy tez bằng tài khoản Administrator cho công việc thường ngày.
