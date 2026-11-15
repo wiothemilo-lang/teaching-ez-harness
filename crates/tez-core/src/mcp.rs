@@ -69,6 +69,10 @@ pub struct McpServerConfig {
     /// Header bổ sung cho HTTP, ví dụ Authorization. Không ghi log.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Tên biến môi trường chứa bearer token; đọc lúc kết nối, không lưu token
+    /// trong `mcp.json`.
+    #[serde(default, alias = "bearerTokenEnv")]
+    pub bearer_token_env: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -784,6 +788,66 @@ impl StdioConnection {
     }
 }
 
+/// Thay `${VAR}` trong header bằng biến môi trường. Thiếu biến là lỗi cấu hình,
+/// không gửi nguyên placeholder lên server.
+fn expand_env_value(value: &str) -> Result<String, McpError> {
+    let mut output = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            output.push_str("${");
+            rest = after;
+            continue;
+        };
+        let name = &after[..end];
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            output.push_str("${");
+            rest = after;
+            continue;
+        }
+        let value = std::env::var(name)
+            .map_err(|_| McpError::Spawn(format!("thiếu biến môi trường {name} cho MCP header")))?;
+        output.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+/// Header HTTP sau khi mở rộng `${VAR}` và thêm bearer token từ biến môi trường.
+fn resolve_http_headers(config: &McpServerConfig) -> Result<HashMap<String, String>, McpError> {
+    let mut headers = HashMap::new();
+    for (name, value) in &config.headers {
+        headers.insert(name.clone(), expand_env_value(value)?);
+    }
+    if let Some(variable) = config
+        .bearer_token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let token = std::env::var(variable).map_err(|_| {
+            McpError::Spawn(format!(
+                "thiếu biến môi trường {variable} cho bearer token MCP"
+            ))
+        })?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(McpError::Spawn(format!(
+                "biến môi trường {variable} cho bearer token MCP đang rỗng"
+            )));
+        }
+        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+    }
+    Ok(headers)
+}
+
 struct HttpConnection {
     client: reqwest::Client,
     url: String,
@@ -816,7 +880,7 @@ impl HttpConnection {
         Ok(Self {
             client,
             url: raw.to_string(),
-            headers: config.headers.clone(),
+            headers: resolve_http_headers(config)?,
             session_id: None,
             next_id: 1,
         })
@@ -1246,6 +1310,7 @@ mod tests {
                 read_only: false,
                 url: None,
                 headers: HashMap::new(),
+                bearer_token_env: None,
             },
         );
         save_config(dir.path(), &config).unwrap();
@@ -1270,6 +1335,7 @@ mod tests {
                 read_only: false,
                 url: None,
                 headers: HashMap::new(),
+                bearer_token_env: None,
             },
         );
         save_config(data.path(), &config).unwrap();
@@ -1305,6 +1371,7 @@ mod tests {
                 read_only: false,
                 url: None,
                 headers: HashMap::new(),
+                bearer_token_env: None,
             },
         );
         save_config(data.path(), &config).unwrap();
@@ -1478,6 +1545,7 @@ mod tests {
             read_only: false,
             url: Some(format!("http://{address}/mcp")),
             headers: HashMap::new(),
+            bearer_token_env: None,
         };
         let (client, tools) = McpClient::connect("http", &config).await.unwrap();
         assert_eq!(tools.len(), 1);
@@ -1628,6 +1696,7 @@ mod tests {
             read_only: false,
             url: Some(format!("http://{address}/mcp")),
             headers: HashMap::new(),
+            bearer_token_env: None,
         };
         let (client, tools) = McpClient::connect("http", &config).await.unwrap();
         assert!(tools.is_empty());
@@ -1698,9 +1767,66 @@ mod tests {
             read_only: true,
             url: None,
             headers: HashMap::new(),
+            bearer_token_env: None,
         };
         assert!(trusted_read_only("user", &user_read_only));
         assert!(!trusted_read_only("project", &user_read_only));
         assert!(!trusted_read_only("demo", &user_read_only));
+    }
+
+    fn http_config(headers: HashMap<String, String>, bearer: Option<&str>) -> McpServerConfig {
+        McpServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            read_only: false,
+            url: Some("https://example.com/mcp".into()),
+            headers,
+            bearer_token_env: bearer.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn expands_env_values_in_http_headers() {
+        std::env::set_var("TEZ_TEST_MCP_TOKEN", "abc");
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer ${TEZ_TEST_MCP_TOKEN}".to_string(),
+        );
+        let resolved = resolve_http_headers(&http_config(headers, None)).unwrap();
+        assert_eq!(
+            resolved.get("Authorization").map(String::as_str),
+            Some("Bearer abc")
+        );
+        std::env::remove_var("TEZ_TEST_MCP_TOKEN");
+    }
+
+    #[test]
+    fn missing_env_header_is_an_error() {
+        std::env::remove_var("TEZ_TEST_MCP_MISSING");
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer ${TEZ_TEST_MCP_MISSING}".to_string(),
+        );
+        let error = resolve_http_headers(&http_config(headers, None)).unwrap_err();
+        assert!(error.to_string().contains("TEZ_TEST_MCP_MISSING"));
+    }
+
+    #[test]
+    fn bearer_token_env_sets_authorization() {
+        std::env::set_var("TEZ_TEST_MCP_BEARER", "xyz");
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer old".to_string());
+        let resolved =
+            resolve_http_headers(&http_config(headers, Some("TEZ_TEST_MCP_BEARER"))).unwrap();
+        assert_eq!(
+            resolved.get("Authorization").map(String::as_str),
+            Some("Bearer xyz")
+        );
+        std::env::remove_var("TEZ_TEST_MCP_BEARER");
     }
 }

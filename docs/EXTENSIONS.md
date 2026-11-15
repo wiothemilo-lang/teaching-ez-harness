@@ -92,7 +92,7 @@ Có hai transport:
     },
     "remote-docs": {
       "url": "https://mcp.example.com/mcp",
-      "headers": { "Authorization": "Bearer <token>" },
+      "headers": { "Authorization": "Bearer ${TEZ_MCP_TOKEN}" },
       "enabled": true
     }
   }
@@ -104,7 +104,8 @@ Có hai transport:
 | `command` | Chương trình chạy server stdio, phải có trên `PATH`. Bỏ trống nếu dùng `url`. |
 | `args` | Mảng tham số cho stdio. |
 | `url` | Endpoint Streamable HTTP. Có `url` thì tez dùng HTTP thay vì spawn process. |
-| `headers` | Header gửi kèm mỗi request HTTP, ví dụ `Authorization`. Không nên đặt secret trực tiếp nếu file bị chia sẻ. |
+| `headers` | Header gửi kèm mỗi request HTTP, ví dụ `Authorization`; hỗ trợ `${VAR}`. Không nên đặt secret trực tiếp nếu file bị chia sẻ. |
+| `bearer_token_env` | Tên biến môi trường chứa Bearer token; đọc lúc connect, không lưu token. |
 | `env` | Biến môi trường bổ sung cho stdio. |
 | `cwd` | Thư mục làm việc cho stdio; plugin mặc định dùng thư mục plugin. |
 | `enabled` | `false` để tạm tắt mà không xóa cấu hình. |
@@ -142,7 +143,7 @@ Tool được đặt tên `mcp__<server>__<tool>` và làm sạch ký tự để
 
 ### Giới hạn hiện tại
 
-- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated hay OAuth. Header auth phải cấu hình tĩnh trong `headers`. Resources/prompts chỉ đọc qua tool extras, không có UI riêng.
+- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated hay OAuth flow đầy đủ; header hỗ trợ `${VAR}` và `bearer_token_env`. Resources/prompts chỉ đọc qua tool extras, không có UI riêng.
 - Timeout khởi động/gọi: 20 giây; stderr của server stdio bị bỏ qua.
 - Server stdio chạy dưới quyền user hiện tại, **chưa có sandbox**. Chỉ cài server bạn tin tưởng.
 - Server stdio được spawn lại mỗi lượt chat; chưa giữ process dài hạn. HTTP dùng client mới mỗi lượt.

@@ -79,6 +79,7 @@ type McpDraft = {
   read_only: boolean;
   url: string;
   headersText: string;
+  bearerTokenEnv: string;
 };
 
 const PRESETS: Preset[] = [
@@ -369,6 +370,7 @@ export function SettingsPanel({
       read_only: false,
       url: "",
       headersText: "",
+      bearerTokenEnv: "",
     });
   };
 
@@ -389,6 +391,7 @@ export function SettingsPanel({
       headersText: Object.entries(server.headers)
         .map(([key, value]) => `${key}=${value}`)
         .join("\n"),
+      bearerTokenEnv: server.bearer_token_env ?? "",
     });
   };
 
@@ -428,6 +431,7 @@ export function SettingsPanel({
         read_only: mcpDraft.read_only,
         url: url || null,
         headers,
+        bearer_token_env: mcpDraft.bearerTokenEnv.trim() || null,
       });
       setMcpDraft(null);
       await reload();
@@ -1055,6 +1059,24 @@ export function SettingsPanel({
                     placeholder="Authorization=Bearer …"
                     spellCheck={false}
                   />
+                </label>
+                <label className="field field-wide">
+                  <span>Bearer token env (tùy chọn)</span>
+                  <input
+                    value={mcpDraft.bearerTokenEnv}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous
+                          ? { ...previous, bearerTokenEnv: event.target.value }
+                          : previous,
+                      )
+                    }
+                    placeholder="TEZ_MCP_TOKEN"
+                    spellCheck={false}
+                  />
+                  <p className="field-note">
+                    Đọc từ biến môi trường lúc kết nối; token không được lưu vào mcp.json.
+                  </p>
                 </label>
               </div>
 
