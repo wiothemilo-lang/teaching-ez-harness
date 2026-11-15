@@ -104,8 +104,11 @@ pub fn atomic_mass(symbol: &str) -> Option<f64> {
     Some(mass)
 }
 
+/// Chặn chỉ số phi thực tế; cũng tránh tràn i64 khi nhân hệ số.
+const MAX_COUNT: i64 = 1_000_000;
+
 /// Tách hệ số đứng trước (ví dụ `2H2O` → `(2, "H2O")`). Mặc định 1.
-fn split_leading_number(part: &str) -> (i64, &str) {
+fn split_leading_number(part: &str) -> Result<(i64, &str), String> {
     let digit_end = part
         .char_indices()
         .take_while(|(_, c)| c.is_ascii_digit())
@@ -113,27 +116,42 @@ fn split_leading_number(part: &str) -> (i64, &str) {
         .last()
         .unwrap_or(0);
     if digit_end == 0 {
-        return (1, part);
+        return Ok((1, part));
     }
-    match part[..digit_end].parse::<i64>() {
-        Ok(n) if n > 0 => (n, &part[digit_end..]),
-        _ => (1, part),
+    let number = part[..digit_end]
+        .parse::<i64>()
+        .map_err(|_| format!("hệ số quá lớn trong '{part}'"))?;
+    if number <= 0 || number > MAX_COUNT {
+        return Err(format!("hệ số không hợp lệ trong '{part}'"));
     }
+    Ok((number, &part[digit_end..]))
 }
 
-fn parse_number(chars: &[char], pos: &mut usize) -> i64 {
+fn parse_number(chars: &[char], pos: &mut usize) -> Result<i64, String> {
     let start = *pos;
     while *pos < chars.len() && chars[*pos].is_ascii_digit() {
         *pos += 1;
     }
     if start == *pos {
-        return 1;
+        return Ok(1);
     }
-    chars[start..*pos]
+    let number = chars[start..*pos]
         .iter()
         .collect::<String>()
         .parse::<i64>()
-        .unwrap_or(1)
+        .map_err(|_| "chỉ số quá lớn trong công thức".to_string())?;
+    if number <= 0 || number > MAX_COUNT {
+        return Err("chỉ số phải nằm trong khoảng 1..=1000000".to_string());
+    }
+    Ok(number)
+}
+
+fn add_count(out: &mut Composition, element: String, count: i64) -> Result<(), String> {
+    let entry = out.entry(element).or_insert(0);
+    *entry = entry
+        .checked_add(count)
+        .ok_or_else(|| "công thức quá lớn".to_string())?;
+    Ok(())
 }
 
 fn parse_group(chars: &[char], pos: &mut usize, out: &mut Composition) -> Result<(), String> {
@@ -149,9 +167,15 @@ fn parse_group(chars: &[char], pos: &mut usize, out: &mut Composition) -> Result
                     return Err("thiếu dấu ')' trong công thức".to_string());
                 }
                 *pos += 1;
-                let multiplier = parse_number(chars, pos);
+                if inner.is_empty() {
+                    return Err("nhóm ngoặc rỗng trong công thức".to_string());
+                }
+                let multiplier = parse_number(chars, pos)?;
                 for (element, count) in inner {
-                    *out.entry(element).or_insert(0) += count * multiplier;
+                    let count = count
+                        .checked_mul(multiplier)
+                        .ok_or_else(|| "công thức quá lớn".to_string())?;
+                    add_count(out, element, count)?;
                 }
             }
             c if c.is_ascii_uppercase() => {
@@ -164,8 +188,8 @@ fn parse_group(chars: &[char], pos: &mut usize, out: &mut Composition) -> Result
                 if atomic_mass(&symbol).is_none() {
                     return Err(format!("nguyên tố không biết: {symbol}"));
                 }
-                let count = parse_number(chars, pos);
-                *out.entry(symbol).or_insert(0) += count;
+                let count = parse_number(chars, pos)?;
+                add_count(out, symbol, count)?;
             }
             c => return Err(format!("ký tự không hợp lệ trong công thức: '{c}'")),
         }
@@ -177,18 +201,21 @@ fn parse_group(chars: &[char], pos: &mut usize, out: &mut Composition) -> Result
 ///
 /// Hỗ trợ ngoặc đơn và hydrate: `Ca(OH)2`, `Fe2(SO4)3`, `CuSO4·5H2O`.
 pub fn parse_formula(formula: &str) -> Result<Composition, String> {
-    let cleaned: String = formula.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned = formula.trim();
     if cleaned.is_empty() {
         return Err("công thức rỗng".to_string());
     }
-    super::check_input_bounds(&cleaned)?;
+    if cleaned.chars().any(char::is_whitespace) {
+        return Err("công thức không được chứa khoảng trắng".to_string());
+    }
+    super::check_input_bounds(cleaned)?;
 
     let mut total = Composition::new();
     for part in cleaned.split(['·', '*']) {
         if part.is_empty() {
             return Err(format!("công thức không hợp lệ: '{formula}'"));
         }
-        let (multiplier, rest) = split_leading_number(part);
+        let (multiplier, rest) = split_leading_number(part)?;
         let chars: Vec<char> = rest.chars().collect();
         let mut counts = Composition::new();
         let mut pos = 0;
@@ -196,8 +223,14 @@ pub fn parse_formula(formula: &str) -> Result<Composition, String> {
         if pos != chars.len() {
             return Err(format!("ký tự thừa trong '{part}'"));
         }
+        if counts.is_empty() {
+            return Err(format!("phần '{part}' không có nguyên tố nào"));
+        }
         for (element, count) in counts {
-            *total.entry(element).or_insert(0) += count * multiplier;
+            let count = count
+                .checked_mul(multiplier)
+                .ok_or_else(|| "công thức quá lớn".to_string())?;
+            add_count(&mut total, element, count)?;
         }
     }
     Ok(total)
@@ -210,6 +243,9 @@ pub fn molar_mass(composition: &Composition) -> Result<f64, String> {
         let mass =
             atomic_mass(element).ok_or_else(|| format!("nguyên tố không biết: {element}"))?;
         total += mass * (*count as f64);
+    }
+    if !total.is_finite() {
+        return Err("khối lượng mol quá lớn".to_string());
     }
     Ok(total)
 }
@@ -264,6 +300,24 @@ mod tests {
     #[test]
     fn rejects_unknown_element() {
         assert!(parse_formula("Xx2O").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_counts_and_empty_parts() {
+        for formula in ["H0", "()", "5", "(H2)0", "H2 O", "Ca()2"] {
+            assert!(parse_formula(formula).is_err(), "{formula} phải bị từ chối");
+        }
+    }
+
+    #[test]
+    fn rejects_overflow_instead_of_panicking() {
+        for formula in [
+            "(H2)9223372036854775807",
+            "H9223372036854775807",
+            "C1000001",
+        ] {
+            assert!(parse_formula(formula).is_err(), "{formula} phải bị từ chối");
+        }
     }
 
     #[test]
