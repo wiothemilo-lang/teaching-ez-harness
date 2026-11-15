@@ -40,6 +40,10 @@ pub enum ConnectionError {
     MissingApiKey(String),
     #[error("base_url '{0}' không hợp lệ: phải là URL http(s) tuyệt đối, ví dụ https://api.groq.com/openai/v1")]
     InvalidBaseUrl(String),
+    #[error(
+        "base_url đã đổi cho provider '{0}'. Nhập lại API key để tránh gửi key cũ sang endpoint mới"
+    )]
+    BaseUrlChanged(String),
     #[error("không tìm thấy provider id '{0}'. Xem danh sách bằng: tez provider list")]
     ProviderIdNotFound(String),
 }

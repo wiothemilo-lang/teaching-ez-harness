@@ -518,14 +518,92 @@ fn default_workspace() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("workspaces").join("default"))
 }
 
+/// Chặn chọn thẳng thư mục hệ thống hoặc thư mục chứa credential làm workspace.
+/// Người dùng vẫn có thể mở dự án con như `/root/project` hoặc `/var/www/app`.
+fn workspace_path_allowed(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let root = text.trim_end_matches('/');
+    let root = if root.is_empty() { "/" } else { root };
+    const FORBIDDEN: &[&str] = &[
+        "/",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/boot",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/root",
+        "/home",
+        "/var",
+        "/opt",
+        "/tmp",
+        "c:/",
+        "c:/windows",
+        "c:/program files",
+        "c:/program files (x86)",
+        "c:/programdata",
+        "c:/users",
+    ];
+    if FORBIDDEN.contains(&root) {
+        return false;
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = Path::new(&home)
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_lowercase();
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && root == home {
+            return false;
+        }
+    }
+    const SENSITIVE: &[&str] = &[
+        "/.ssh",
+        "/.aws",
+        "/.gnupg",
+        "/.config",
+        "/.kube",
+        "/.docker",
+        "/.password-store",
+    ];
+    !SENSITIVE
+        .iter()
+        .any(|suffix| root.ends_with(suffix) || root.contains(&format!("{suffix}/")))
+}
+
 /// Chuẩn hóa workspace cho chế độ Code; tạo thư mục nếu chưa có.
 fn resolve_workspace(input: Option<&str>) -> anyhow::Result<PathBuf> {
     let path = match input.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => PathBuf::from(value),
         None => default_workspace()?,
     };
+    if !path.is_absolute() {
+        anyhow::bail!("workspace phải là đường dẫn tuyệt đối: {}", path.display());
+    }
     std::fs::create_dir_all(&path)?;
-    Ok(path.canonicalize().unwrap_or(path))
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| anyhow::anyhow!("không mở được workspace {}: {error}", path.display()))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("workspace không phải thư mục: {}", canonical.display());
+    }
+    if !workspace_path_allowed(&canonical) {
+        anyhow::bail!(
+            "không cho phép dùng thư mục hệ thống/nhạy cảm làm workspace: {}",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn is_safe_external_url(url: &str) -> bool {
+    let url = url.trim().to_lowercase();
+    url.starts_with("https://")
+        || url.starts_with("http://localhost")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]")
 }
 
 fn open_path_in_os(path: &Path) -> std::io::Result<()> {
@@ -1653,15 +1731,26 @@ fn launch_update(path: String) -> Result<(), String> {
             path = path.display()
         ));
     }
-    open_path_in_os(&path).map_err(|error| format!("không mở được bản cập nhật: {error}"))
+    let updates = data_dir()
+        .map_err(friendly)?
+        .join("updates")
+        .canonicalize()
+        .map_err(|error| format!("không mở được thư mục cập nhật: {error}"))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("không mở được file cập nhật: {error}"))?;
+    if !canonical.starts_with(&updates) || !canonical.is_file() {
+        return Err("chỉ được chạy file đã tải trong thư mục cập nhật".into());
+    }
+    open_path_in_os(&canonical).map_err(|error| format!("không mở được bản cập nhật: {error}"))
 }
 
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("chỉ hỗ trợ liên kết http(s)".into());
+    if !is_safe_external_url(&url) {
+        return Err("chỉ hỗ trợ liên kết https (hoặc http localhost)".into());
     }
-    open_path_in_os(Path::new(&url)).map_err(|error| format!("không mở được liên kết: {error}"))
+    open_path_in_os(Path::new(url.trim())).map_err(|error| format!("không mở được liên kết: {error}"))
 }
 
 #[tauri::command]
@@ -1711,4 +1800,30 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_system_workspace_roots() {
+        for path in ["/", "/etc", "/root", "/home", "/proc", "/sys"] {
+            assert!(!workspace_path_allowed(Path::new(path)), "{path}");
+        }
+        assert!(!workspace_path_allowed(Path::new("/root/.ssh")));
+        assert!(!workspace_path_allowed(Path::new("/home/alice/.aws")));
+        assert!(workspace_path_allowed(Path::new("/root/project")));
+        assert!(workspace_path_allowed(Path::new("/var/www/app")));
+    }
+
+    #[test]
+    fn only_allows_https_or_local_links() {
+        assert!(is_safe_external_url("https://example.com"));
+        assert!(is_safe_external_url("http://localhost:1420"));
+        assert!(is_safe_external_url("http://127.0.0.1/docs"));
+        assert!(!is_safe_external_url("http://example.com"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+    }
 }
