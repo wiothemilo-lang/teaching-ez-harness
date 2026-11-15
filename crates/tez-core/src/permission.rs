@@ -11,7 +11,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -210,44 +209,182 @@ fn normalize(command: &str) -> String {
         .to_lowercase()
 }
 
-const DENY_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -fr /",
-    "mkfs",
-    "dd if=",
-    "> /dev/sda",
-    "> /dev/nvme",
-    "shutdown",
-    "reboot",
-    "poweroff",
-    "halt",
-    ":(){",
-    "chmod -r 777 /",
-    "format c:",
-    "del /f /s /q c:\\",
-    "sudo rm -rf /",
-];
+/// Tách lệnh thành token, bỏ quote/backslash để `r\m` vẫn nhận ra là `rm`.
+fn shell_tokens(command: &str) -> Vec<String> {
+    command
+        .chars()
+        .filter(|ch| !matches!(ch, '"' | '\'' | '\\'))
+        .collect::<String>()
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '`' | '\n')
+        })
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn command_name(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
+/// Token có phải là lệnh thực sự được chạy không (đầu câu, sau shell/wrapper)?
+/// Nhờ vậy `grep shutdown` hay `echo 'rm -rf /'` không bị chặn nhầm.
+fn is_command_position(tokens: &[String], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let previous = tokens[index - 1].as_str();
+    if matches!(
+        previous,
+        "sudo"
+            | "doas"
+            | "command"
+            | "env"
+            | "nohup"
+            | "exec"
+            | "xargs"
+            | "time"
+            | "nice"
+            | "-c"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "dash"
+            | "ash"
+    ) {
+        return true;
+    }
+    // `sudo -u root rm`, `env FOO=1 rm`, `xargs -0 rm`: wrapper ở gần phía trước.
+    tokens[..index].iter().rev().take(4).any(|token| {
+        matches!(
+            token.as_str(),
+            "sudo" | "doas" | "env" | "xargs" | "command" | "nohup"
+        )
+    })
+}
+
+const DELETE_COMMANDS: &[&str] = &["rm", "rmdir", "del", "erase", "rd", "srm", "shred"];
+
+fn delete_command_position(tokens: &[String]) -> Option<usize> {
+    tokens.iter().enumerate().find_map(|(index, token)| {
+        (DELETE_COMMANDS.contains(&command_name(token)) && is_command_position(tokens, index))
+            .then_some(index)
+    })
+}
+
+/// `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`... bị chặn thẳng, kể cả ở Trust.
+fn catastrophic_delete(tokens: &[String]) -> bool {
+    let Some(start) = delete_command_position(tokens) else {
+        return false;
+    };
+    let args = &tokens[start + 1..];
+    let flags: Vec<&str> = args
+        .iter()
+        .take_while(|token| token.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let targets: Vec<&str> = args
+        .iter()
+        .filter(|token| !token.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let recursive = flags
+        .iter()
+        .any(|flag| flag.contains('r') || *flag == "--recursive");
+    let force = flags
+        .iter()
+        .any(|flag| flag.contains('f') || *flag == "--force");
+    let root_target = targets.iter().any(|target| {
+        *target == "/"
+            || *target == "*"
+            || *target == "~"
+            || target.starts_with("~/")
+            || *target == "$home"
+            || *target == "${home}"
+            || *target == "c:"
+            || *target == "c:/"
+            || [
+                "/etc", "/usr", "/var", "/home", "/root", "/bin", "/boot", "/dev", "/lib", "/opt",
+                "/sbin", "/srv", "/sys", "/proc",
+            ]
+            .iter()
+            .any(|prefix| *target == *prefix || target.starts_with(&format!("{prefix}/")))
+    });
+
+    let windows_delete = matches!(command_name(&tokens[start]), "del" | "erase" | "rd");
+    if windows_delete
+        && root_target
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "/s" | "/q" | "/f"))
+    {
+        return true;
+    }
+
+    // Giữ hành vi cũ: xóa đệ quy + ép buộc vào đường dẫn tuyệt đối là nguy hiểm.
+    let absolute = targets.iter().any(|target| target.starts_with('/'));
+    (root_target && (recursive || force || targets.contains(&"/")))
+        || (recursive && force && absolute)
+}
 
 fn deny_reason(tool: &str, args: &Value) -> Option<String> {
     if tool != "run_command" {
         return None;
     }
     let command = args.get("command").and_then(Value::as_str)?;
-    let normalized = normalize(command);
-    for pattern in DENY_PATTERNS {
-        if normalized.contains(pattern) {
-            return Some(format!("lệnh chứa mẫu bị chặn: '{pattern}'"));
+    let tokens = shell_tokens(command);
+
+    if catastrophic_delete(&tokens) {
+        return Some("lệnh xóa toàn bộ thư mục gốc/ổ đĩa".to_string());
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        if !is_command_position(&tokens, index) {
+            continue;
         }
+        let name = command_name(token);
+        if name == "mkfs" || name.starts_with("mkfs.") {
+            return Some(format!("lệnh chứa mẫu bị chặn: '{name}'"));
+        }
+        if matches!(name, "shutdown" | "reboot" | "poweroff" | "halt") {
+            return Some(format!("lệnh chứa mẫu bị chặn: '{name}'"));
+        }
+        if name == "dd" && tokens.iter().any(|token| token.starts_with("of=/dev/")) {
+            return Some("lệnh ghi trực tiếp lên thiết bị".to_string());
+        }
+        if name == "chmod"
+            && tokens.iter().any(|token| token == "777" || token == "0777")
+            && tokens.iter().any(|token| token == "/")
+        {
+            return Some("lệnh đổi quyền toàn hệ thống".to_string());
+        }
+    }
+
+    if tokens
+        .iter()
+        .any(|token| token.starts_with("/dev/sd") || token.starts_with("/dev/nvme"))
+        && tokens.iter().any(|token| token == ">")
+    {
+        return Some("lệnh ghi trực tiếp lên thiết bị".to_string());
+    }
+    if command.replace(' ', "").contains(":(){") {
+        return Some("fork bomb".to_string());
     }
     None
 }
 
-/// Regex nhận diện lệnh xóa ở đầu câu lệnh hoặc sau toán tử shell.
+/// Nhận diện lệnh xóa kể cả khi bị bọc: `bash -c 'rm -rf ~'`, `/bin/rm`,
+/// `command rm`, `r\m`, `sudo -u root rm`.
 fn destructive_command(command: &str) -> bool {
-    let pattern =
-        Regex::new(r"(?i)(?:^|[;&|()\n]|\bsudo\s+)\s*(?:rm|rmdir|del)\b").expect("valid regex");
-    pattern.is_match(command)
+    let tokens = shell_tokens(command);
+    if delete_command_position(&tokens).is_some() {
+        return true;
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .any(|(index, token)| command_name(token) == "find" && is_command_position(&tokens, index))
+        && tokens.iter().any(|token| token == "-delete")
 }
 
 const ASK_PATTERNS: &[&str] = &[
@@ -334,6 +471,60 @@ mod tests {
             let decision = policy.evaluate("run_command", &json!({"command": command}));
             assert!(
                 matches!(decision, PermissionDecision::Deny { .. }),
+                "{command} -> {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn denies_wrapped_catastrophic_commands() {
+        let policy = PermissionPolicy::default();
+        for command in [
+            "bash -c 'rm -rf ~'",
+            "/bin/rm -rf /",
+            "command rm -rf /",
+            "r\\m -rf /",
+            "sudo -u root rm -rf /",
+            "rm -rf $HOME",
+            "rm -rf --no-preserve-root /",
+        ] {
+            let decision = policy.evaluate("run_command", &json!({"command": command}));
+            assert!(
+                matches!(decision, PermissionDecision::Deny { .. }),
+                "{command} -> {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asks_for_wrapped_delete_commands() {
+        let policy = PermissionPolicy::default();
+        for command in [
+            "bash -c 'rm notes.txt'",
+            "/bin/rm notes.txt",
+            "command rm notes.txt",
+            "r\\m notes.txt",
+        ] {
+            let decision = policy.evaluate("run_command", &json!({"command": command}));
+            assert!(
+                matches!(decision, PermissionDecision::Ask { .. }),
+                "{command} -> {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_deny_dangerous_words_in_arguments() {
+        let policy = PermissionPolicy::default();
+        for command in [
+            "grep shutdown logs.txt",
+            "echo mkfs",
+            "grep 'rm -rf /' notes.txt",
+            "cat reboot.md",
+        ] {
+            let decision = policy.evaluate("run_command", &json!({"command": command}));
+            assert!(
+                !matches!(decision, PermissionDecision::Deny { .. }),
                 "{command} -> {decision:?}"
             );
         }

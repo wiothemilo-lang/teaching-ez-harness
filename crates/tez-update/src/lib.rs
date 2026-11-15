@@ -166,24 +166,77 @@ pub async fn check_repo(current: &str, repo: &str) -> Result<UpdateInfo, UpdateE
     })
 }
 
-/// Chọn asset phù hợp nhất với nền tảng hiện tại.
+/// Chọn asset phù hợp với hệ điều hành và kiến trúc hiện tại.
+///
+/// `platform` nhận dạng `"linux-x86_64"` (OS-ARCH). Asset ghi kiến trúc khác
+/// bị loại, không còn fallback về asset đầu tiên.
 pub fn pick_asset<'a>(info: &'a UpdateInfo, platform: &str) -> Option<&'a UpdateAsset> {
     let platform = platform.to_lowercase();
-    let keywords: &[&str] = if platform.contains("windows") {
-        &["windows", "win64", "x64", ".msi", ".exe"]
-    } else if platform.contains("macos") || platform.contains("darwin") {
-        &["macos", "darwin", ".dmg", ".app.tar.gz"]
+    let os_keywords: &[&str] = if platform.contains("windows") {
+        &["windows", "win64", "win32", ".msi", ".exe"]
+    } else if platform.contains("macos") || platform.contains("darwin") || platform.contains("osx")
+    {
+        &["macos", "darwin", "osx", ".dmg", ".app.tar.gz"]
     } else {
         &["linux", "appimage", ".deb", ".rpm", ".tar.gz"]
     };
+    const ARM64: &[&str] = &["aarch64", "arm64"];
+    const X86_64: &[&str] = &["x86_64", "amd64", "x64"];
+    const X86: &[&str] = &["i686", "i386", "x86"];
 
-    info.assets
-        .iter()
-        .find(|asset| {
-            let name = asset.name.to_lowercase();
-            keywords.iter().any(|keyword| name.contains(keyword))
-        })
-        .or_else(|| info.assets.first())
+    let arch_keywords: Option<&[&str]> = if platform.contains("aarch64")
+        || platform.contains("arm64")
+    {
+        Some(ARM64)
+    } else if platform.contains("x86_64") || platform.contains("amd64") || platform.contains("x64")
+    {
+        Some(X86_64)
+    } else if platform.contains("i686") || platform.contains("i386") {
+        Some(X86)
+    } else {
+        // Caller chỉ truyền OS: dùng kiến trúc của binary đang chạy.
+        match std::env::consts::ARCH {
+            "aarch64" => Some(ARM64),
+            "x86_64" => Some(X86_64),
+            "x86" | "i686" => Some(X86),
+            _ => None,
+        }
+    };
+
+    const ANY_ARCH: &[&str] = &[
+        "x86_64",
+        "amd64",
+        "x64",
+        "aarch64",
+        "arm64",
+        "i686",
+        "i386",
+        "armv7",
+        "universal",
+    ];
+
+    let mut best: Option<(u8, &UpdateAsset)> = None;
+    for asset in &info.assets {
+        let name = asset.name.to_lowercase();
+        if [".sha256", ".sha512", ".sig", ".asc", ".txt", ".json"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            continue;
+        }
+        if !os_keywords.iter().any(|keyword| name.contains(keyword)) {
+            continue;
+        }
+        let score = match arch_keywords {
+            Some(keywords) if keywords.iter().any(|keyword| name.contains(keyword)) => 2,
+            Some(_) if ANY_ARCH.iter().any(|keyword| name.contains(keyword)) => continue,
+            _ => 1,
+        };
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, asset));
+        }
+    }
+    best.map(|(_, asset)| asset)
 }
 
 /// Tải asset về `dest_dir`, trả về đường dẫn file đã lưu.
@@ -267,5 +320,43 @@ mod tests {
         };
         assert_eq!(pick_asset(&info, "windows").unwrap().url, "u2");
         assert_eq!(pick_asset(&info, "linux").unwrap().url, "u1");
+    }
+
+    #[test]
+    fn picks_asset_for_requested_architecture() {
+        let info = UpdateInfo {
+            current: "0.2.0".into(),
+            latest: "0.3.0".into(),
+            available: true,
+            notes: String::new(),
+            url: String::new(),
+            published_at: None,
+            assets: vec![
+                UpdateAsset {
+                    name: "tez_0.3.0_linux_aarch64.tar.gz".into(),
+                    url: "arm".into(),
+                    size: 1,
+                },
+                UpdateAsset {
+                    name: "tez_0.3.0_linux_x86_64.tar.gz".into(),
+                    url: "x86".into(),
+                    size: 1,
+                },
+                UpdateAsset {
+                    name: "tez_0.3.0_macos_aarch64.dmg".into(),
+                    url: "mac".into(),
+                    size: 1,
+                },
+                UpdateAsset {
+                    name: "checksums.txt".into(),
+                    url: "sum".into(),
+                    size: 1,
+                },
+            ],
+        };
+        assert_eq!(pick_asset(&info, "linux-x86_64").unwrap().url, "x86");
+        assert_eq!(pick_asset(&info, "linux-aarch64").unwrap().url, "arm");
+        assert_eq!(pick_asset(&info, "macos-aarch64").unwrap().url, "mac");
+        assert!(pick_asset(&info, "windows-x86_64").is_none());
     }
 }
