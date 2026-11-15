@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::connection::{
     self, default_base_url, default_model, display_name, ConnectionError, ConnectionFile,
 };
-use crate::Vault;
+use crate::{storage, Vault};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEntry {
@@ -72,9 +72,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<ProviderBook, ConnectionError> {
     let dir = dir.as_ref();
     let path = path(dir);
 
-    if path.exists() {
-        let bytes = std::fs::read(path)?;
-        let mut book: ProviderBook = serde_json::from_slice(&bytes)?;
+    if let Some(mut book) = storage::read_json::<ProviderBook>(&path)? {
         if book.active.is_none() && !book.providers.is_empty() {
             book.active = Some(book.providers[0].id.clone());
         }
@@ -108,9 +106,22 @@ pub fn load(dir: impl AsRef<Path>) -> Result<ProviderBook, ConnectionError> {
 /// Ghi sổ provider và đồng bộ `connection.json` với provider đang dùng.
 pub fn save(dir: impl AsRef<Path>, book: &ProviderBook) -> Result<(), ConnectionError> {
     let dir = dir.as_ref();
+    // Không bao giờ ghi custom thiếu endpoint: nếu không, key có thể bị gửi
+    // tới endpoint OpenAI mặc định. URL không rỗng cũng phải qua kiểm tra.
+    for entry in &book.providers {
+        let base_url = entry.base_url.trim();
+        if base_url.is_empty() {
+            if entry.provider.trim().eq_ignore_ascii_case("custom") {
+                return Err(ConnectionError::MissingBaseUrl);
+            }
+            continue;
+        }
+        connection::validate_base_url(base_url)?;
+    }
     let bytes = serde_json::to_vec_pretty(book)?;
-    std::fs::write(path(dir), bytes)?;
-    restrict_permissions(&path(dir))?;
+    storage::write_json(&path(dir), &bytes, |bytes| {
+        serde_json::from_slice::<ProviderBook>(bytes).is_ok()
+    })?;
     sync_connection(dir, book)?;
     Ok(())
 }
@@ -124,16 +135,19 @@ fn sync_connection(dir: &Path, book: &ProviderBook) -> Result<(), ConnectionErro
                 model: entry.model.clone(),
                 encrypted_key: entry.encrypted_key.clone(),
             };
-            std::fs::write(
-                connection::path(dir),
-                serde_json::to_vec_pretty(&connection)?,
-            )?;
-            restrict_permissions(&connection::path(dir))?;
+            let bytes = serde_json::to_vec_pretty(&connection)?;
+            storage::write_json(&connection::path(dir), &bytes, |bytes| {
+                serde_json::from_slice::<ConnectionFile>(bytes).is_ok()
+            })?;
         }
         None => {
             let path = connection::path(dir);
-            if path.exists() {
-                std::fs::remove_file(path)?;
+            for path in [path.clone(), storage::backup_path(&path)] {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
     }
@@ -149,10 +163,12 @@ pub fn upsert(
     let mut book = load(dir)?;
     let provider = input.provider.trim().to_lowercase();
     connection::validate_provider(&provider)?;
-    if let Some(key) = input.api_key {
-        if connection::requires_api_key(&provider) && key.trim().is_empty() {
-            return Err(connection::ConnectionError::MissingApiKey(provider.clone()));
-        }
+    let explicit_api_key = input.api_key.map(str::trim).filter(|key| !key.is_empty());
+    if connection::requires_api_key(&provider)
+        && input.api_key.is_some()
+        && explicit_api_key.is_none()
+    {
+        return Err(connection::ConnectionError::MissingApiKey(provider.clone()));
     }
     let requested_id = input
         .id
@@ -185,13 +201,18 @@ pub fn upsert(
             connection::validate_base_url(url)?;
             url.to_string()
         }
-        None if provider == "custom" && kind_changed => {
-            return Err(ConnectionError::MissingBaseUrl)
+        None if provider == "custom" => {
+            if kind_changed {
+                return Err(ConnectionError::MissingBaseUrl);
+            }
+            let existing_url = existing
+                .as_ref()
+                .map(|entry| entry.base_url.trim())
+                .filter(|url| !url.is_empty())
+                .ok_or(ConnectionError::MissingBaseUrl)?;
+            connection::validate_base_url(existing_url)?;
+            existing_url.to_string()
         }
-        None if provider == "custom" => existing
-            .as_ref()
-            .map(|entry| entry.base_url.clone())
-            .ok_or(ConnectionError::MissingBaseUrl)?,
         None if kind_changed => default_base_url(&provider).to_string(),
         None => existing
             .as_ref()
@@ -228,19 +249,24 @@ pub fn upsert(
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(true)
     });
-    if !kind_changed && base_url_changed && has_stored_key && input.api_key.is_none() {
+    if !kind_changed && base_url_changed && has_stored_key && explicit_api_key.is_none() {
         return Err(ConnectionError::BaseUrlChanged(provider));
     }
 
-    let encrypted_key = match input.api_key {
-        Some(key) => Vault::load_or_create(dir)?.encrypt(key.trim().as_bytes())?,
+    let encrypted_key = match explicit_api_key {
+        Some(key) => Vault::load_or_create(dir)?.encrypt(key.as_bytes())?,
         // Đổi loại provider mà không nhập key mới: không tái sử dụng key của
         // endpoint cũ (tránh gửi nhầm key sang vendor khác).
         None if kind_changed && connection::requires_api_key(&provider) => {
             return Err(ConnectionError::MissingApiKey(provider.clone()))
         }
         None if kind_changed => Vault::load_or_create(dir)?.encrypt(b"")?,
-        None => match existing.as_ref() {
+        // `Some("")` ở provider không cần key nghĩa là "không nhập key mới",
+        // không phải xóa key đã lưu.
+        None => match existing
+            .as_ref()
+            .filter(|entry| !entry.encrypted_key.is_empty())
+        {
             Some(entry) => entry.encrypted_key.clone(),
             None => Vault::load_or_create(dir)?.encrypt(b"")?,
         },
@@ -323,18 +349,6 @@ fn slug(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), ConnectionError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), ConnectionError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -604,5 +618,197 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updated.base_url, "https://b.example/v1");
+    }
+
+    #[test]
+    fn rejects_custom_without_base_url_on_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        for base_url in [None, Some(""), Some("   ")] {
+            let error = upsert(
+                dir.path(),
+                ProviderInput {
+                    name: "",
+                    provider: "custom",
+                    base_url,
+                    api_key: Some("sk-secret"),
+                    set_active: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, connection::ConnectionError::MissingBaseUrl));
+        }
+        assert!(!path(dir.path()).exists());
+        assert!(!dir.path().join("master.key").exists());
+
+        let error = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "custom",
+                base_url: Some("https://api.groq.com@evil.tld/v1"),
+                api_key: Some("sk-secret"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            connection::ConnectionError::InvalidBaseUrl(_)
+        ));
+        assert!(!path(dir.path()).exists());
+    }
+
+    #[test]
+    fn rejects_custom_without_base_url_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = ProviderBook {
+            version: 1,
+            active: Some("custom-1".to_string()),
+            providers: vec![ProviderEntry {
+                id: "custom-1".to_string(),
+                name: "Custom".to_string(),
+                provider: "custom".to_string(),
+                base_url: "  ".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                encrypted_key: String::new(),
+            }],
+        };
+
+        let error = save(dir.path(), &book).unwrap_err();
+        assert!(matches!(error, connection::ConnectionError::MissingBaseUrl));
+        assert!(!path(dir.path()).exists());
+
+        let mut book = book;
+        book.providers[0].base_url = "https://api.groq.com@evil.tld/v1".to_string();
+        let error = save(dir.path(), &book).unwrap_err();
+        assert!(matches!(
+            error,
+            connection::ConnectionError::InvalidBaseUrl(_)
+        ));
+        assert!(!path(dir.path()).exists());
+    }
+
+    #[test]
+    fn empty_key_does_not_wipe_existing_keyless_key() {
+        for (provider, base_url) in [
+            ("custom", Some("https://local.example/v1")),
+            ("ollama", None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = upsert(
+                dir.path(),
+                ProviderInput {
+                    name: provider,
+                    provider,
+                    base_url,
+                    api_key: Some("sk-keep"),
+                    set_active: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            for empty in ["", "   "] {
+                let edited = upsert(
+                    dir.path(),
+                    ProviderInput {
+                        id: Some(&saved.id),
+                        name: "edited",
+                        provider,
+                        api_key: Some(empty),
+                        set_active: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    decrypt_key(dir.path(), &edited).unwrap(),
+                    "sk-keep",
+                    "provider {provider} bị mất key khi nhập key rỗng"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_book_falls_back_to_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "First",
+                provider: "groq",
+                api_key: Some("sk-first"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let file = path(dir.path());
+        let backup = storage::backup_path(&file);
+        assert!(backup.exists(), "lần ghi đầu vẫn phải tạo .bak");
+
+        upsert(
+            dir.path(),
+            ProviderInput {
+                id: Some(&first.id),
+                name: "Second",
+                provider: "groq",
+                api_key: None,
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let previous: ProviderBook =
+            serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        assert_eq!(previous.providers[0].name, "First");
+
+        std::fs::write(&file, b"not json").unwrap();
+        let recovered = load(dir.path()).unwrap();
+        assert_eq!(recovered.providers[0].name, "First");
+        assert_eq!(recovered.active.as_deref(), Some(first.id.as_str()));
+        assert_eq!(
+            decrypt_key(dir.path(), &recovered.providers[0]).unwrap(),
+            "sk-first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        upsert(
+            dir.path(),
+            ProviderInput {
+                name: "Groq",
+                provider: "groq",
+                api_key: Some("sk-private"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let provider_path = path(dir.path());
+        let connection_path = connection::path(dir.path());
+        for file in [
+            provider_path.clone(),
+            storage::backup_path(&provider_path),
+            connection_path.clone(),
+            storage::backup_path(&connection_path),
+            dir.path().join("master.key"),
+        ] {
+            let mode = std::fs::metadata(&file)
+                .unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{} phải là 0600", file.display());
+        }
     }
 }

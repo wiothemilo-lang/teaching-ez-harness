@@ -456,7 +456,8 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             set_active: true,
         },
     )?;
-    let vault = Vault::load_or_create(&dir)?;
+    // Upsert đã bảo đảm vault tồn tại; chỉ mở key hiện có để không mint key mới.
+    let vault = Vault::load(&dir)?;
 
     // Đảm bảo DB và profile tồn tại ngay từ đầu.
     let store = Store::open(dir.join("tez.db"))?;
@@ -715,11 +716,21 @@ fn resolve_chat_connection(
         .map(|entry| entry.provider.clone())
         .or_else(|| args.provider.clone())
         .unwrap_or_else(|| "groq".to_string());
-    let base_url = args
+    let base_url = match args
         .base_url
         .clone()
         .or_else(|| selected.map(|entry| entry.base_url.clone()))
-        .unwrap_or_else(|| connection::default_base_url(&provider_id).to_string());
+    {
+        Some(url) => url,
+        // Không để custom rơi về endpoint OpenAI mặc định rồi gửi key tới đó.
+        None if provider_id == "custom" => {
+            anyhow::bail!(
+                "provider 'custom' cần --base-url (ví dụ: https://gateway.example.com/v1)"
+            )
+        }
+        None => connection::default_base_url(&provider_id).to_string(),
+    };
+    connection::validate_base_url(&base_url)?;
     let model = args
         .model
         .clone()
@@ -1415,8 +1426,11 @@ fn doctor() -> anyhow::Result<()> {
         human_size(store.document_bytes()? as u64)
     );
 
-    let vault = Vault::load_or_create(&dir)?;
-    println!("vault key: {}", vault.key_path().display());
+    // Doctor chỉ chẩn đoán: không được tạo master.key mới khi key cũ bị mất.
+    match Vault::load(&dir) {
+        Ok(vault) => println!("vault key: {}", vault.key_path().display()),
+        Err(error) => println!("vault key: chưa mở được ({error})"),
+    }
 
     for key in [
         "GROQ_API_KEY",
