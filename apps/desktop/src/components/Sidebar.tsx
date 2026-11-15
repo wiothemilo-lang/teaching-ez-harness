@@ -90,7 +90,7 @@ export function Sidebar({
             <small>
               {mode === "code"
                 ? "Agent đọc/ghi file trong thư mục này"
-                : "Chuyển sang Code để dùng công cụ file"}
+                : "Dùng cho chỉ dẫn dự án và ngữ cảnh"}
             </small>
           </span>
           <IconChevronRight size={14} />

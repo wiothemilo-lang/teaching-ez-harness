@@ -278,7 +278,7 @@ export default function App() {
         session_id: sessionId,
         provider_id: status.connection.id,
         mode,
-        workspace: mode === "code" ? workspace || null : null,
+        workspace: workspace || null,
       });
       setSessionId(reply.session_id);
       setMessages((previous) => [

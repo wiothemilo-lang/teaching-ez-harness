@@ -87,6 +87,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | SQLite: session (kèm mode), message, tool call, todo, token usage | ✅ |
 | Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
 | Skills Markdown: 4 built-in, khớp ngữ cảnh + từ khóa, chèn vào context, tạo bằng AI | ✅ |
+| Ngữ cảnh dự án: `AGENTS.md`/`CLAUDE.md`, `.tez/skills`, `.tez/mcp.json` | ✅ |
 | MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace | ✅ |
 | Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
@@ -311,6 +312,7 @@ Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền m
 
 - **Chat:** trợ lý tổng quát, không bắt chọn môn hay lớp; câu trả lời stream dần, nút gửi đổi thành nút **dừng** khi agent đang chạy; tool trace có args/kết quả/thời gian, token usage.
 - **Code:** nhập hoặc mở workspace; agent dùng `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `todo_write`, `task`, `compact` và bị giới hạn trong thư mục đó.
+- **Ngữ cảnh dự án:** khi đã chọn workspace, agent đọc `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), nạp skill ở `.tez/skills/` và MCP server ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
 - **Duyệt thao tác:** khi permission mode yêu cầu, app hiện hộp thoại kèm lý do, tool và args JSON; chọn **Từ chối** hoặc **Cho phép chạy**.
 - **Dock harness:** ngay trên ô nhập, hiện kế hoạch todo, thanh context so với giới hạn, số lượt nén và số thao tác bị chặn.
 - **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.

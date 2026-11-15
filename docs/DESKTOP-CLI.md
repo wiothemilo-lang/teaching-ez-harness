@@ -60,6 +60,7 @@
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
 - Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp từ khóa trong câu hỏi (tối đa 2) và đăng ký tool MCP vào cùng registry với tool built-in.
+- Khi có workspace, chat nạp thêm `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), skill ở `.tez/skills/`, MCP ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
 - Desktop và CLI đều mở SQLite trực tiếp; WAL + `busy_timeout` xử lý tranh chấp ngắn. Không có process server riêng.
 - Mỗi lệnh chat mở Store, nạp session/todo, chạy agent rồi ghi message/tool call/usage; lỗi DB trả về UI dưới dạng chuỗi thân thiện.

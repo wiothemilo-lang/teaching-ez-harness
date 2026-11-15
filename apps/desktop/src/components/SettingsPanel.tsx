@@ -738,7 +738,8 @@ export function SettingsPanel({
               <h3>Kỹ năng</h3>
               <p>
                 Prompt pack Markdown được chèn vào context khi khớp ngữ cảnh và từ khóa trong câu
-                hỏi. Có thể tạo bằng AI rồi chỉnh lại file.
+                hỏi. Có thể tạo bằng AI rồi chỉnh lại file. Skill riêng của dự án nằm trong
+                <code> &lt;workspace&gt;/.tez/skills/</code> và được nạp khi chọn workspace.
               </p>
             </div>
             <div className="head-actions">

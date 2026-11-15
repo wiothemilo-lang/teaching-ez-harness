@@ -94,8 +94,22 @@ pub fn config_path(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join("mcp.json")
 }
 
+/// File MCP riêng của dự án: `<root>/.tez/mcp.json`.
+pub fn project_config_path(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join(".tez").join("mcp.json")
+}
+
 pub fn load_config(dir: impl AsRef<Path>) -> Result<McpConfig, McpError> {
     let path = config_path(dir);
+    if !path.exists() {
+        return Ok(McpConfig::default());
+    }
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn load_project_config(root: impl AsRef<Path>) -> Result<McpConfig, McpError> {
+    let path = project_config_path(root);
     if !path.exists() {
         return Ok(McpConfig::default());
     }
@@ -110,8 +124,18 @@ pub fn save_config(dir: impl AsRef<Path>, config: &McpConfig) -> Result<(), McpE
     Ok(())
 }
 
-/// Gộp server từ `mcp.json` và từ plugin. Server user định nghĩa được ưu tiên.
+/// Gộp server từ `mcp.json` toàn cục và từ plugin. Server user định nghĩa được ưu tiên.
 pub fn load_servers(dir: impl AsRef<Path>) -> Result<Vec<ServerEntry>, McpError> {
+    load_servers_with_project(dir, None)
+}
+
+/// Gộp server toàn cục, server của dự án và server từ plugin.
+///
+/// Thứ tự ưu tiên khi trùng tên: dự án > user > plugin.
+pub fn load_servers_with_project(
+    dir: impl AsRef<Path>,
+    project_root: Option<&Path>,
+) -> Result<Vec<ServerEntry>, McpError> {
     let dir = dir.as_ref();
     let config = load_config(dir)?;
     let mut entries: Vec<ServerEntry> = config
@@ -123,6 +147,25 @@ pub fn load_servers(dir: impl AsRef<Path>) -> Result<Vec<ServerEntry>, McpError>
             source: "user".to_string(),
         })
         .collect();
+
+    if let Some(root) = project_root {
+        let project = load_project_config(root)?;
+        for (name, mut config) in project.servers {
+            if config.cwd.is_none() {
+                config.cwd = Some(root.to_string_lossy().to_string());
+            }
+            let entry = ServerEntry {
+                name: name.clone(),
+                config,
+                source: "project".to_string(),
+            };
+            if let Some(existing) = entries.iter_mut().find(|item| item.name == name) {
+                *existing = entry;
+            } else {
+                entries.push(entry);
+            }
+        }
+    }
 
     let plugins =
         crate::plugins::load_all(dir).map_err(|error| McpError::Spawn(error.to_string()))?;
@@ -147,7 +190,15 @@ pub fn load_servers(dir: impl AsRef<Path>) -> Result<Vec<ServerEntry>, McpError>
 
 /// Spawn các server đang bật, lấy danh sách tool và giữ process sống.
 pub async fn discover(dir: impl AsRef<Path>) -> Result<McpDiscovery, McpError> {
-    let entries = load_servers(dir)?;
+    discover_with_project(dir, None).await
+}
+
+/// Như [`discover`] nhưng gộp thêm MCP server của dự án.
+pub async fn discover_with_project(
+    dir: impl AsRef<Path>,
+    project_root: Option<&Path>,
+) -> Result<McpDiscovery, McpError> {
+    let entries = load_servers_with_project(dir, project_root)?;
     let mut tools = Vec::new();
     let mut servers = Vec::new();
 
@@ -567,5 +618,43 @@ mod tests {
         save_config(dir.path(), &config).unwrap();
         let loaded = load_config(dir.path()).unwrap();
         assert_eq!(loaded.servers["demo"].command, "python3");
+    }
+
+    #[test]
+    fn project_servers_override_user_servers() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "demo".into(),
+            McpServerConfig {
+                command: "global".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                enabled: true,
+            },
+        );
+        save_config(data.path(), &config).unwrap();
+
+        std::fs::create_dir_all(project.path().join(".tez")).unwrap();
+        std::fs::write(
+            project.path().join(".tez").join("mcp.json"),
+            r#"{"servers":{"demo":{"command":"project"},"extra":{"command":"extra"}}}"#,
+        )
+        .unwrap();
+
+        let entries = load_servers_with_project(data.path(), Some(project.path())).unwrap();
+        let demo = entries.iter().find(|entry| entry.name == "demo").unwrap();
+        assert_eq!(demo.config.command, "project");
+        assert_eq!(demo.source, "project");
+        assert_eq!(
+            demo.config.cwd.as_deref(),
+            Some(project.path().to_str().unwrap())
+        );
+
+        let extra = entries.iter().find(|entry| entry.name == "extra").unwrap();
+        assert_eq!(extra.source, "project");
     }
 }

@@ -44,7 +44,7 @@ Model của người dùng chỉ cần làm phần **suy luận/ngôn ngữ**. �
 ```
 Cargo.toml                     # workspace
 crates/
-  tez-core/                    # domain + agent runtime + context + tools + pedagogy
+  tez-core/                    # domain + agent runtime + context + project + tools
   tez-llm/                     # provider trait + OpenAI-compatible adapter + tool calls
   tez-auth/                    # connections, keychain, vault, OAuth
   tez-store/                   # SQLite, migrations, repositories
@@ -173,6 +173,7 @@ Agent dừng khi:
 | Nguồn | Nội dung | Ưu tiên |
 |---|---|---|
 | **System** | Vai trò chat/code, ngôn ngữ, chỉ dẫn bổ sung của người dùng | Pinned |
+| **Project** | `AGENTS.md`/`CLAUDE.md` và `.tez/` của workspace, render thành `<project-instructions>`, tối đa 24 KB | Cao |
 | **Skills** | Skill khớp từ khóa trong câu hỏi, render sẵn | Cao |
 | **Memory** | Memory recall theo từ khóa | Cao |
 | **Todos** | Kế hoạch hiện tại của phiên | Pinned |
