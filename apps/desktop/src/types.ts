@@ -137,6 +137,11 @@ export type ExtensionSummary = {
   plugins: number;
 };
 
+export type SandboxInfo = {
+  available: boolean;
+  default_enabled: boolean;
+};
+
 export type AppStatus = {
   connection: ConnectionInfo | null;
   providers: ProviderInfo[];
@@ -146,6 +151,7 @@ export type AppStatus = {
   default_workspace: string;
   version: string;
   extensions: ExtensionSummary;
+  sandbox: SandboxInfo;
 };
 
 export type UpdateAsset = {

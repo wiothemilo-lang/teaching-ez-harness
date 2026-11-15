@@ -114,7 +114,7 @@ Có hai transport:
 | `env` | Biến môi trường bổ sung cho stdio. |
 | `cwd` | Thư mục làm việc cho stdio; plugin mặc định dùng thư mục plugin. |
 | `enabled` | `false` để tạm tắt mà không xóa cấu hình. |
-| `sandbox` | Tùy chọn sandbox stdio trên Linux: `{ "enabled": true, "allow_network": false, "writable_paths": [...] }`. Bật thì cần `bubblewrap`; thiếu `bwrap` server bị từ chối, không chạy không sandbox. Mặc định chặn mạng, ẩn secret trong data dir và credential trong HOME; `writable_paths` được bind read-write (không được trỏ vào data dir). |
+| `sandbox` | Sandbox stdio trên Linux: `{ "enabled": true, "allow_network": false, "writable_paths": [...] }`. **Mặc định bật trên Linux**, kể cả khi config cũ thiếu field; tắt rõ ràng bằng `"enabled": false`. Cần `bubblewrap`; thiếu `bwrap` server bị từ chối, không chạy không sandbox. Mặc định chặn mạng, ẩn secret trong data dir và credential trong HOME; `writable_paths` được bind read-write (không được trỏ vào data dir hoặc thư mục cha của data dir). Trên macOS/Windows chưa có sandbox OS nên mặc định tắt. |
 | `read_only` | `true` để ép mọi tool của server được coi là chỉ đọc. Alias khi đọc file: `readOnly`. |
 
 Đường dẫn: `~/.local/share/teaching-ez/mcp.json`. Desktop ghi khóa này dưới dạng `read_only`; `readOnly` được chấp nhận khi bạn sửa file bằng tay.
@@ -174,7 +174,7 @@ Server Streamable HTTP có thể dùng OAuth 2.1 + PKCE. Khai báo trong `mcp.js
 - HTTP dùng POST JSON-RPC + response JSON/SSE và GET SSE stream best-effort cho request/notification server khởi tạo (`ping`, `roots/list`; request khác trả lỗi `-32601`); header hỗ trợ `${VAR}` và `bearer_token_env`. Resources/prompts xem qua dialog **Tài nguyên** trong Settings → MCP hoặc tool extras.
 - `mcp.json` hỏng không chặn phiên chat: server từ file đó bị bỏ qua kèm cảnh báo. Khi lưu từ Settings, file hỏng cũ được đổi tên thành `mcp.json.corrupt-<timestamp>-<pid>` trước khi ghi file mới atomically.
 - Timeout khởi động/gọi: 20 giây; stderr của server stdio bị bỏ qua.
-- Server stdio mặc định chạy dưới quyền user hiện tại; có thể bật sandbox bubblewrap theo từng server trên Linux. Khi bật: mạng bị chặn trừ khi `allow_network`, data dir và credential trong HOME bị ẩn, chỉ các đường dẫn trong `writable_paths` được ghi; thiếu `bwrap` thì server bị từ chối thay vì chạy không sandbox. macOS/Windows chưa có sandbox OS cho MCP. Chỉ cài server bạn tin tưởng. Process chỉ kế thừa các biến môi trường cơ bản (`PATH`, `HOME`, `LANG`, ...), không kế thừa API key/token của app; biến bổ sung phải khai báo trong `env`.
+- Server stdio mặc định chạy trong sandbox bubblewrap trên Linux (kể cả config cũ thiếu `sandbox`); tắt rõ ràng bằng `"enabled": false` nếu server cần quyền đặc biệt. Khi bật: mạng bị chặn trừ khi `allow_network`, data dir và credential trong HOME bị ẩn, chỉ các đường dẫn trong `writable_paths` được ghi; thiếu `bwrap` thì server bị từ chối thay vì chạy không sandbox. macOS/Windows chưa có sandbox OS cho MCP. Chỉ cài server bạn tin tưởng. Process chỉ kế thừa các biến môi trường cơ bản (`PATH`, `HOME`, `LANG`, ...), không kế thừa API key/token của app; biến bổ sung phải khai báo trong `env`.
 - Server stdio được spawn lại mỗi lượt chat; chưa giữ process dài hạn. HTTP dùng client mới mỗi lượt.
 
 ### CLI

@@ -742,7 +742,7 @@ tez update --check-only
 | Rủi ro | Biện pháp |
 |---|---|
 | Tool nguy hiểm | Trên Linux, `run_command` chạy trong bubblewrap: workspace read-write, data dir/credential bị ẩn, network bị tách mặc định, fail-closed nếu thiếu `bwrap`; vẫn qua permission pipeline (deny → ask → allow) và audit/redaction. macOS/Windows chỉ có giới hạn đường dẫn ở tầng ứng dụng, chưa có sandbox OS |
-| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers hỗ trợ ${VAR}/bearer_token_env). Server stdio có sandbox bubblewrap tùy chọn (Linux): ẩn secret, chặn mạng mặc định, chỉ bind `writable_paths` |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers hỗ trợ ${VAR}/bearer_token_env). Server stdio **mặc định chạy trong sandbox bubblewrap trên Linux** (config cũ thiếu field cũng vậy): ẩn secret, chặn mạng mặc định, chỉ bind `writable_paths`; macOS/Windows chưa có sandbox OS |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
 | Key rò rỉ | AES-GCM với `master.key` quyền `0600` trong data dir (chưa dùng OS keychain); redaction; không trả secret. Bản backup chứa `master.key` nên phải bảo vệ |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
@@ -767,9 +767,9 @@ tez update --check-only
   permission denial; subagent trả text cuối; MCP stdio; MCP stdio sandbox
   (bubblewrap, Linux); MCP HTTP JSON/SSE + session header + env
   headers/bearer + resources/prompts.
-- **Số test hiện tại:** `tez-core` 275 + 2 MCP stdio, `tez-auth` 32,
+- **Số test hiện tại:** `tez-core` 279 + 2 MCP stdio, `tez-auth` 32,
   `tez-backup` 4, `tez-cli` 22, `tez-llm` 16, `tez-store` 28, `tez-update` 16;
-  tổng 395. Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test.
+  tổng 399. Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test.
   `cargo test --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
   `cargo fmt --all -- --check` sạch.

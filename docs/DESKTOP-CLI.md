@@ -223,7 +223,7 @@ tez logs --tail 100
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
-| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)**; sandbox stdio tùy chọn (Linux, bubblewrap) với mạng chặn mặc định và `writable_paths` |
+| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)**; sandbox stdio mặc định bật trên Linux (bubblewrap) với mạng chặn mặc định và `writable_paths`; server chưa sandbox có tag cảnh báo |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
 | **Settings → Harness** | Permission mode, permission rule dạng `allow\|ask\|deny <tool> <pattern>` (bỏ qua `#` comment/dòng trống, lỗi hiện inline và tắt **Lưu**), giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
 | Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
@@ -326,7 +326,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Local server (tương lai) | Nếu bật `tez-server`: 127.0.0.1 + bearer token + Origin check; file token `0600`. Hiện desktop gọi Tauri command in-process. |
 | Key rò rỉ | AES-GCM với `master.key` quyền `0600` trong data dir (chưa dùng OS keychain); redaction; không log header. Bản backup có chứa `master.key` nên phải bảo vệ. |
 | Key lộ qua renderer | Renderer không nhận secret. |
-| Tool nguy hiểm | Trên Linux, `run_command` chạy trong bubblewrap: workspace read-write, data dir/credential bị ẩn, network bị tách mặc định; vẫn qua permission pipeline (deny → ask → allow) và audit/redaction. MCP stdio có sandbox bubblewrap tùy chọn theo server. macOS/Windows chưa có sandbox OS. |
+| Tool nguy hiểm | Trên Linux, `run_command` chạy trong bubblewrap: workspace read-write, data dir/credential bị ẩn, network bị tách mặc định; vẫn qua permission pipeline (deny → ask → allow) và audit/redaction. MCP stdio mặc định chạy trong bubblewrap trên Linux; server cần quyền đặc biệt phải tắt rõ ràng. macOS/Windows chưa có sandbox OS. |
 | MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. |
 | Prompt injection | Tài liệu/tool result là data; delimiter; không thực thi chỉ dẫn; tool allowlist. |
 | Ghi dữ liệu sai | Write/edit tool qua permission; audit JSONL; todo/plan hiển thị để người dùng theo dõi. |

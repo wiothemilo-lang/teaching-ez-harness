@@ -397,7 +397,7 @@ export function SettingsPanel({
       oauthScopesText: "",
       oauthRedirectUri: "",
       oauthResource: "",
-      sandboxEnabled: false,
+      sandboxEnabled: status?.sandbox.default_enabled ?? false,
       sandboxAllowNetwork: false,
       sandboxWritableText: "",
     });
@@ -1024,6 +1024,12 @@ export function SettingsPanel({
                         {!server.enabled && <Tag tone="neutral">Đang tắt</Tag>}
                         {server.read_only && <Tag tone="forest">Chỉ đọc</Tag>}
                         {server.sandbox?.enabled && <Tag tone="forest">Sandbox</Tag>}
+                        {!server.url &&
+                          server.enabled &&
+                          !server.sandbox?.enabled &&
+                          status?.sandbox.available && (
+                            <Tag tone="clay">Chưa sandbox</Tag>
+                          )}
                         {server.oauth && <Tag tone="clay">OAuth</Tag>}
                         {server.oauth &&
                           (server.authorized ? (
