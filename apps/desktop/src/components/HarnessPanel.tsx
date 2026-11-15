@@ -531,8 +531,9 @@ export function HarnessPanel({ notify, onChanged }: Props) {
             <div className="harness-block-head">
               <h4>Nén context</h4>
               <p>
-                Bốn bước từ rẻ tới đắt: lưu kết quả lớn, cắt lịch sử cũ, micro-compact, rồi mới
-                tóm tắt bằng model.
+                Bốn bước từ rẻ tới đắt: lưu kết quả lớn, cắt lịch sử cũ, micro-compact ở 80%
+                giới hạn, rồi mới tóm tắt bằng model ở 90%. Mặc định 24.000 ký tự để an toàn với
+                model context nhỏ.
               </p>
             </div>
             <label className="checkbox harness-toggle">

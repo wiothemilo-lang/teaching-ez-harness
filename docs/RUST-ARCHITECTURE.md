@@ -100,7 +100,7 @@ docs/
 | `temperature` | 0.2 |
 | Timeout mỗi tool | 60s mặc định; `run_command` 130s; `task` 180s |
 | Output tool tối đa | 8KB (cắt an toàn theo UTF-8) |
-| Compaction | bật, ngưỡng 60.000 ký tự JSON |
+| Compaction | bật, ngưỡng mềm 24.000 ký tự JSON; micro ở 80%, summary ở 90% |
 | Token context | ước lượng bằng độ dài JSON messages, không cần tokenizer |
 
 ### 3.2 Kiểu dữ liệu
@@ -210,16 +210,18 @@ Compaction là pipeline bốn bước, chạy từ rẻ tới đắt
 2. **Snip lịch sử** — khi số message vượt `trigger_messages`, lưu toàn bộ
    transcript vào `sessions/<id>/transcripts/<timestamp>.json`, giữ vài message
    đầu + `target_messages` message gần nhất, chèn marker có đường dẫn transcript.
-3. **Micro-compact** — nếu vẫn vượt `context_char_limit`, thay kết quả tool cũ
-   bằng đường dẫn file, giữ `keep_recent_results` kết quả gần nhất.
-4. **LLM summary** — chỉ khi vẫn vượt giới hạn: gọi model tóm tắt mục tiêu,
+3. **Micro-compact** — khi vượt 80% `context_char_limit`, thay kết quả tool cũ
+   bằng đường dẫn file, giữ `keep_recent_results` kết quả gần nhất và nén về
+   khoảng 65% giới hạn.
+4. **LLM summary** — chỉ khi vẫn vượt 90% giới hạn: gọi model tóm tắt mục tiêu,
    file đã đọc/sửa, quyết định, việc còn lại; giữ system prompt và yêu cầu hiện
    tại, kèm đường dẫn transcript.
 
 Thứ tự này cố định vì bước 1–3 không gọi model và luôn có đường phục hồi; bước
-4 mất chi tiết nên chỉ là phương án cuối. Nếu provider vẫn báo lỗi context
-(`prompt is too long`, `maximum context`), agent thử tóm tắt một lần rồi chạy
-lại. Agent cũng có tool `compact` để chủ động nén sau một giai đoạn dài.
+4 mất chi tiết nên chỉ là phương án cuối. Nếu provider báo lỗi context
+(`prompt is too long`, `maximum context`), hoặc trả `400 Invalid request`/`413`
+khi request đã chịu áp lực ít nhất 50% giới hạn, agent thử tóm tắt một lần rồi
+chạy lại. Agent cũng có tool `compact` để chủ động nén sau một giai đoạn dài.
 
 `harness.json` chỉnh được `enabled`, `context_char_limit`, `large_result_chars`,
 `preview_chars`, `trigger_messages`, `target_messages`, `keep_recent_results`.
@@ -764,9 +766,9 @@ tez update --check-only
   permission denial; subagent trả text cuối; MCP stdio; MCP stdio sandbox
   (bubblewrap, Linux); MCP HTTP JSON/SSE + session header + env
   headers/bearer + resources/prompts.
-- **Số test hiện tại:** `tez-core` 271 + 2 MCP stdio, `tez-auth` 32,
+- **Số test hiện tại:** `tez-core` 275 + 2 MCP stdio, `tez-auth` 32,
   `tez-backup` 4, `tez-cli` 22, `tez-llm` 16, `tez-store` 28, `tez-update` 16;
-  tổng 392. Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test.
+  tổng 395. Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test.
   `cargo test --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
   `cargo fmt --all -- --check` sạch.

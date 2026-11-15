@@ -36,22 +36,22 @@ fn default_true() -> bool {
     true
 }
 fn default_context_limit() -> usize {
-    60_000
-}
-fn default_large_result() -> usize {
     24_000
 }
+fn default_large_result() -> usize {
+    6_000
+}
 fn default_preview() -> usize {
-    2_000
+    1_200
 }
 fn default_trigger_messages() -> usize {
-    60
+    32
 }
 fn default_target_messages() -> usize {
-    30
+    16
 }
 fn default_keep_recent() -> usize {
-    3
+    2
 }
 
 impl Default for CompactSettings {
@@ -151,7 +151,10 @@ impl Compactor {
 
         report.persisted = self.persist_large_results(messages);
         report.snipped = self.snip_history(messages, &mut report);
-        if self.estimate(messages) > self.settings.context_char_limit {
+        // Compact sớm ở 80% để chừa chỗ cho system prompt, tool schema và
+        // phần sinh tiếp theo; không đợi tới khi request đã vượt giới hạn.
+        let soft_limit = self.settings.context_char_limit * 4 / 5;
+        if self.estimate(messages) > soft_limit {
             report.micro_compacted = self.micro_compact(messages);
         }
         report.estimated_chars = self.estimate(messages);
@@ -159,7 +162,9 @@ impl Compactor {
     }
 
     pub fn needs_summary(&self, messages: &[Message]) -> bool {
-        self.settings.enabled && self.estimate(messages) > self.settings.context_char_limit
+        // Tóm tắt trước ngưỡng cứng 10% để tránh provider trả 400 chung chung.
+        let summary_limit = self.settings.context_char_limit * 9 / 10;
+        self.settings.enabled && self.estimate(messages) > summary_limit
     }
 
     fn persist_large_results(&self, messages: &mut [Message]) -> usize {
@@ -286,7 +291,7 @@ impl Compactor {
     }
 
     fn micro_compact(&self, messages: &mut [Message]) -> usize {
-        let target = (self.settings.context_char_limit as f64 * 0.8) as usize;
+        let target = (self.settings.context_char_limit as f64 * 0.65) as usize;
         let tool_indices: Vec<usize> = messages
             .iter()
             .enumerate()
@@ -620,6 +625,42 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Kết quả cũ đã lưu")));
+    }
+
+    #[test]
+    fn micro_compacts_at_soft_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = Compactor::new(
+            CompactSettings {
+                context_char_limit: 20_000,
+                large_result_chars: 100_000,
+                keep_recent_results: 1,
+                ..CompactSettings::default()
+            },
+            Some(dir.path().to_path_buf()),
+        );
+        let mut messages = vec![Message::system("system")];
+        for index in 0..5 {
+            messages.push(Message::user(format!("lệnh {index}")));
+            messages.push(Message::assistant_tool_calls(
+                vec![ToolCall {
+                    id: format!("call_{index}"),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "run_command".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                None,
+            ));
+            messages.push(tool_message(&format!("call_{index}"), &"z".repeat(3_500)));
+        }
+
+        let before = compactor.estimate(&messages);
+        assert!(before > 16_000 && before < 20_000, "{before}");
+        let report = compactor.prepare(&mut messages);
+        assert!(report.micro_compacted > 0);
+        assert!(!compactor.needs_summary(&messages));
     }
 
     #[test]

@@ -380,7 +380,11 @@ impl Agent {
                     break;
                 }
                 Err(AgentError::Llm(error)) => {
-                    if is_context_error(&error) && reactive_retries == 0 {
+                    let pressure = self.compactor.estimate(&messages).saturating_mul(2)
+                        >= self.compactor.settings().context_char_limit;
+                    let recoverable =
+                        is_context_error(&error) || (is_invalid_request(&error) && pressure);
+                    if recoverable && reactive_retries == 0 {
                         reactive_retries += 1;
                         if let Some((summary, usage)) = self.summarize(model, &messages).await {
                             add_usage(&mut total_usage, &usage);
@@ -816,6 +820,23 @@ fn is_context_error(error: &LlmError) -> bool {
         || text.contains("maximum context")
 }
 
+/// Nhiều provider trả 400 "Invalid request" chung chung khi request quá lớn
+/// thay vì nói rõ lỗi context. Chỉ coi là tín hiệu context khi request đã
+/// chịu áp lực (xem `run_with`), tránh tóm tắt nhầm khi payload sai thật.
+fn is_invalid_request(error: &LlmError) -> bool {
+    let LlmError::Api { status, body } = error else {
+        return false;
+    };
+    if *status == 413 {
+        return true;
+    }
+    if *status != 400 {
+        return false;
+    }
+    let text = body.to_lowercase();
+    text.contains("invalid request") || text.contains("invalid_request_error")
+}
+
 /// Cắt output tool theo giới hạn byte, không cắt giữa ký tự UTF-8.
 fn cap_output(mut content: String, limit: usize) -> String {
     if content.len() <= limit {
@@ -944,6 +965,80 @@ mod tests {
             status: 500,
             body: "internal error".into()
         }));
+    }
+
+    #[test]
+    fn detects_generic_invalid_request() {
+        assert!(is_invalid_request(&LlmError::Api {
+            status: 400,
+            body: "Invalid request: messages are too large".into()
+        }));
+        assert!(is_invalid_request(&LlmError::Api {
+            status: 413,
+            body: "payload too large".into()
+        }));
+        assert!(!is_invalid_request(&LlmError::Api {
+            status: 401,
+            body: "Invalid request".into()
+        }));
+        assert!(!is_invalid_request(&LlmError::Api {
+            status: 400,
+            body: "missing field model".into()
+        }));
+    }
+
+    struct InvalidRequestProvider {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for InvalidRequestProvider {
+        fn name(&self) -> &str {
+            "invalid-request"
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, LlmError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                1 => Err(LlmError::Api {
+                    status: 400,
+                    body: "Invalid request".into(),
+                }),
+                2 => Ok(ChatResponse::Text {
+                    content: "tóm tắt".into(),
+                    usage: Usage::default(),
+                }),
+                _ => Ok(ChatResponse::Text {
+                    content: "xong".into(),
+                    usage: Usage::default(),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_generic_invalid_request_when_context_is_tight() {
+        let provider = Arc::new(InvalidRequestProvider {
+            calls: Mutex::new(0),
+        });
+        let agent =
+            Agent::new(provider.clone(), ToolRegistry::new()).with_compactor(Compactor::new(
+                CompactSettings {
+                    context_char_limit: 8_000,
+                    large_result_chars: 100_000,
+                    ..CompactSettings::default()
+                },
+                None,
+            ));
+
+        let outcome = agent
+            .run("mock", vec![Message::user("x".repeat(5_000))])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "xong");
+        assert_eq!(*provider.calls.lock().unwrap(), 3);
     }
 
     #[tokio::test]

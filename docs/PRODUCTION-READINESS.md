@@ -22,6 +22,7 @@
 | SEC-02 | P0 | `run_command` đọc được `master.key`/`providers.json` và gửi dữ liệu ra ngoài | Sandbox bubblewrap trên Linux: workspace read-write, data dir/credential trong HOME bị ẩn, network namespace tách mặc định; env con chỉ còn allowlist; fail-closed nếu thiếu `bwrap` | Test `sandbox_hides_app_data_dir`; `tez doctor` hiển thị trạng thái sandbox |
 | SEC-03 | P0 | MCP stdio chạy với quyền user, đọc được secret trong data dir và gửi dữ liệu ra ngoài | Sandbox bubblewrap tùy chọn theo server: ẩn `master.key`/`providers.json`/DB/audit, chặn mạng mặc định, chỉ bind `writable_paths`; thiếu `bwrap` thì từ chối; UI Settings → MCP | Test `sandboxed_demo_server_discovers_tools`, `mcp_command_hides_secrets_and_blocks_network` |
 | EVAL-01 | P1 | Chưa có eval harness/regression | Thêm `tez eval --suite evals/*.json`: case JSON, kiểm tra `contains`/`not_contains`, báo cáo text/JSON, mã thoát khác 0 khi fail; 8 case mẫu; workflow nightly tự bỏ qua nếu thiếu secret | 4 test `tez-cli`; chạy mock 8/8 pass; `tez eval --json` |
+| CTX-02 | P1 | Provider trả `400 Invalid request` chung chung khi context lớn; compaction cũ chỉ chạy khi vượt giới hạn cứng | Hạ mặc định còn 24.000 ký tự; micro-compact ở 80% và nén về 65%; summary ở 90%; nhận diện `400 Invalid request`/`413` khi context đã dùng ≥50% và thử summary một lần | Test `detects_generic_invalid_request`, `retries_generic_invalid_request_when_context_is_tight`; 395 test workspace |
 
 ### Lệnh kiểm chứng
 
@@ -33,7 +34,7 @@ cd apps/desktop && pnpm exec tsc --noEmit && pnpm build
 PATH=/root/.cargo/bin:$PATH cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
-Kết quả local ngày 2026-11-15: fmt sạch, clippy sạch, **392 test pass**, desktop typecheck/build pass, Tauri check pass.
+Kết quả local ngày 2026-11-15: fmt sạch, clippy sạch, **395 test pass**, desktop typecheck/build pass, Tauri check pass.
 
 ## 2. Còn lại trước khi phát hành rộng rãi
 
@@ -58,6 +59,7 @@ Kết quả local ngày 2026-11-15: fmt sạch, clippy sạch, **392 test pass**
 - [x] Log bền vững + panic hook cho desktop/CLI.
 - [x] Sandbox `run_command` trên Linux (bubblewrap, ẩn data dir/credential, chặn mạng mặc định).
 - [x] Sandbox MCP stdio tùy chọn trên Linux (bubblewrap, ẩn secret, chặn mạng mặc định, `writable_paths`).
+- [x] Compaction chạy sớm (24.000 ký tự, micro 80%, summary 90%) và phục hồi `400 Invalid request`/`413` khi context chịu áp lực.
 - [x] Eval harness `tez eval` + 8 case mẫu + workflow nightly (tự bỏ qua nếu thiếu secret).
 - [ ] Sandbox MCP mặc định/non-Linux + `run_command` trên macOS/Windows + network allowlist toàn diện.
 - [ ] Ký số installer và auto-update xác minh chữ ký.

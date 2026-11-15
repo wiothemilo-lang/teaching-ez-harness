@@ -375,7 +375,7 @@ Chạy không cần FUSE:
 - Skill dùng hai tầng: catalog rút gọn theo nguồn trong system prompt và tool `skill` (không tên = danh mục đầy đủ, có tên = body tối đa 12.000 ký tự). Skill vẫn là prompt pack, không chạy code; bốn skill seed nằm trong `skills/` nên hiện nguồn `user`.
 - Code mode giới hạn đường dẫn ở tầng ứng dụng. Trên Linux, `run_command` mặc định chạy trong bubblewrap: workspace được bind read-write, data dir và credential trong HOME bị ẩn, network namespace bị tách (chặn egress) trừ khi bật `sandbox.allow_network`. Cần gói `bubblewrap`; nếu thiếu `bwrap`, lệnh bị từ chối thay vì chạy không sandbox. Trên macOS/Windows sandbox OS chưa có, nên chỉ mở workspace tin cậy.
 - Permission pipeline và hook là lớp kiểm soát của app, không thay thế sandbox hệ điều hành; deny-list chỉ chặn các mẫu phá hủy rõ ràng.
-- Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu).
+- Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu). Mặc định nén sớm ở 24.000 ký tự JSON: micro-compact ở 80%, summary ở 90%, và tự thử summary khi provider trả `400 Invalid request`/`413` lúc context đã chịu áp lực.
 - Cập nhật không tự động cài: người dùng bấm tải rồi chạy installer.
 - Installer Windows có trong workflow release nhưng chưa được ký số (SmartScreen có thể cảnh báo).
 - Chưa có sync đa máy; dữ liệu nằm trên máy bạn.
