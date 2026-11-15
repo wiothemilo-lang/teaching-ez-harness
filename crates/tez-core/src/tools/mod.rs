@@ -89,6 +89,60 @@ pub fn check_input_bounds(input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Thay lời gọi hàm toán học bằng tên `math::...` mà evalexpr hiểu.
+///
+/// Chỉ thay khi tên hàm đứng riêng: `sin(` được thay, `asin(` và
+/// `math::sin(` thì không (tránh `math::amath::sin`).
+pub(crate) fn normalize_math_functions(expression: &str) -> String {
+    const FUNCTIONS: &[(&str, &str)] = &[
+        ("sqrt", "math::sqrt"),
+        ("cbrt", "math::cbrt"),
+        ("asin", "math::asin"),
+        ("acos", "math::acos"),
+        ("atan", "math::atan"),
+        ("sinh", "math::sinh"),
+        ("cosh", "math::cosh"),
+        ("tanh", "math::tanh"),
+        ("sin", "math::sin"),
+        ("cos", "math::cos"),
+        ("tan", "math::tan"),
+        ("exp", "math::exp"),
+        ("abs", "math::abs"),
+        ("floor", "math::floor"),
+        ("ceil", "math::ceil"),
+        ("round", "math::round"),
+        ("ln", "math::ln"),
+        ("log", "math::log10"),
+    ];
+    let mut result = expression.to_string();
+    for (name, replacement) in FUNCTIONS {
+        result = replace_function_call(&result, name, replacement);
+    }
+    result
+}
+
+fn replace_function_call(input: &str, name: &str, replacement: &str) -> String {
+    let needle = format!("{name}(");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(position) = rest.find(&needle) {
+        let previous = rest[..position].chars().last();
+        let boundary = previous
+            .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+            .unwrap_or(true);
+        out.push_str(&rest[..position]);
+        if boundary {
+            out.push_str(replacement);
+            out.push('(');
+        } else {
+            out.push_str(&needle);
+        }
+        rest = &rest[position + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,

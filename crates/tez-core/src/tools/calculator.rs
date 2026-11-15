@@ -33,10 +33,24 @@ impl Tool for Calculator {
             .get("expression")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'expression'".into()))?;
+        let expression = expression.trim();
+        if expression.is_empty() {
+            return Ok(ToolOutput::error("biểu thức rỗng".to_string()));
+        }
         super::check_input_bounds(expression).map_err(ToolError::InvalidArgs)?;
 
-        match evalexpr::eval(expression) {
-            Ok(value) => Ok(ToolOutput::ok(value.to_string())),
+        let normalized = super::normalize_math_functions(expression);
+        match evalexpr::eval(&normalized) {
+            Ok(value) => {
+                if let Ok(number) = value.as_number() {
+                    if !number.is_finite() {
+                        return Ok(ToolOutput::error(
+                            "kết quả không hữu hạn (chia cho 0 hoặc tràn số)".to_string(),
+                        ));
+                    }
+                }
+                Ok(ToolOutput::ok(value.to_string()))
+            }
             Err(error) => Ok(ToolOutput::error(format!("không tính được: {error}"))),
         }
     }
@@ -62,6 +76,31 @@ mod tests {
         let tool = Calculator;
         let out = tool.execute(json!({"expression": "2 +"})).await.unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn accepts_plain_math_names() {
+        let tool = Calculator;
+        let out = tool
+            .execute(json!({"expression": "sqrt(16)"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "4");
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_and_non_finite_results() {
+        let tool = Calculator;
+        let empty = tool.execute(json!({"expression": "   "})).await.unwrap();
+        assert!(empty.is_error);
+        for expression in ["1/0.0", "1e308*10"] {
+            let out = tool
+                .execute(json!({"expression": expression}))
+                .await
+                .unwrap();
+            assert!(out.is_error, "{expression} -> {}", out.content);
+        }
     }
 
     #[tokio::test]

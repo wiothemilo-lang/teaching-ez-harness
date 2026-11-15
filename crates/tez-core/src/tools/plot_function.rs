@@ -7,23 +7,9 @@ use tez_llm::ToolSpec;
 
 use super::{Tool, ToolError, ToolOutput};
 
-/// Chuẩn hóa tên hàm cho thân thiện với học sinh:
-/// `sqrt(x)` → `math::sqrt(x)`, `log(x)` → `math::log10(x)`.
+/// Chuẩn hóa tên hàm cho thân thiện với học sinh, dùng chung với calculator.
 fn normalize_expression(expression: &str) -> String {
-    let mut result = expression.to_string();
-    for name in [
-        "sqrt", "cbrt", "asin", "acos", "atan", "sinh", "cosh", "tanh", "sin", "cos", "tan", "exp",
-        "abs", "floor", "ceil", "round",
-    ] {
-        result = result.replace(&format!("{name}("), &format!("math::{name}("));
-    }
-    result = result.replace("ln(", "math::ln(");
-    result = result.replace("log(", "math::log10(");
-    // Tránh trường hợp người dùng đã viết math::sqrt( bị nhân đôi.
-    while result.contains("math::math::") {
-        result = result.replace("math::math::", "math::");
-    }
-    result
+    super::normalize_math_functions(expression)
 }
 
 fn percentile(sorted: &[f64], fraction: f64) -> f64 {
@@ -220,6 +206,16 @@ mod tests {
     async fn normalizes_sqrt() {
         assert_eq!(normalize_expression("sqrt(x)"), "math::sqrt(x)");
         assert_eq!(normalize_expression("math::sqrt(x)"), "math::sqrt(x)");
+    }
+
+    #[test]
+    fn does_not_corrupt_asin_or_prefixed_names() {
+        assert_eq!(normalize_expression("asin(x)"), "math::asin(x)");
+        assert_eq!(normalize_expression("math::asin(x)"), "math::asin(x)");
+        assert_eq!(
+            normalize_expression("sin(x) + asin(x)"),
+            "math::sin(x) + math::asin(x)"
+        );
     }
 
     #[tokio::test]
