@@ -70,7 +70,7 @@ pub const MAX_NESTING_DEPTH: usize = 64;
 
 /// Chặn input quá dài hoặc lồng ngoặc quá sâu trước khi đưa vào parser đệ quy.
 pub fn check_input_bounds(input: &str) -> Result<(), String> {
-    if input.len() > MAX_INPUT_LEN {
+    if input.chars().count() > MAX_INPUT_LEN {
         return Err(format!("đầu vào quá dài (tối đa {MAX_INPUT_LEN} ký tự)"));
     }
     let mut depth = 0usize;
@@ -258,5 +258,13 @@ mod tests {
     fn rejects_overlong_input() {
         let long = "1+".repeat(MAX_INPUT_LEN);
         assert!(check_input_bounds(&long).is_err());
+    }
+
+    #[test]
+    fn input_limit_counts_characters_not_bytes() {
+        let at_limit = "ế".repeat(MAX_INPUT_LEN);
+        assert!(check_input_bounds(&at_limit).is_ok());
+        let too_long = "ế".repeat(MAX_INPUT_LEN + 1);
+        assert!(check_input_bounds(&too_long).is_err());
     }
 }

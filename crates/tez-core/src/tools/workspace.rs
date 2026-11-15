@@ -4,13 +4,15 @@
 //! phải sandbox của hệ điều hành: người dùng vẫn nên chạy tez bằng tài khoản
 //! không có quyền cao.
 
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tez_llm::ToolSpec;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::{Tool, ToolError, ToolOutput};
 
@@ -18,6 +20,9 @@ const MAX_READ_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_ENTRIES: usize = 300;
+const MAX_WALK_ENTRIES: usize = 50_000;
+const MAX_GLOB_MATCHES: usize = 10_000;
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 /// Thư mục làm việc đã chuẩn hóa, dùng chung cho các tool Code.
 #[derive(Debug, Clone)]
@@ -175,6 +180,130 @@ fn cap_text(text: &mut String) {
     text.push_str("\n… (đã cắt bớt output)");
 }
 
+/// Mở và đọc file text, chỉ chấp nhận file thường.
+///
+/// `O_NONBLOCK` quan trọng trên Unix: nếu đường dẫn bị đổi thành FIFO giữa
+/// lúc kiểm tra và lúc mở, `open` vẫn trả về ngay thay vì treo worker.
+async fn read_regular_text(path: &Path, max_bytes: u64) -> Result<String, String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .await
+        .map_err(|error| format!("không đọc được file: {error}"))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| format!("không đọc được file: {error}"))?;
+    if metadata.is_dir() {
+        return Err("đây là thư mục; dùng list_files để xem nội dung".to_string());
+    }
+    if !metadata.is_file() {
+        return Err("đây không phải file thường (FIFO/device/socket); từ chối đọc".to_string());
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "file quá lớn ({} byte, giới hạn {} byte)",
+            metadata.len(),
+            max_bytes
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("không đọc được file: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("file quá lớn (giới hạn {} byte)", max_bytes));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("không đọc được file dạng text: {error}"))
+}
+
+/// Bản sync của [`read_regular_text`] cho grep (chạy trên blocking pool).
+fn read_regular_text_sync(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Ghi file qua temp cùng thư mục rồi rename: không bao giờ truncate file gốc.
+async fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let temp = parent.join(format!(
+        ".{file_name}.tez-tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let permissions = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|metadata| metadata.permissions());
+
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await
+            .map_err(|error| format!("không tạo được file tạm: {error}"))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)
+                .await
+                .map_err(|error| format!("không đặt được quyền file tạm: {error}"))?;
+        }
+        file.write_all(content.as_bytes())
+            .await
+            .map_err(|error| format!("không ghi được file: {error}"))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("không đồng bộ được file: {error}"))?;
+        drop(file);
+        tokio::fs::rename(&temp, path)
+            .await
+            .map_err(|error| format!("không thay được file: {error}"))
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    result
+}
+
+fn ensure_unchanged(before: &str, current: &str) -> Result<(), &'static str> {
+    if before == current {
+        Ok(())
+    } else {
+        Err("file đã thay đổi trong lúc sửa; hãy đọc lại file rồi thử lại")
+    }
+}
+
 /// Đọc nội dung file dạng text.
 pub struct ReadFile {
     workspace: Workspace,
@@ -207,66 +336,44 @@ impl Tool for ReadFile {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let path = self.workspace.resolve(required_str(&args, "path")?)?;
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => return Ok(ToolOutput::error(format!("không đọc được file: {error}"))),
+        let content = match read_regular_text(&path, MAX_READ_BYTES).await {
+            Ok(content) => content,
+            Err(error) => return Ok(ToolOutput::error(error)),
         };
-        if metadata.is_dir() {
-            return Ok(ToolOutput::error(
-                "đây là thư mục; dùng list_files để xem nội dung",
-            ));
-        }
-        // FIFO/device/socket: đọc sẽ treo vô hạn và giữ runtime không thoát được.
-        if !metadata.is_file() {
-            return Ok(ToolOutput::error(
-                "đây không phải file thường (FIFO/device/socket); từ chối đọc",
-            ));
-        }
-        if metadata.len() > MAX_READ_BYTES {
-            return Ok(ToolOutput::error(format!(
-                "file quá lớn ({} byte, giới hạn {} byte)",
-                metadata.len(),
-                MAX_READ_BYTES
-            )));
+
+        let offset = args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1);
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(1, 2_000) as usize);
+        if offset == 1 && limit.is_none() {
+            return Ok(ToolOutput::ok(content));
         }
 
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => {
-                let offset = args
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|value| value.clamp(1, 2_000) as usize);
-                if offset == 1 && limit.is_none() {
-                    return Ok(ToolOutput::ok(content));
-                }
-                let lines: Vec<&str> = content.lines().collect();
-                if offset > lines.len() && !lines.is_empty() {
-                    return Ok(ToolOutput::error(format!(
-                        "offset {offset} vượt quá số dòng ({})",
-                        lines.len()
-                    )));
-                }
-                let end = limit
-                    .map(|limit| (offset - 1 + limit).min(lines.len()))
-                    .unwrap_or(lines.len());
-                let slice = lines
-                    .get(offset.saturating_sub(1)..end)
-                    .unwrap_or_default()
-                    .join("\n");
-                Ok(ToolOutput::ok(format!(
-                    "[dòng {offset}-{end}/{}]\n{slice}",
-                    lines.len()
-                )))
-            }
-            Err(error) => Ok(ToolOutput::error(format!(
-                "không đọc được file dạng text: {error}"
-            ))),
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return Ok(ToolOutput::ok("[file rỗng]"));
         }
+        if offset > lines.len() {
+            return Ok(ToolOutput::error(format!(
+                "offset {offset} vượt quá số dòng ({})",
+                lines.len()
+            )));
+        }
+        let start = offset.saturating_sub(1);
+        let end = limit
+            .map(|limit| start.saturating_add(limit).min(lines.len()))
+            .unwrap_or(lines.len());
+        let slice = lines.get(start..end).unwrap_or_default().join("\n");
+        Ok(ToolOutput::ok(format!(
+            "[dòng {offset}-{end}/{}]\n{slice}",
+            lines.len()
+        )))
     }
 }
 
@@ -313,13 +420,31 @@ impl Tool for WriteFile {
             })?;
         }
 
-        match tokio::fs::write(&path, content).await {
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                return Ok(ToolOutput::error("đây là thư mục; không thể ghi file"))
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Ok(ToolOutput::error(
+                    "đường dẫn không phải file thường (FIFO/device/socket); từ chối ghi",
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Ok(ToolOutput::error(format!(
+                    "không kiểm tra được file: {error}"
+                )))
+            }
+        }
+
+        match write_atomic(&path, content).await {
             Ok(()) => Ok(ToolOutput::ok(format!(
                 "đã ghi {} byte vào {}",
                 content.len(),
                 self.workspace.display(&path)
             ))),
-            Err(error) => Ok(ToolOutput::error(format!("không ghi được file: {error}"))),
+            Err(error) => Ok(ToolOutput::error(error)),
         }
     }
 }
@@ -368,25 +493,9 @@ impl Tool for EditFile {
         if old_string.is_empty() {
             return Ok(ToolOutput::error("old_string không được rỗng"));
         }
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => return Ok(ToolOutput::error(format!("không đọc được file: {error}"))),
-        };
-        if metadata.len() > MAX_READ_BYTES {
-            return Ok(ToolOutput::error(format!(
-                "file quá lớn để sửa an toàn ({} byte, giới hạn {} byte)",
-                metadata.len(),
-                MAX_READ_BYTES
-            )));
-        }
-
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match read_regular_text(&path, MAX_READ_BYTES).await {
             Ok(content) => content,
-            Err(error) => {
-                return Ok(ToolOutput::error(format!(
-                    "không đọc được file dạng text: {error}"
-                )))
-            }
+            Err(error) => return Ok(ToolOutput::error(error)),
         };
         let count = content.matches(old_string).count();
         if count == 0 {
@@ -405,12 +514,21 @@ impl Tool for EditFile {
         } else {
             content.replacen(old_string, new_string, 1)
         };
-        match tokio::fs::write(&path, updated).await {
+        // Đọc lại trước khi thay: nếu file đã đổi trong lúc ta tính toán,
+        // không được ghi đè thay đổi của người khác.
+        let current = match read_regular_text(&path, MAX_READ_BYTES).await {
+            Ok(current) => current,
+            Err(error) => return Ok(ToolOutput::error(error)),
+        };
+        if let Err(message) = ensure_unchanged(&content, &current) {
+            return Ok(ToolOutput::error(message));
+        }
+        match write_atomic(&path, &updated).await {
             Ok(()) => Ok(ToolOutput::ok(format!(
                 "đã thay {count} lần trong {}",
                 self.workspace.display(&path)
             ))),
-            Err(error) => Ok(ToolOutput::error(format!("không ghi được file: {error}"))),
+            Err(error) => Ok(ToolOutput::error(error)),
         }
     }
 }
@@ -557,34 +675,50 @@ impl Tool for GlobFiles {
             .unwrap_or(200)
             .clamp(1, 300) as usize;
 
-        let mut files = Vec::new();
-        walk_files(&base, 0, &mut files);
-        let mut matches: Vec<String> = files
-            .into_iter()
-            .filter_map(|path| {
-                let rel = path
-                    .strip_prefix(self.workspace.root())
-                    .ok()?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let file_name = path.file_name()?.to_string_lossy();
-                (pattern.matches(&rel) || pattern.matches(file_name.as_ref())).then_some(rel)
-            })
-            .collect();
+        // So khớp ngay trong lúc duyệt, không cắt 5000 file trước rồi mới
+        // match (file khớp có thể nằm sau mốc cắt).
+        let mut state = WalkState::default();
+        let mut matches = Vec::new();
+        let mut match_cap_hit = false;
+        walk_files(&base, 0, &mut state, &mut |path| {
+            let Some(rel) = path.strip_prefix(self.workspace.root()).ok() else {
+                return true;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let Some(file_name) = path.file_name().map(|name| name.to_string_lossy()) else {
+                return true;
+            };
+            if pattern.matches(&rel) || pattern.matches(file_name.as_ref()) {
+                matches.push(rel);
+                if matches.len() >= MAX_GLOB_MATCHES {
+                    match_cap_hit = true;
+                    return false;
+                }
+            }
+            true
+        });
         matches.sort();
         matches.dedup();
         if matches.is_empty() {
-            return Ok(ToolOutput::ok("(không có file khớp)"));
+            let mut text = "(không có file khớp)".to_string();
+            append_walk_truncation(&mut text, state.truncated);
+            return Ok(ToolOutput::ok(text));
         }
         let total = matches.len();
         matches.truncate(limit);
         let mut text = matches.join("\n");
         if total > limit {
             text.push_str(&format!(
-                "\n… (còn {} file, tăng limit để xem thêm)",
+                "\n… (còn {} file khớp, tăng limit để xem thêm)",
                 total - limit
             ));
         }
+        if match_cap_hit {
+            text.push_str(&format!(
+                "\n… (đã dừng sau {MAX_GLOB_MATCHES} file khớp; kết quả có thể chưa đầy đủ)"
+            ));
+        }
+        append_walk_truncation(&mut text, state.truncated);
         cap_text(&mut text);
         Ok(ToolOutput::ok(text))
     }
@@ -650,13 +784,22 @@ impl Tool for GrepFiles {
         let base = self
             .workspace
             .resolve(optional_str(&args, "path").unwrap_or("."))?;
+        let mut state = WalkState::default();
         let mut files = Vec::new();
-        if base.is_file() {
-            files.push(base);
-        } else if base.is_dir() {
-            walk_files(&base, 0, &mut files);
-        } else {
-            return Ok(ToolOutput::error("path không tồn tại"));
+        match std::fs::metadata(&base) {
+            Ok(metadata) if metadata.is_file() => files.push(base),
+            Ok(metadata) if metadata.is_dir() => {
+                walk_files(&base, 0, &mut state, &mut |path| {
+                    files.push(path.to_path_buf());
+                    true
+                });
+            }
+            Ok(_) => {
+                return Ok(ToolOutput::error(
+                    "path không phải file thường (FIFO/device/socket)",
+                ))
+            }
+            Err(_) => return Ok(ToolOutput::error("path không tồn tại")),
         }
 
         let mut lines = Vec::new();
@@ -680,13 +823,7 @@ impl Tool for GrepFiles {
                     continue;
                 }
             }
-            let Ok(metadata) = std::fs::metadata(&file) else {
-                continue;
-            };
-            if metadata.len() > 512 * 1024 {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&file) else {
+            let Some(content) = read_regular_text_sync(&file, 512 * 1024) else {
                 continue;
             };
             for (index, line) in content.lines().enumerate() {
@@ -704,17 +841,31 @@ impl Tool for GrepFiles {
         }
 
         if lines.is_empty() {
-            return Ok(ToolOutput::ok("(không có dòng khớp)"));
+            let mut text = "(không có dòng khớp)".to_string();
+            append_walk_truncation(&mut text, state.truncated);
+            return Ok(ToolOutput::ok(text));
         }
         let mut text = lines.join("\n");
+        append_walk_truncation(&mut text, state.truncated);
         cap_text(&mut text);
         Ok(ToolOutput::ok(text))
     }
 }
 
-/// Duyệt file text trong thư mục, bỏ thư mục build và giới hạn số lượng.
-fn walk_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 12 || out.len() >= 5_000 {
+#[derive(Default)]
+struct WalkState {
+    visited: usize,
+    truncated: bool,
+    stopped: bool,
+}
+
+/// Duyệt file trong thư mục, bỏ thư mục build và gọi visitor cho từng file.
+/// Visitor trả `false` để dừng sớm (ví dụ đã đủ số match).
+fn walk_files<F>(dir: &Path, depth: usize, state: &mut WalkState, visit: &mut F)
+where
+    F: FnMut(&Path) -> bool,
+{
+    if depth > 12 || state.truncated || state.stopped {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -723,7 +874,7 @@ fn walk_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let mut items: Vec<_> = entries.filter_map(Result::ok).collect();
     items.sort_by_key(|entry| entry.file_name());
     for entry in items {
-        if out.len() >= 5_000 {
+        if state.truncated || state.stopped {
             return;
         }
         let path = entry.path();
@@ -742,10 +893,26 @@ fn walk_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             ) {
                 continue;
             }
-            walk_files(&path, depth + 1, out);
+            walk_files(&path, depth + 1, state, visit);
         } else {
-            out.push(path);
+            if state.visited >= MAX_WALK_ENTRIES {
+                state.truncated = true;
+                return;
+            }
+            state.visited += 1;
+            if !visit(&path) {
+                state.stopped = true;
+                return;
+            }
         }
+    }
+}
+
+fn append_walk_truncation(text: &mut String, truncated: bool) {
+    if truncated {
+        text.push_str(&format!(
+            "\n… (đã quét tối đa {MAX_WALK_ENTRIES} file; kết quả có thể chưa đầy đủ)"
+        ));
     }
 }
 
@@ -845,17 +1012,18 @@ impl Tool for RunCommand {
 
         match result {
             Ok(Ok(status)) => {
-                let (stdout, stdout_total) = match join_reader(stdout_task).await {
-                    Some(value) => value,
-                    None => {
-                        // Process cháu giữ pipe: dừng cả cây để không rò rỉ task/process.
-                        if let Some(pid) = pid {
-                            kill_process_tree(pid);
-                        }
-                        (String::new(), 0)
+                // Đọc stdout/stderr song song. Process cháu có thể giữ một
+                // trong hai pipe mở; nếu một reader timeout thì phải dừng cả
+                // cây lệnh, không chỉ bỏ qua reader đó.
+                let (stdout_result, stderr_result) =
+                    tokio::join!(join_reader(stdout_task), join_reader(stderr_task));
+                if stdout_result.is_none() || stderr_result.is_none() {
+                    if let Some(pid) = pid {
+                        kill_process_tree(pid);
                     }
-                };
-                let (stderr, stderr_total) = join_reader(stderr_task).await.unwrap_or_default();
+                }
+                let (stdout, stdout_total) = stdout_result.unwrap_or_default();
+                let (stderr, stderr_total) = stderr_result.unwrap_or_default();
                 let mut text = format!("exit code: {}", status.code().unwrap_or(-1));
                 if stdout_total > stdout.len() {
                     text.push_str(&format!(
@@ -1027,6 +1195,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("không chạy được mkfifo");
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn blocks_write_through_dangling_symlink() {
         let dir = tempfile::tempdir().unwrap();
@@ -1164,5 +1341,222 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(8),
             "timeout phải dừng cả cây lệnh, không chờ sleep 30"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_reader_timeout_kills_background_child() {
+        let (dir, workspace) = workspace();
+        let command = RunCommand::new(workspace);
+        let output = command
+            .execute(json!({
+                "command": "(sleep 3; echo alive > marker) 1>/dev/null & echo $! > child.pid",
+                "timeout_secs": 10
+            }))
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(dir.path().join("child.pid").exists());
+
+        // Reader stderr timeout sau 2s; process con chỉ ghi marker ở giây thứ 3.
+        // Chờ dư 1s để không đua với lúc process con thức dậy.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !dir.path().join("marker").exists(),
+            "process con giữ stderr phải bị kill, không được sống tới lúc ghi marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_rejects_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let (dir, workspace) = workspace();
+        let fifo = dir.path().join("pipe");
+        make_fifo(&fifo);
+
+        let write = WriteFile::new(workspace);
+        let output = write
+            .execute(json!({"path": "pipe", "content": "x"}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("file thường"), "{}", output.content);
+        assert!(std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edit_file_rejects_fifo_without_blocking() {
+        let (dir, workspace) = workspace();
+        let fifo = dir.path().join("pipe");
+        make_fifo(&fifo);
+        // Giữ một đầu O_RDWR để nếu guard bị bỏ, reader mở được FIFO rồi
+        // block thay vì treo ở open().
+        let keep_open = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+
+        let edit = EditFile::new(workspace);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            edit.execute(json!({"path": "pipe", "old_string": "a", "new_string": "b"})),
+        )
+        .await;
+        drop(keep_open);
+
+        let output = result.expect("edit_file không được mở FIFO").unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("file thường"), "{}", output.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grep_skips_fifo_without_blocking() {
+        let (dir, workspace) = workspace();
+        let fifo = dir.path().join("pipe");
+        make_fifo(&fifo);
+        let keep_open = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+
+        let grep = GrepFiles::new(workspace);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            grep.execute(json!({"pattern": "MATCH"})),
+        )
+        .await;
+        drop(keep_open);
+
+        let output = result.expect("grep không được mở FIFO").unwrap();
+        assert_eq!(output.content, "(không có dòng khớp)");
+    }
+
+    #[tokio::test]
+    async fn write_file_replaces_content_and_leaves_no_temp_files() {
+        let (dir, workspace) = workspace();
+        let write = WriteFile::new(workspace);
+        write
+            .execute(json!({"path": "a.txt", "content": "one"}))
+            .await
+            .unwrap();
+        write
+            .execute(json!({"path": "a.txt", "content": "two"}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "two"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains("tez-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "còn file tạm: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, workspace) = workspace();
+        let path = dir.path().join("script.sh");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let write = WriteFile::new(workspace);
+        write
+            .execute(json!({"path": "script.sh", "content": "new"}))
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn edit_verification_detects_concurrent_change() {
+        assert!(ensure_unchanged("same", "same").is_ok());
+        assert!(ensure_unchanged("before", "after").is_err());
+    }
+
+    #[tokio::test]
+    async fn glob_matches_files_beyond_old_walk_cap() {
+        let (dir, workspace) = workspace();
+        for index in 0..5_005 {
+            std::fs::write(dir.path().join(format!("f{index:05}.txt")), "").unwrap();
+        }
+        std::fs::write(dir.path().join("zzz-target.rs"), "").unwrap();
+
+        let glob = GlobFiles::new(workspace);
+        let output = glob
+            .execute(json!({"pattern": "*.rs", "limit": 10}))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(
+            output.content.contains("zzz-target.rs"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_reports_result_truncation() {
+        let (dir, workspace) = workspace();
+        for index in 0..350 {
+            std::fs::write(dir.path().join(format!("f{index:05}.txt")), "").unwrap();
+        }
+
+        let glob = GlobFiles::new(workspace);
+        let output = glob
+            .execute(json!({"pattern": "*.txt", "limit": 300}))
+            .await
+            .unwrap();
+        assert!(
+            output.content.contains("còn 50 file khớp"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_handles_empty_file_with_huge_offset() {
+        let (_dir, workspace) = workspace();
+        std::fs::write(workspace.root().join("empty.txt"), "").unwrap();
+
+        let read = ReadFile::new(workspace);
+        let output = read
+            .execute(json!({"path": "empty.txt", "offset": u64::MAX, "limit": 2000}))
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("rỗng"), "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_offset_past_end() {
+        let (_dir, workspace) = workspace();
+        std::fs::write(workspace.root().join("one.txt"), "one\n").unwrap();
+
+        let read = ReadFile::new(workspace);
+        let output = read
+            .execute(json!({"path": "one.txt", "offset": u64::MAX}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("vượt quá số dòng"));
     }
 }

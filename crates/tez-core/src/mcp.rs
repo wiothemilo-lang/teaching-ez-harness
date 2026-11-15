@@ -648,6 +648,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_read_only_hint() {
+        let tools = parse_tools(&json!({
+            "tools": [
+                {"name": "read", "annotations": {"readOnlyHint": true}},
+                {"name": "write", "annotations": {"readOnlyHint": false}},
+                {"name": "legacy", "readOnly": true},
+                {"name": "plain"}
+            ]
+        }));
+        assert_eq!(tools.len(), 4);
+        assert!(tools[0].read_only);
+        assert!(!tools[1].read_only);
+        assert!(tools[2].read_only);
+        assert!(!tools[3].read_only);
+    }
+
+    #[test]
     fn parses_text_and_error_results() {
         let ok = parse_call_result(&json!({
             "content": [{"type": "text", "text": "hello"}],
