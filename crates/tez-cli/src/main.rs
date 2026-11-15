@@ -1,7 +1,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -11,7 +11,7 @@ use dialoguer::{Confirm, Password};
 use directories::ProjectDirs;
 use serde_json::Value;
 use tez_auth::connection;
-use tez_auth::providers::{self, ProviderBook, ProviderInput};
+use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
 use tez_auth::Vault;
 use tez_core::agent::{Agent, AgentConfig, RunContext};
 use tez_core::compaction::{session_artifact_dir, CompactSettings, Compactor};
@@ -166,8 +166,8 @@ struct ChatArgs {
     #[arg(long, default_value = "general")]
     subject: String,
     /// Chế độ: chat (mặc định), plan hoặc code.
-    #[arg(long, default_value = "chat")]
-    mode: String,
+    #[arg(long)]
+    mode: Option<String>,
     /// Thư mục làm việc cho chế độ plan/code (mặc định: thư mục hiện tại).
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -281,10 +281,14 @@ enum ToolsCommand {
     },
 }
 
-fn data_dir() -> anyhow::Result<PathBuf> {
+fn data_dir_path() -> anyhow::Result<PathBuf> {
     let dirs = ProjectDirs::from("dev", "teaching-ez", "teaching-ez")
         .ok_or_else(|| anyhow::anyhow!("không xác định được thư mục dữ liệu"))?;
-    let dir = dirs.data_dir().to_path_buf();
+    Ok(dirs.data_dir().to_path_buf())
+}
+
+fn data_dir() -> anyhow::Result<PathBuf> {
+    let dir = data_dir_path()?;
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -390,15 +394,104 @@ fn resolve_subject(input: &str) -> anyhow::Result<&'static SubjectPack> {
     })
 }
 
+fn parse_mode(value: &str) -> anyhow::Result<Mode> {
+    Mode::try_parse(value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "chế độ '{}' không hợp lệ. Chọn: chat, code, plan",
+            value.trim()
+        )
+    })
+}
+
+fn parse_permission_mode(value: &str) -> anyhow::Result<PermissionMode> {
+    match value.trim().to_lowercase().as_str() {
+        "readonly" | "read_only" | "read-only" => Ok(PermissionMode::ReadOnly),
+        "strict" => Ok(PermissionMode::Strict),
+        "standard" => Ok(PermissionMode::Standard),
+        "trust" | "trusted" => Ok(PermissionMode::Trust),
+        _ => anyhow::bail!(
+            "permission '{}' không hợp lệ. Chọn: read_only, strict, standard, trust",
+            value.trim()
+        ),
+    }
+}
+
+/// `LIMIT` của SQLite nhận số nguyên có dấu; chặn 0 và giá trị vượt i64.
+fn validate_limit(limit: usize) -> anyhow::Result<usize> {
+    if limit == 0 {
+        anyhow::bail!("--limit phải lớn hơn 0.");
+    }
+    if i64::try_from(limit).is_err() {
+        anyhow::bail!("--limit quá lớn (tối đa {}).", i64::MAX);
+    }
+    Ok(limit)
+}
+
+/// Bỏ mã ANSI/OSC và ký tự điều khiển để nội dung từ DB không phá terminal.
+fn sanitize_terminal_text(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if used >= max_chars {
+            break;
+        }
+        match ch {
+            '\x1b' => match chars.next() {
+                // OSC: ESC ] ... BEL hoặc ST (ESC \).
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // CSI: ESC [ tham số/intermediate ... byte kết thúc 0x40..=0x7e.
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // Các chuỗi ESC khác: bỏ tới byte kết thúc 0x40..=0x7e.
+                Some(next) if !('\x40'..='\x7e').contains(&next) => {
+                    for next in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\r' | '\t' => {
+                out.push(' ');
+                used += 1;
+            }
+            ch if ch.is_control() => {}
+            ch => {
+                out.push(ch);
+                used += 1;
+            }
+        }
+    }
+    out
+}
+
 async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
     let provider = args.provider.trim().to_lowercase();
     connection::validate_provider(&provider)?;
+    // `None` giữ key đã lưu; `Some("")` mới là chủ ý xóa key (custom/ollama).
     let api_key = match args.api_key {
-        Some(key) => key,
-        None if !connection::requires_api_key(&provider) => String::new(),
+        Some(key) => Some(key.trim().to_string()),
+        None if !connection::requires_api_key(&provider) => None,
         None => {
-            if let Some(key) = env_api_key(&provider) {
+            let key = if let Some(key) = env_api_key(&provider) {
                 key
             } else if std::io::stdin().is_terminal() {
                 Password::new()
@@ -409,10 +502,10 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                     "Thiếu API key cho {provider} và không có terminal để nhập ẩn. \
                      Dùng --api-key hoặc đặt biến môi trường (vd GROQ_API_KEY)."
                 )
-            }
+            };
+            Some(key.trim().to_string())
         }
     };
-    let api_key = api_key.trim().to_string();
     if let Some(url) = args.base_url.as_deref() {
         let url = url.trim();
         if url.starts_with("http://") {
@@ -431,11 +524,13 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             }
         }
     }
-    if connection::requires_api_key(&provider) && api_key.is_empty() {
-        anyhow::bail!(
-            "API key rỗng cho {provider}. Nhập key thật, hoặc dùng --provider ollama/custom \
-             nếu endpoint không cần key."
-        );
+    if let Some(key) = api_key.as_deref() {
+        if connection::requires_api_key(&provider) && key.is_empty() {
+            anyhow::bail!(
+                "API key rỗng cho {provider}. Nhập key thật, hoặc dùng --provider ollama/custom \
+                 nếu endpoint không cần key."
+            );
+        }
     }
 
     // Cùng một loại provider thì cập nhật entry cũ thay vì thêm trùng.
@@ -452,7 +547,7 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             provider: &provider,
             base_url: args.base_url.as_deref(),
             model: args.model.as_deref(),
-            api_key: Some(&api_key),
+            api_key: api_key.as_deref(),
             set_active: true,
         },
     )?;
@@ -632,15 +727,29 @@ fn mcp_list() -> anyhow::Result<()> {
 async fn mcp_test(name: Option<String>) -> anyhow::Result<()> {
     let dir = data_dir()?;
     let servers = mcp::load_servers(&dir)?;
-    let selected: Vec<_> = servers
-        .into_iter()
-        .filter(|entry| entry.config.enabled)
-        .filter(|entry| name.as_deref().is_none_or(|value| entry.name == value))
-        .collect();
+    let selected: Vec<_> = if let Some(name) = name.as_deref() {
+        let entry = servers
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| anyhow::anyhow!("không tìm thấy MCP server '{name}'"))?;
+        if !entry.config.enabled {
+            anyhow::bail!(
+                "MCP server '{name}' đang tắt. Bật trong {} rồi thử lại.",
+                mcp::config_path(&dir).display()
+            );
+        }
+        vec![entry]
+    } else {
+        servers
+            .into_iter()
+            .filter(|entry| entry.config.enabled)
+            .collect()
+    };
     if selected.is_empty() {
         println!("Không có MCP server phù hợp.");
         return Ok(());
     }
+    let mut failures = 0usize;
     for entry in selected {
         match mcp::McpClient::connect(&entry.name, &entry.config).await {
             Ok((_client, tools)) => {
@@ -649,8 +758,14 @@ async fn mcp_test(name: Option<String>) -> anyhow::Result<()> {
                     println!("  - {}: {}", tool.name, tool.description);
                 }
             }
-            Err(error) => println!("{}: LỖI · {error}", entry.name),
+            Err(error) => {
+                failures += 1;
+                eprintln!("{}: LỖI · {error}", entry.name);
+            }
         }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} MCP server lỗi.");
     }
     Ok(())
 }
@@ -686,71 +801,145 @@ struct ResolvedConnection {
     api_key: String,
 }
 
+struct ProviderChoice<'a> {
+    entry: Option<&'a ProviderEntry>,
+    kind: String,
+}
+
+fn find_saved_provider<'a>(book: &'a ProviderBook, requested: &str) -> Option<&'a ProviderEntry> {
+    book.find(requested)
+        .or_else(|| {
+            book.providers
+                .iter()
+                .find(|entry| entry.id.eq_ignore_ascii_case(requested))
+        })
+        .or_else(|| {
+            book.providers
+                .iter()
+                .find(|entry| entry.provider.eq_ignore_ascii_case(requested))
+        })
+}
+
+/// Chọn provider theo `--provider`: id đã lưu trước, rồi tới loại đã biết.
+///
+/// `--provider` không bao giờ rơi về provider đang dùng: nếu không khớp id/loại
+/// nào và không phải loại hỗ trợ sẵn thì báo lỗi ngay.
+fn resolve_provider_choice<'a>(
+    book: &'a ProviderBook,
+    requested: Option<&str>,
+) -> anyhow::Result<ProviderChoice<'a>> {
+    match requested {
+        Some(raw) => {
+            let requested = raw.trim().to_lowercase();
+            if requested.is_empty() {
+                anyhow::bail!("--provider không được để trống.");
+            }
+            if let Some(entry) = find_saved_provider(book, &requested) {
+                return Ok(ProviderChoice {
+                    entry: Some(entry),
+                    kind: entry.provider.to_lowercase(),
+                });
+            }
+            connection::validate_provider(&requested)?;
+            Ok(ProviderChoice {
+                entry: None,
+                kind: requested,
+            })
+        }
+        None => Ok(match book.active() {
+            Some(entry) => ProviderChoice {
+                entry: Some(entry),
+                kind: entry.provider.to_lowercase(),
+            },
+            None => ProviderChoice {
+                entry: None,
+                kind: "groq".to_string(),
+            },
+        }),
+    }
+}
+
+/// Key hiệu lực: cờ CLI > key đã lưu > biến môi trường của provider.
+///
+/// Key đã lưu rỗng (provider cũ) vẫn được fallback sang env như `tez test`.
+fn effective_api_key(
+    explicit: Option<&str>,
+    stored: Option<&str>,
+    env: Option<String>,
+    provider_id: &str,
+) -> anyhow::Result<String> {
+    if let Some(key) = explicit {
+        let key = key.trim();
+        if key.is_empty() && connection::requires_api_key(provider_id) {
+            anyhow::bail!(
+                "API key rỗng cho {provider_id}. Nhập key thật, hoặc dùng --provider ollama/custom \
+                 nếu endpoint không cần key."
+            );
+        }
+        return Ok(key.to_string());
+    }
+    if let Some(key) = stored.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(key.to_string());
+    }
+    if let Some(key) = env.map(|value| value.trim().to_string()) {
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+    if connection::requires_api_key(provider_id) {
+        anyhow::bail!(
+            "Chưa có API key cho {provider_id}. Chạy: tez connect --provider {provider_id}\n\
+             Hoặc đặt biến môi trường tương ứng và thử lại."
+        );
+    }
+    Ok(String::new())
+}
+
 fn resolve_chat_connection(
     args: &ChatArgs,
     book: &ProviderBook,
     dir: &Path,
 ) -> anyhow::Result<ResolvedConnection> {
-    // Tên provider lạ không được âm thầm rơi về endpoint OpenAI mặc định.
-    if let Some(requested) = args.provider.as_deref() {
-        let saved = book.find(requested).is_some()
-            || book
-                .providers
-                .iter()
-                .any(|entry| entry.provider == requested);
-        if !saved {
-            connection::validate_provider(requested).map_err(|error| anyhow::anyhow!("{error}"))?;
-        }
-    }
-
-    let selected = args
-        .provider
-        .as_deref()
-        .and_then(|value| {
-            book.find(value)
-                .or_else(|| book.providers.iter().find(|entry| entry.provider == value))
-        })
-        .or_else(|| book.active());
-
-    let provider_id = selected
-        .map(|entry| entry.provider.clone())
-        .or_else(|| args.provider.clone())
-        .unwrap_or_else(|| "groq".to_string());
-    let base_url = match args
+    let ProviderChoice { entry, kind } = resolve_provider_choice(book, args.provider.as_deref())?;
+    let provider_id = kind;
+    let base_url_override = args
         .base_url
-        .clone()
-        .or_else(|| selected.map(|entry| entry.base_url.clone()))
-    {
-        Some(url) => url,
-        // Không để custom rơi về endpoint OpenAI mặc định rồi gửi key tới đó.
-        None if provider_id == "custom" => {
-            anyhow::bail!(
-                "provider 'custom' cần --base-url (ví dụ: https://gateway.example.com/v1)"
-            )
-        }
-        None => connection::default_base_url(&provider_id).to_string(),
-    };
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if provider_id == "custom" && entry.is_none() && base_url_override.is_none() {
+        anyhow::bail!(
+            "provider custom cần --base-url (hoặc chạy `tez connect --provider custom --base-url ...`)."
+        );
+    }
+    let base_url = base_url_override
+        .map(ToOwned::to_owned)
+        .or_else(|| entry.map(|entry| entry.base_url.clone()))
+        .unwrap_or_else(|| connection::default_base_url(&provider_id).to_string());
     connection::validate_base_url(&base_url)?;
     let model = args
         .model
-        .clone()
-        .or_else(|| selected.map(|entry| entry.model.clone()))
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| entry.map(|entry| entry.model.clone()))
         .unwrap_or_else(|| connection::default_model(&provider_id).to_string());
 
-    let api_key = if let Some(key) = args.api_key.clone() {
-        key
-    } else if let Some(entry) = selected {
-        providers::decrypt_key(dir, entry)?
-    } else if let Some(key) = env_api_key(&provider_id) {
-        key
-    } else if provider_id == "ollama" {
-        String::new()
+    // Cờ --api-key thay thế hoàn toàn key đã lưu: không cần đọc vault.
+    let stored_key = if args.api_key.is_some() {
+        None
     } else {
-        anyhow::bail!(
-            "Chưa có API key cho {provider_id}. Chạy: tez connect --provider {provider_id}\n\
-             Hoặc đặt biến môi trường tương ứng và thử lại."
-        );
+        entry
+            .map(|entry| providers::decrypt_key(dir, entry))
+            .transpose()?
     };
+    let api_key = effective_api_key(
+        args.api_key.as_deref(),
+        stored_key.as_deref(),
+        env_api_key(&provider_id),
+        &provider_id,
+    )?;
 
     Ok(ResolvedConnection {
         provider_id,
@@ -824,8 +1013,13 @@ fn cli_approval_preview(root: &Path, request: &ApprovalRequest) -> Option<String
 #[async_trait]
 impl Approver for CliApprover {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
-        if let Some(preview) = cli_approval_preview(&self.workspace, request) {
-            println!("\n{preview}");
+        // Stdout chỉ dành cho câu trả lời cuối; diff/preview phải ra stderr.
+        if let Some(preview) = request
+            .preview
+            .clone()
+            .or_else(|| cli_approval_preview(&self.workspace, request))
+        {
+            eprintln!("{preview}");
         }
         let prompt = format!(
             "⚠ {} — công cụ: {} {}",
@@ -1074,11 +1268,126 @@ fn read_stdin_prompt() -> anyhow::Result<Option<String>> {
     Ok(Some(prompt.trim().to_string()))
 }
 
+struct ActiveSession {
+    dir: PathBuf,
+    session_id: String,
+}
+
+fn active_session_slot() -> &'static Mutex<Option<ActiveSession>> {
+    static SLOT: OnceLock<Mutex<Option<ActiveSession>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn set_active_session(dir: &Path, session_id: &str) {
+    if let Ok(mut slot) = active_session_slot().lock() {
+        *slot = Some(ActiveSession {
+            dir: dir.to_path_buf(),
+            session_id: session_id.to_string(),
+        });
+    }
+}
+
+fn clear_active_session() {
+    if let Ok(mut slot) = active_session_slot().lock() {
+        *slot = None;
+    }
+}
+
+struct ActiveSessionGuard {
+    completed: bool,
+}
+
+impl ActiveSessionGuard {
+    fn new() -> Self {
+        Self { completed: false }
+    }
+
+    /// Session đã được đóng bình thường; không cần dọn ở `Drop`.
+    fn finish(&mut self) {
+        self.completed = true;
+        clear_active_session();
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            clear_active_session();
+        } else {
+            abandon_active_session();
+        }
+    }
+}
+
+/// Đánh dấu session đang mở là bỏ dở trước khi thoát vì tín hiệu.
+fn abandon_active_session() {
+    let active = active_session_slot()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    let Some(active) = active else {
+        return;
+    };
+    if let Ok(store) = Store::open(active.dir.join("tez.db")) {
+        let _ = store.abandon_session(&active.session_id);
+    }
+}
+
+fn shutdown_on_signal() -> ! {
+    abandon_active_session();
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(130);
+}
+
+/// Ctrl-C/SIGTERM thoát mã 130 và không để session kẹt trạng thái `active`.
+async fn install_signal_handler() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("[signal] không đăng ký được SIGINT: {error}");
+                return;
+            }
+        };
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("[signal] không đăng ký được SIGTERM: {error}");
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            shutdown_on_signal();
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                shutdown_on_signal();
+            }
+        });
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn chat(args: ChatArgs) -> anyhow::Result<()> {
+    let requested_mode = args.mode.as_deref().map(parse_mode).transpose()?;
+    let requested_permission = args
+        .permission
+        .as_deref()
+        .map(parse_permission_mode)
+        .transpose()?;
     let dir = data_dir()?;
     let book = providers::load(&dir)?;
-    let mut mode = Mode::try_parse(&args.mode)
-        .ok_or_else(|| anyhow::anyhow!("chế độ '{}' không hợp lệ. Chọn: chat, code", args.mode))?;
+    let mut mode = requested_mode.unwrap_or_default();
     let mut pack = subjects::resolve_or_general(&args.subject);
     let workspace = match args.workspace.clone() {
         Some(path) => path,
@@ -1107,8 +1416,17 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
                 anyhow::anyhow!("không tìm thấy session '{id}'. Xem: tez sessions")
             })?;
             store.resume_session(id)?;
-            // Session đã lưu quyết định chế độ và môn học; cờ CLI chỉ dùng khi tạo mới.
-            mode = Mode::parse(&row.mode);
+            // Môn học theo session đã lưu; --mode được phép ghi đè và lưu lại.
+            let stored_mode = Mode::parse(&row.mode);
+            mode = match requested_mode {
+                Some(requested) => {
+                    if stored_mode != requested {
+                        store.update_session_mode(id, requested.as_str())?;
+                    }
+                    requested
+                }
+                None => stored_mode,
+            };
             pack = subjects::resolve_or_general(row.subject.as_deref().unwrap_or("general"));
             let conversation = store
                 .load_messages(id, args.history)?
@@ -1128,6 +1446,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             None,
         ),
     };
+    set_active_session(&dir, &session_id);
+    let mut session_guard = ActiveSessionGuard::new();
     drop(store);
 
     let todos = Arc::new(TodoState::new());
@@ -1138,8 +1458,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     }
 
     let mut config = harness::load(&dir);
-    if let Some(permission) = args.permission.as_deref() {
-        config.permission_mode = PermissionMode::parse(permission);
+    if let Some(permission) = requested_permission {
+        config.permission_mode = permission;
     }
     if let Some(max_steps) = args.max_steps {
         config.max_steps = max_steps.clamp(1, 100);
@@ -1261,11 +1581,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     if let Some(prompt) = args.prompt.as_deref().or(stdin_prompt.as_deref()) {
         match turn.run_turn(&mut conversation, prompt).await {
             Ok(text) => last_summary = text,
-            Err(error) => {
-                // Không để session rỗng hoặc kẹt 'active' khi lượt chat thất bại.
-                Store::open(dir.join("tez.db"))?.abandon_session(&session_id)?;
-                return Err(with_llm_hint(error));
-            }
+            // Guard dọn session rỗng hoặc đánh dấu 'failed' khi lượt chat lỗi.
+            Err(error) => return Err(with_llm_hint(error)),
         }
     } else if interactive {
         match mode {
@@ -1336,6 +1653,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             Some(summary.as_str())
         },
     )?;
+    session_guard.finish();
 
     eprintln!(
         "[session] {session_id} | {} | {} | {} | tiếp tục: tez chat --session {session_id}",
@@ -1394,10 +1712,23 @@ async fn update(args: UpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Nạp skill đã có mà không seed thư mục mặc định (doctor phải chỉ đọc).
+fn load_skills_read_only(dir: &Path) -> anyhow::Result<SkillRegistry> {
+    let mut registry = SkillRegistry::default();
+    registry.load_extra(&[dir.join("skills")], "user")?;
+    for plugin in plugins::load_all(dir)? {
+        registry.load_extra(&plugin.skill_paths(), &plugin.manifest.id)?;
+    }
+    Ok(registry)
+}
+
 fn doctor() -> anyhow::Result<()> {
-    let dir = data_dir()?;
+    let dir = data_dir_path()?;
     println!("tez {}", env!("CARGO_PKG_VERSION"));
     println!("data dir: {}", dir.display());
+    if !dir.exists() {
+        println!("data dir: chưa tồn tại (doctor chỉ đọc, không tạo mới)");
+    }
 
     let book = providers::load(&dir)?;
     match book.active() {
@@ -1411,27 +1742,38 @@ fn doctor() -> anyhow::Result<()> {
         None => println!("provider: chưa có (chạy `tez connect`)"),
     }
 
-    let store = Store::open(dir.join("tez.db"))?;
-    let usage = store.usage_summary()?;
-    println!(
-        "db: {} ({}, {} session, {} request, {} in / {} out token)",
-        store.path().display(),
-        human_size(store.size_bytes()?),
-        store.session_count()?,
-        usage.requests,
-        usage.tokens_in,
-        usage.tokens_out
-    );
-    println!(
-        "documents: {} file, {}",
-        store.document_count()?,
-        human_size(store.document_bytes()? as u64)
-    );
+    let db_path = dir.join("tez.db");
+    if db_path.exists() {
+        match Store::open_read_only(&db_path) {
+            Ok(store) => {
+                let usage = store.usage_summary()?;
+                println!(
+                    "db: {} ({}, {} session, {} request, {} in / {} out token)",
+                    store.path().display(),
+                    human_size(store.size_bytes()?),
+                    store.session_count()?,
+                    usage.requests,
+                    usage.tokens_in,
+                    usage.tokens_out
+                );
+                println!(
+                    "documents: {} file, {}",
+                    store.document_count()?,
+                    human_size(store.document_bytes()? as u64)
+                );
+            }
+            Err(error) => println!("db: {} (không đọc được: {error})", db_path.display()),
+        }
+    } else {
+        println!(
+            "db: chưa có ({}) — chạy `tez chat` để tạo",
+            db_path.display()
+        );
+    }
 
-    // Doctor chỉ chẩn đoán: không được tạo master.key mới khi key cũ bị mất.
     match Vault::load(&dir) {
         Ok(vault) => println!("vault key: {}", vault.key_path().display()),
-        Err(error) => println!("vault key: chưa mở được ({error})"),
+        Err(error) => println!("vault: thiếu/lỗi master.key · {error}"),
     }
 
     for key in [
@@ -1451,7 +1793,7 @@ fn doctor() -> anyhow::Result<()> {
         );
     }
 
-    println!("modes: chat (tổng quát) · code (workspace tools)");
+    println!("modes: chat (tổng quát) · plan (chỉ đọc) · code (workspace tools)");
     println!(
         "subjects: {}",
         subjects::ALL
@@ -1481,7 +1823,7 @@ fn doctor() -> anyhow::Result<()> {
         harness_config.hooks.len()
     );
     println!("harness config: {}", harness::config_path(&dir).display());
-    let skills = SkillRegistry::load_with_plugins(&dir)?;
+    let skills = load_skills_read_only(&dir)?;
     println!(
         "skills: {} (thư mục {})",
         skills.all().len(),
@@ -1621,9 +1963,10 @@ fn subject_show(id: &str) -> anyhow::Result<()> {
 }
 
 fn sessions(args: SessionsArgs) -> anyhow::Result<()> {
+    let limit = validate_limit(args.limit)?;
     let dir = data_dir()?;
     let store = Store::open(dir.join("tez.db"))?;
-    let rows = store.list_sessions(args.limit)?;
+    let rows = store.list_sessions(limit)?;
     if rows.is_empty() {
         println!("Chưa có session nào. Chạy: tez chat \"...\"");
         return Ok(());
@@ -1634,8 +1977,7 @@ fn sessions(args: SessionsArgs) -> anyhow::Result<()> {
         "ID", "CHẾ ĐỘ", "MÔN", "TRẠNG THÁI", "TIN"
     );
     for row in rows {
-        let summary = row.summary.unwrap_or_default();
-        let summary: String = summary.chars().take(60).collect();
+        let summary = sanitize_terminal_text(row.summary.as_deref().unwrap_or_default(), 60);
         println!(
             "{:<38} {:<8} {:<10} {:<8} {:<6} {}  {}",
             row.id,
@@ -1832,6 +2174,7 @@ fn restore_sigpipe() {}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     restore_sigpipe();
+    install_signal_handler().await;
     let cli = Cli::parse();
     match cli.command {
         Commands::Doctor => doctor(),
@@ -1882,5 +2225,177 @@ async fn main() -> anyhow::Result<()> {
             MemoryCommand::Forget { name } => memory_forget(&name),
         },
         Commands::Harness => harness_show(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_entry(id: &str, provider: &str) -> ProviderEntry {
+        ProviderEntry {
+            id: id.to_string(),
+            name: provider.to_string(),
+            provider: provider.to_string(),
+            base_url: connection::default_base_url(provider).to_string(),
+            model: connection::default_model(provider).to_string(),
+            encrypted_key: "ciphertext".to_string(),
+        }
+    }
+
+    fn sample_book() -> ProviderBook {
+        ProviderBook {
+            version: 1,
+            active: Some("groq-1".to_string()),
+            providers: vec![provider_entry("groq-1", "groq")],
+        }
+    }
+
+    #[test]
+    fn provider_flag_known_kind_does_not_fall_back_to_active() {
+        let book = sample_book();
+        let choice = resolve_provider_choice(&book, Some("custom")).unwrap();
+        assert!(choice.entry.is_none());
+        assert_eq!(choice.kind, "custom");
+    }
+
+    #[test]
+    fn provider_flag_unknown_kind_errors() {
+        let book = sample_book();
+        assert!(resolve_provider_choice(&book, Some("nope")).is_err());
+        assert!(resolve_provider_choice(&book, Some("  ")).is_err());
+    }
+
+    #[test]
+    fn provider_flag_matches_saved_id_case_insensitively() {
+        let book = sample_book();
+        let choice = resolve_provider_choice(&book, Some("GROQ-1")).unwrap();
+        assert_eq!(choice.entry.unwrap().id, "groq-1");
+        assert_eq!(choice.kind, "groq");
+    }
+
+    #[test]
+    fn provider_flag_matches_saved_kind() {
+        let book = sample_book();
+        let choice = resolve_provider_choice(&book, Some("groq")).unwrap();
+        assert_eq!(choice.entry.unwrap().id, "groq-1");
+    }
+
+    #[test]
+    fn provider_defaults_to_active_without_flag() {
+        let book = sample_book();
+        let choice = resolve_provider_choice(&book, None).unwrap();
+        assert_eq!(choice.entry.unwrap().id, "groq-1");
+    }
+
+    #[test]
+    fn empty_stored_key_falls_back_to_env() {
+        let key = effective_api_key(None, Some(""), Some("env-key".to_string()), "groq").unwrap();
+        assert_eq!(key, "env-key");
+    }
+
+    #[test]
+    fn stored_key_wins_over_env() {
+        let key = effective_api_key(
+            None,
+            Some("stored-key"),
+            Some("env-key".to_string()),
+            "groq",
+        )
+        .unwrap();
+        assert_eq!(key, "stored-key");
+    }
+
+    #[test]
+    fn explicit_key_wins_over_stored_key() {
+        let key = effective_api_key(
+            Some("explicit-key"),
+            Some("stored-key"),
+            Some("env-key".to_string()),
+            "groq",
+        )
+        .unwrap();
+        assert_eq!(key, "explicit-key");
+    }
+
+    #[test]
+    fn cloud_provider_without_key_errors() {
+        assert!(effective_api_key(None, None, None, "groq").is_err());
+        assert!(effective_api_key(Some(""), None, None, "openai").is_err());
+    }
+
+    #[test]
+    fn keyless_provider_without_key_is_allowed() {
+        assert_eq!(effective_api_key(None, None, None, "custom").unwrap(), "");
+        assert_eq!(effective_api_key(None, None, None, "ollama").unwrap(), "");
+    }
+
+    #[test]
+    fn parses_modes() {
+        assert_eq!(parse_mode("chat").unwrap(), Mode::Chat);
+        assert_eq!(parse_mode("PLAN").unwrap(), Mode::Plan);
+        assert_eq!(parse_mode("code").unwrap(), Mode::Code);
+    }
+
+    #[test]
+    fn invalid_mode_lists_choices() {
+        let error = parse_mode("bogus").unwrap_err().to_string();
+        assert!(error.contains("chat"), "{error}");
+        assert!(error.contains("code"), "{error}");
+        assert!(error.contains("plan"), "{error}");
+    }
+
+    #[test]
+    fn parses_permission_modes() {
+        assert_eq!(
+            parse_permission_mode("read-only").unwrap(),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            parse_permission_mode("STRICT").unwrap(),
+            PermissionMode::Strict
+        );
+        assert_eq!(
+            parse_permission_mode("standard").unwrap(),
+            PermissionMode::Standard
+        );
+        assert_eq!(
+            parse_permission_mode("trusted").unwrap(),
+            PermissionMode::Trust
+        );
+        assert!(parse_permission_mode("bogus").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_limit() {
+        assert!(validate_limit(0).is_err());
+    }
+
+    #[test]
+    fn accepts_positive_limit() {
+        assert_eq!(validate_limit(20).unwrap(), 20);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_limit_above_i64_max() {
+        let max = usize::try_from(i64::MAX).unwrap();
+        assert!(validate_limit(max).is_ok());
+        assert!(validate_limit(max + 1).is_err());
+    }
+
+    #[test]
+    fn strips_ansi_sequences() {
+        assert_eq!(sanitize_terminal_text("\x1b[31mred\x1b[0m", 60), "red");
+        assert_eq!(
+            sanitize_terminal_text("\x1b[2K\x1b]0;title\x07ok", 60),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn replaces_control_chars_and_truncates() {
+        assert_eq!(sanitize_terminal_text("a\nb\tc\x07d", 60), "a b cd");
+        assert_eq!(sanitize_terminal_text("\x1b[31mabcdef\x1b[0m", 3), "abc");
     }
 }

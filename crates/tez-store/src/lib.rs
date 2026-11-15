@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -493,6 +493,15 @@ impl Store {
         // DDL có thể vừa tạo -wal/-shm; siết quyền lần cuối.
         store.harden_permissions()?;
         Ok(store)
+    }
+
+    /// Mở DB đã tồn tại ở chế độ chỉ đọc: không tạo file, không migrate.
+    ///
+    /// Dùng cho lệnh chẩn đoán như `tez doctor` để không làm thay đổi dữ liệu.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn, path })
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
@@ -1239,6 +1248,21 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "Học sinh");
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_or_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists());
+
+        let store = Store::open(&path).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        drop(store);
+
+        let read_only = Store::open_read_only(&path).unwrap();
+        assert_eq!(read_only.session_count().unwrap(), 0);
     }
 
     #[test]
