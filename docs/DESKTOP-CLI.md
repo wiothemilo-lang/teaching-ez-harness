@@ -55,17 +55,18 @@
 > - Extension: `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `draft_extension`, `save_extension`, `open_extension_path`.
 > - Update/file: `check_update`, `download_update`, `launch_update`, `open_external`, `open_workspace`.
 >
-> Khi một tool cần duyệt, `DesktopApprover` phát event `tez://approval-request`; React mở modal rồi gọi `respond_approval({ id, approved })`. Trong lúc agent chạy, text được stream qua event `tez://chat-delta`; `stop_chat` dừng lượt chạy hiện tại. Khi cần SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
+> Khi một tool cần duyệt, `DesktopApprover` phát event `tez://approval-request`; React mở modal rồi gọi `respond_approval({ id, approved, remember })`. Nếu người dùng tick **Cho phép thao tác này trong phiên hiện tại**, broker nhớ `session_id|tool|path` (hoặc command) trong bộ nhớ tiến trình và tự duyệt các request khớp sau đó. Trong lúc agent chạy, text được stream qua event `tez://chat-delta`; `stop_chat` dừng lượt chạy hiện tại. Khi cần SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
 
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
-- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat đưa catalog skill vào system prompt và đăng ký tool `skill` để model tự nạp nội dung, cùng tool MCP trong một registry.
+- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat đưa catalog rút gọn theo nguồn vào system prompt và đăng ký tool `skill` (không tên = danh mục đầy đủ, có tên = nội dung), cùng tool MCP trong một registry. Plan chỉ đăng ký tool MCP read-only.
 - Khi có workspace, chat nạp thêm `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), skill ở `.tez/skills/`, MCP ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
+- Plan lưu văn bản cuối vào `plans/<session>.md` (cap 200.000 ký tự); desktop nạp lại khi chuyển Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn).
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
 - Desktop và CLI đều mở SQLite trực tiếp; WAL + `busy_timeout` xử lý tranh chấp ngắn. Không có process server riêng.
 - Mỗi lệnh chat mở Store, nạp session/todo, chạy agent rồi ghi message/tool call/usage; lỗi DB trả về UI dưới dạng chuỗi thân thiện.
 - Provider call nằm trong `tez-core` qua trait `LlmProvider`; vault/keychain nằm trong `tez-auth`.
-- Desktop stream text qua `tez://chat-delta`; CLI vẫn trả token một lần. Local server/SSE chỉ cần khi có nhiều client.
+- Desktop stream text qua `tez://chat-delta`; CLI stream text ra stdout, tool trace và thống kê đi stderr. Local server/SSE chỉ cần khi có nhiều client.
 
 ---
 
@@ -180,15 +181,18 @@ tez doctor
 - `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
   tương tác; có pipe thì đọc một lần từ stdin.
 - `--mode code` dùng workspace tools; `--mode plan` chỉ đọc workspace và trình
-  kế hoạch; `--workspace` mặc định là thư mục hiện tại. `--session` khôi phục
-  mode/môn học đã lưu.
+  kế hoạch, đồng thời lưu văn bản cuối vào `plans/<session>.md`;
+  `--workspace` mặc định là thư mục hiện tại. `--session` khôi phục mode/môn
+  học đã lưu.
 - `--yes` tự duyệt mọi thao tác cần permission; `--permission` ghi đè
   `harness.json`; `--max-steps` và `--no-memory` ghi đè cho riêng lượt chạy.
+  Khi hỏi duyệt `write_file`/`edit_file`, CLI in unified diff (cap 24.000 ký tự)
+  trước prompt lý do/tool/args.
 - `tez memory list|search|forget` và `tez harness` xem bộ nhớ dài hạn và cấu
   hình harness.
-- Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
-  thống kê nén đi ra stderr. CLI chưa stream token; desktop stream qua
-  `tez://chat-delta`.
+- Output text được stream ra stdout khi agent chạy; tool trace, cảnh báo permission và
+  thống kê nén đi ra stderr. Desktop stream qua `tez://chat-delta`, CLI qua channel
+  `with_stream` và printer stdout riêng.
 - Lỗi trả exit code 1 kèm thông báo. `tez doctor` kiểm tra data dir, provider,
   DB, skill, MCP, plugin, harness và dung lượng.
 
@@ -198,22 +202,23 @@ tez doctor
 
 | Màn hình | Chức năng |
 |---|---|
-| **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh (lưu vào SQLite để resume), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
+| **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh (file trong `images/<session>/`, DB giữ ref `tez-image:`; gửi lại tối đa 2 lượt user gần nhất), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
+| **Plan** | Chỉ đọc workspace, khảo sát và lưu kế hoạch vào `plans/<session>.md`; nút Kế hoạch mở PlanDialog để xem/sửa/lưu; chuyển sang Code nạp lại plan |
 | **Code** | Workspace chip, `read_file`/`write_file`/`edit_file`/`list_files`/`glob`/`grep`/`run_command`, todo/context dock, approval modal |
-| **Approval modal** | Hiện lý do + tool + diff trước khi ghi (hoặc args JSON); từ chối hoặc cho phép; timeout 180 s thì từ chối |
+| **Approval modal** | Hiện lý do + tool + diff trước khi ghi (hoặc args JSON); checkbox **Cho phép thao tác này trong phiên hiện tại**; từ chối hoặc cho phép; timeout 180 s thì từ chối |
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
-| Settings → MCP | Server stdio, env, cwd, test, danh sách tool |
+| Settings → MCP | Server stdio, env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)** |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
-| **Settings → Harness** | Permission mode, giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
+| **Settings → Harness** | Permission mode, permission rule dạng `allow\|ask\|deny <tool> <pattern>` (bỏ qua `#` comment/dòng trống, lỗi hiện inline và tắt **Lưu**), giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
 | Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
 | Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục |
 | Usage | Token/latency/chi phí ước tính *(kế hoạch)* |
 | About/Doctor | Version, log, health *(kế hoạch)* |
 
 Các màn Lessons, Tools, Context inspector và Models theo mô tả cũ vẫn là kế
-hoạch; bản hiện tại tập trung vào Chat/Code, extension và harness.
+hoạch; bản hiện tại tập trung vào Chat/Plan/Code, extension và harness.
 
 **Tauri security:**
 
@@ -255,6 +260,7 @@ Chi tiết: [PROVIDER-AUTH.md](PROVIDER-AUTH.md).
 - Migration hiện tại là schema version 5; `Store::migrate` chạy `SCHEMA` idempotent rồi thêm cột còn thiếu (`sessions.subject`, `sessions.mode`).
 - Bảng chính: `profiles`, `connections`, `lessons`, `sessions`, `messages`, `context_snapshots`, `tool_calls`, `session_todos`, `ai_usage`, `documents`, `document_chunks`, `document_chunks_fts`, `schema_migrations`.
 - `session_todos` giữ kế hoạch của phiên dưới dạng JSON array, khoá theo `session_id`; desktop/CLI nạp lại khi resume.
+- Plan đầy đủ nằm ngoài DB ở `plans/<session>.md` (cap 200.000 ký tự); desktop có PlanDialog để xem/sửa/lưu, CLI đọc file; đây là văn bản cuối của lượt Plan, không phải schema.
 - Không multi-tenant; mỗi máy một DB.
 
 Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
@@ -305,6 +311,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Key rò rỉ | keychain + AES-GCM; redaction; không log header. |
 | Key lộ qua renderer | Renderer không nhận secret. |
 | Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; không phải sandbox OS. |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; app tin khai báo, không xác minh hành vi. |
 | Prompt injection | Tài liệu/tool result là data; delimiter; không thực thi chỉ dẫn; tool allowlist. |
 | Ghi dữ liệu sai | Write/edit tool qua permission; audit JSONL; todo/plan hiển thị để người dùng theo dõi. |
 | Update giả | GitHub Releases + checksum; signing sau. |
@@ -314,7 +321,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 
 ## 13. Testing
 
-- Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, store migration v5 và `session_todos`.
+- Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode, MCP read-only), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, plan save/load + cap + sanitize tên file, image file storage + `tez-image:` refs, web browser resolver/fallback, store migration v5 và `session_todos`.
 - Integration: mock provider + agent loop; permission denial; subagent; MCP stdio; artifact compaction (`sessions/<id>/tool-results|transcripts`).
 - CLI e2e: `assert_cmd`; connect/chat/tools/context; `--yes`/`--permission`/`--max-steps`; `memory`, `harness`.
 - Desktop smoke: Tauri driver/Playwright (sau); preview mock hiện kiểm tra approval modal, Harness dock và Settings → Harness.
@@ -329,7 +336,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Phase | Thời lượng | Kết quả |
 |---|---|---|
 | 0. Rust basics | 1–2 tuần | CLI nhỏ, hiểu ownership/async |
-| 1. Core + CLI | 2–3 tuần | `tez chat` (CLI non-streaming; desktop stream sau) |
+| 1. Core + CLI | 2–3 tuần | `tez chat` (stream trên desktop và CLI) |
 | 2. Auth + store | 2 tuần | `tez connect/models`, vault, SQLite |
 | 3. Agent loop + harness | 2–3 tuần | Context + tools + permission/hooks/todo/subagent/compaction/memory |
 | 4. Subject packs | 2–3 tuần | 4 môn mỏng, RAG, evidence, eval |

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use tez_core::modes::{Mode, PLAN_TOOLS};
 use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
+use tez_core::plan;
 use tez_core::plugins;
 use tez_core::project;
 use tez_core::skills::SkillRegistry;
@@ -36,11 +37,11 @@ use tez_core::tools::skill::SkillTool;
 use tez_core::tools::web::WebFetchTool;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::{code_registry, ToolRegistry};
+use tez_core::tools::{code_registry, Tool, ToolRegistry};
 use tez_llm::{
     ChatRequest as LlmChatRequest, ChatResponse, LlmProvider, Message, OpenAiCompatible,
 };
-use tez_store::{NewMessage, Store, UsageRecord};
+use tez_store::{NewMessage, Store, StoredMessage, UsageRecord};
 
 const SAMPLE_PLUGIN_JSON: &str =
     include_str!("../../../../examples/plugins/study-toolkit/plugin.json");
@@ -48,6 +49,12 @@ const SAMPLE_PLUGIN_SERVER: &str =
     include_str!("../../../../examples/plugins/study-toolkit/server.py");
 const SAMPLE_PLUGIN_SKILL: &str =
     include_str!("../../../../examples/plugins/study-toolkit/skills/exam-strategy/SKILL.md");
+
+const MAX_IMAGES_PER_REQUEST: usize = 4;
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Chỉ gửi lại ảnh của vài lượt người dùng gần nhất để request không phình to.
+const HISTORY_IMAGE_TURNS: usize = 2;
+const HISTORY_MAX_IMAGES: usize = 6;
 
 /// Dọn session mới nếu lượt chat lỗi giữa đường (key sai, mạng, MCP...).
 struct NewSessionGuard {
@@ -89,6 +96,8 @@ struct SaveMcpRequest {
     cwd: Option<String>,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    read_only: bool,
 }
 
 fn default_true() -> bool {
@@ -242,28 +251,54 @@ struct ChatReply {
 /// Kênh chờ người dùng bấm duyệt trong desktop.
 #[derive(Default)]
 struct ApprovalBroker {
-    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    pending: Mutex<HashMap<String, PendingApproval>>,
+    remembered: Mutex<HashSet<String>>,
+}
+
+struct PendingApproval {
+    key: String,
+    sender: tokio::sync::oneshot::Sender<bool>,
 }
 
 impl ApprovalBroker {
-    fn register(&self, id: &str) -> tokio::sync::oneshot::Receiver<bool> {
+    fn register(&self, id: &str, key: &str) -> tokio::sync::oneshot::Receiver<bool> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id.to_string(), tx);
+            pending.insert(
+                id.to_string(),
+                PendingApproval {
+                    key: key.to_string(),
+                    sender: tx,
+                },
+            );
         }
         rx
     }
 
-    fn respond(&self, id: &str, approved: bool) -> bool {
-        let sender = self
+    fn respond(&self, id: &str, approved: bool, remember: bool) -> bool {
+        let pending = self
             .pending
             .lock()
             .ok()
             .and_then(|mut pending| pending.remove(id));
-        match sender {
-            Some(tx) => tx.send(approved).is_ok(),
+        match pending {
+            Some(pending) => {
+                if approved && remember {
+                    if let Ok(mut remembered) = self.remembered.lock() {
+                        remembered.insert(pending.key);
+                    }
+                }
+                pending.sender.send(approved).is_ok()
+            }
             None => false,
         }
+    }
+
+    fn is_remembered(&self, key: &str) -> bool {
+        self.remembered
+            .lock()
+            .map(|remembered| remembered.contains(key))
+            .unwrap_or(false)
     }
 
     fn cancel(&self, id: &str) {
@@ -319,9 +354,37 @@ struct DesktopApprover {
     workspace: Option<PathBuf>,
 }
 
+fn approval_key(request: &ApprovalRequest) -> String {
+    let target = if request.tool == "run_command" {
+        request
+            .args
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+    } else {
+        request
+            .args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+    };
+    format!(
+        "{}|{}|{}",
+        request.session_id.as_deref().unwrap_or(""),
+        request.tool,
+        target
+    )
+}
+
 #[async_trait]
 impl Approver for DesktopApprover {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
+        let key = approval_key(request);
+        if self.broker.is_remembered(&key) {
+            return true;
+        }
         let mut request = request.clone();
         if request.preview.is_none() {
             request.preview = self
@@ -329,7 +392,7 @@ impl Approver for DesktopApprover {
                 .as_deref()
                 .and_then(|root| approval_preview(root, &request));
         }
-        let receiver = self.broker.register(&request.id);
+        let receiver = self.broker.register(&request.id, &key);
         if let Err(error) = self.app.emit("tez://approval-request", &request) {
             eprintln!("[permission] không gửi được yêu cầu duyệt: {error}");
             self.broker.cancel(&request.id);
@@ -407,6 +470,8 @@ fn approval_preview(root: &Path, request: &ApprovalRequest) -> Option<String> {
 struct RespondApprovalRequest {
     id: String,
     approved: bool,
+    #[serde(default)]
+    remember: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,6 +520,12 @@ struct SkillInfo {
 }
 
 #[derive(Debug, Serialize)]
+struct PlanInfo {
+    path: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
 struct McpServerInfo {
     name: String,
     source: String,
@@ -463,6 +534,7 @@ struct McpServerInfo {
     cwd: Option<String>,
     env: HashMap<String, String>,
     enabled: bool,
+    read_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -883,6 +955,7 @@ fn list_extensions() -> Result<ExtensionsInfo, String> {
             cwd: entry.config.cwd,
             env: entry.config.env,
             enabled: entry.config.enabled,
+            read_only: entry.config.read_only,
         })
         .collect();
 
@@ -924,6 +997,7 @@ fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
             env: request.env,
             cwd: request.cwd.filter(|value| !value.trim().is_empty()),
             enabled: request.enabled,
+            read_only: request.read_only,
         },
     );
     mcp::save_config(&dir, &config).map_err(|error| error.to_string())
@@ -1169,6 +1243,8 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
             cwd: Option<String>,
             #[serde(default = "default_true")]
             enabled: bool,
+            #[serde(default)]
+            read_only: bool,
         }
 
         let file = request
@@ -1191,6 +1267,7 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
                 env: draft.env,
                 cwd: draft.cwd.filter(|value| !value.trim().is_empty()),
                 enabled: draft.enabled,
+                read_only: draft.read_only,
             },
         );
         mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;
@@ -1338,6 +1415,51 @@ fn stop_chat(stop: State<'_, Arc<StopBroker>>) -> bool {
     stop.stop()
 }
 
+fn history_to_messages(
+    messages: Vec<StoredMessage>,
+    image_turns: usize,
+    max_images: usize,
+    max_bytes: usize,
+) -> Vec<Message> {
+    let mut selected: Vec<Vec<String>> = vec![Vec::new(); messages.len()];
+    let mut turns_left = image_turns;
+    let mut images_left = max_images;
+    let mut bytes_left = max_bytes;
+
+    // Duyệt ngược để ưu tiên ảnh mới nhất khi ngân sách ảnh bị giới hạn.
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role != "user" {
+            continue;
+        }
+        if turns_left == 0 {
+            break;
+        }
+        turns_left -= 1;
+        for image in &message.images {
+            if images_left == 0 {
+                break;
+            }
+            if image.len() > bytes_left {
+                continue;
+            }
+            bytes_left -= image.len();
+            images_left -= 1;
+            selected[index].push(image.clone());
+        }
+    }
+
+    messages
+        .into_iter()
+        .zip(selected)
+        .filter_map(|(message, images)| match message.role.as_str() {
+            "user" if images.is_empty() => Some(Message::user(message.content)),
+            "user" => Some(Message::user_with_images(message.content, images)),
+            "assistant" => Some(Message::assistant(message.content)),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn chat_inner(
     app: AppHandle,
     broker: Arc<ApprovalBroker>,
@@ -1345,7 +1467,7 @@ async fn chat_inner(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ChatReply> {
     let stream_app = app.clone();
-    if request.images.len() > 4 {
+    if request.images.len() > MAX_IMAGES_PER_REQUEST {
         anyhow::bail!("tối đa 4 ảnh mỗi lượt");
     }
     if request
@@ -1355,7 +1477,7 @@ async fn chat_inner(
     {
         anyhow::bail!("ảnh phải là data URL image/*");
     }
-    if request.images.iter().map(String::len).sum::<usize>() > 8 * 1024 * 1024 {
+    if request.images.iter().map(String::len).sum::<usize>() > MAX_IMAGE_BYTES {
         anyhow::bail!("tổng dung lượng ảnh vượt 8 MB");
     }
     let dir = data_dir()?;
@@ -1380,8 +1502,6 @@ async fn chat_inner(
     } else {
         config.permission_mode
     };
-    let policy =
-        Arc::new(PermissionPolicy::new(policy_mode).with_rules(config.permission_rules.clone()));
     let approver: Arc<dyn Approver> = if policy_mode == PermissionMode::Trust {
         Arc::new(AutoApprover)
     } else {
@@ -1408,17 +1528,14 @@ async fn chat_inner(
                     store.update_session_mode(id, mode.as_str())?;
                 }
                 store.resume_session(id)?;
-                let history = store
-                    .load_messages(id, 40)?
-                    .into_iter()
-                    .filter_map(|message| match message.role.as_str() {
-                        // Ảnh cũ vẫn hiện trong UI/resume nhưng không gửi lại
-                        // toàn bộ lịch sử để tránh request phình to.
-                        "user" => Some(Message::user(message.content)),
-                        "assistant" => Some(Message::assistant(message.content)),
-                        _ => None,
-                    })
-                    .collect();
+                let current_images = request.images.len();
+                let current_bytes = request.images.iter().map(String::len).sum::<usize>();
+                let history = history_to_messages(
+                    store.load_messages(id, 40)?,
+                    HISTORY_IMAGE_TURNS,
+                    HISTORY_MAX_IMAGES.saturating_sub(current_images),
+                    MAX_IMAGE_BYTES.saturating_sub(current_bytes),
+                );
                 (id.to_string(), history, store.load_todos(id)?, false, Some(previous))
             }
             None => (
@@ -1485,7 +1602,7 @@ async fn chat_inner(
     if let Some(root) = workspace.as_deref() {
         registry.load_project(root)?;
     }
-    let skill_catalog = registry.catalog_lines(50);
+    let skill_catalog = registry.catalog_overview(12);
 
     let recalled = if config.memory.enabled && config.memory.auto_recall {
         let records = memory_store.search(&request.message, config.memory.recall_limit);
@@ -1519,6 +1636,11 @@ async fn chat_inner(
 
     if previous_mode == Some(Mode::Plan) && mode == Mode::Code {
         if let Some(content) = messages.first_mut().and_then(|system| system.content.as_mut()) {
+            if let Ok(Some(saved)) = plan::load_plan(&dir, &session_id) {
+                content.push_str("\nKế hoạch đã lưu của phiên:\n<plan>\n");
+                content.push_str(&saved);
+                content.push_str("\n</plan>\n");
+            }
             content.push_str(
                 "\nNgười dùng vừa duyệt kế hoạch và chuyển từ Plan sang Code. \
                  Thực thi theo kế hoạch trong lịch sử và todos; nếu kế hoạch thiếu thông tin \
@@ -1549,12 +1671,26 @@ async fn chat_inner(
     tools.register(TodoWrite::new(Arc::clone(&todos)));
     tools.register(SkillTool::new(registry.clone()));
     tools.register(WebFetchTool::new());
-    if !plan_mode {
-        let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
-        for tool in discovery.tools {
-            tools.register(tool);
+
+    // MCP được nạp cho cả Plan; ở Plan chỉ đăng ký tool được khai báo chỉ đọc.
+    let mut read_only_tools = Vec::new();
+    let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
+    for tool in discovery.tools {
+        let read_only = tool.is_read_only();
+        if plan_mode && !read_only {
+            continue;
         }
+        if read_only {
+            read_only_tools.push(tool.spec().name);
+        }
+        tools.register(tool);
     }
+
+    let policy = Arc::new(
+        PermissionPolicy::new(policy_mode)
+            .with_rules(config.permission_rules.clone())
+            .with_read_only_tools(read_only_tools),
+    );
 
     if mode == Mode::Code {
         let runtime = Arc::new(SubagentRuntime {
@@ -1603,6 +1739,12 @@ async fn chat_inner(
     drop(agent);
     let _ = emitter.await;
     let latency_ms = started.elapsed().as_millis() as u64;
+
+    if plan_mode {
+        if let Err(error) = plan::save_plan(&dir, &session_id, &outcome.text) {
+            eprintln!("không lưu được kế hoạch: {error}");
+        }
+    }
 
     let store = Store::open(dir.join("tez.db"))?;
     store.append_message(NewMessage {
@@ -1675,11 +1817,32 @@ async fn chat_inner(
 }
 
 #[tauri::command]
+fn load_session_plan(session_id: String) -> Result<PlanInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let text = plan::load_plan(&dir, &session_id)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let path = plan::plan_path(&dir, &session_id).display().to_string();
+    Ok(PlanInfo { path, text })
+}
+
+#[tauri::command]
+fn save_session_plan(session_id: String, text: String) -> Result<PlanInfo, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let path = plan::save_plan(&dir, &session_id, &text).map_err(|error| error.to_string())?;
+    let path = path
+        .unwrap_or_else(|| plan::plan_path(&dir, &session_id))
+        .display()
+        .to_string();
+    Ok(PlanInfo { path, text })
+}
+
+#[tauri::command]
 fn respond_approval(
     broker: State<'_, Arc<ApprovalBroker>>,
     request: RespondApprovalRequest,
 ) -> bool {
-    broker.respond(&request.id, request.approved)
+    broker.respond(&request.id, request.approved, request.remember)
 }
 
 fn harness_info(dir: &Path) -> HarnessInfo {
@@ -1800,6 +1963,8 @@ pub fn run() {
             app_status,
             chat,
             stop_chat,
+            load_session_plan,
+            save_session_plan,
             respond_approval,
             get_harness,
             save_harness,
@@ -1833,6 +1998,82 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(role: &str, content: &str, images: &[&str]) -> StoredMessage {
+        StoredMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            images: images.iter().map(|image| image.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn history_keeps_images_for_recent_user_turns_only() {
+        let messages = history_to_messages(
+            vec![
+                stored("user", "cũ", &["data:image/png;base64,old"]),
+                stored("assistant", "trả lời cũ", &[]),
+                stored("user", "giữa", &["data:image/png;base64,mid"]),
+                stored("assistant", "trả lời giữa", &[]),
+                stored("user", "mới", &["data:image/png;base64,new"]),
+            ],
+            2,
+            6,
+            MAX_IMAGE_BYTES,
+        );
+
+        assert_eq!(messages.len(), 5);
+        assert!(messages[0].images.is_empty());
+        assert_eq!(messages[2].images, vec!["data:image/png;base64,mid"]);
+        assert_eq!(messages[4].images, vec!["data:image/png;base64,new"]);
+    }
+
+    #[test]
+    fn history_respects_image_count_and_byte_budget() {
+        let messages = history_to_messages(
+            vec![
+                stored(
+                    "user",
+                    "cũ",
+                    &["data:image/png;base64,1234", "data:image/png;base64,5678"],
+                ),
+                stored(
+                    "user",
+                    "mới",
+                    &[
+                        "data:image/png;base64,1234567890",
+                        "data:image/png;base64,ab",
+                    ],
+                ),
+            ],
+            2,
+            2,
+            30,
+        );
+
+        // Ảnh mới nhất quá lớn bị bỏ; ảnh nhỏ còn lại được giữ.
+        assert!(messages[0].images.is_empty());
+        assert_eq!(messages[1].images, vec!["data:image/png;base64,ab"]);
+    }
+
+    #[test]
+    fn history_skips_unknown_roles() {
+        let messages = history_to_messages(
+            vec![
+                stored("system", "bỏ qua", &[]),
+                stored("user", "giữ", &[]),
+                stored("tool", "bỏ qua", &[]),
+                stored("assistant", "giữ", &[]),
+            ],
+            2,
+            6,
+            MAX_IMAGE_BYTES,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+    }
 
     #[test]
     fn rejects_system_workspace_roots() {

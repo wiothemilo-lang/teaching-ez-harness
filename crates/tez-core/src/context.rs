@@ -17,7 +17,7 @@ pub struct ContextInput<'a> {
     pub recent: &'a [Message],
     pub excerpts: &'a [String],
     /// Kỹ năng khả dụng, mỗi phần tử là một dòng catalog (xem
-    /// [`crate::skills::SkillRegistry::catalog_lines`]). Nội dung đầy đủ được
+    /// [`crate::skills::SkillRegistry::catalog_overview`]). Nội dung đầy đủ được
     /// nạp qua tool `skill`.
     pub skills: &'a [String],
     /// Memory liên quan đã render sẵn (xem [`crate::memory::render_recalled`]).
@@ -97,7 +97,7 @@ impl ContextBuilder {
 
         if !input.skills.is_empty() {
             system.push_str(
-                "\nKỹ năng khả dụng (danh mục ngắn; gọi tool `skill` với name để nạp toàn bộ hướng dẫn khi phù hợp):\n",
+                "\nKỹ năng khả dụng (danh mục rút gọn theo nguồn; gọi tool `skill` không kèm name để xem danh mục đầy đủ, hoặc kèm name để nạp toàn bộ hướng dẫn khi phù hợp):\n",
             );
             for skill in input.skills {
                 system.push_str(skill);

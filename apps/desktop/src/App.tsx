@@ -21,6 +21,7 @@ import { ChatView } from "./components/ChatView";
 import { CodeView } from "./components/CodeView";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { CommandPalette } from "./components/CommandPalette";
+import { PlanDialog } from "./components/PlanDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Spinner } from "./components/ui";
 import { IconCheck, IconInfo, IconRefresh, IconX } from "./icons";
@@ -44,6 +45,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("providers");
   const [commandOpen, setCommandOpen] = useState(false);
+  const [planOpen, setPlanOpen] = useState(false);
   const [createRequest, setCreateRequest] = useState<ExtensionKind | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -87,11 +89,11 @@ export default function App() {
   }, []);
 
   const respondApproval = useCallback(
-    (approved: boolean) => {
+    (approved: boolean, remember: boolean) => {
       if (!approval) return;
       const id = approval.id;
       setApproval(null);
-      void api.respondApproval(id, approved).catch((responseError) => {
+      void api.respondApproval(id, approved, remember).catch((responseError) => {
         notify("error", "Không gửi được phản hồi", errorMessage(responseError));
       });
     },
@@ -431,6 +433,7 @@ export default function App() {
           onInput={setInput}
           onSend={() => void send()}
           onStop={stop}
+          onOpenPlan={() => setPlanOpen(true)}
           onOpenSettings={() => openSettings("providers")}
           onOpenHarness={() => openSettings("harness")}
           onDismissError={() => setError(null)}
@@ -461,6 +464,13 @@ export default function App() {
         notify={notify}
         createRequest={createRequest}
         onCreateRequest={() => setCreateRequest(null)}
+      />
+
+      <PlanDialog
+        open={planOpen}
+        sessionId={sessionId}
+        onClose={() => setPlanOpen(false)}
+        notify={notify}
       />
 
       {approval && <ApprovalDialog request={approval} onRespond={respondApproval} />}

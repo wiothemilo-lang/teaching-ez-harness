@@ -1,17 +1,18 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { ApprovalRequest } from "../types";
 import { IconLock, IconX } from "../icons";
 
 type Props = {
   request: ApprovalRequest;
-  onRespond: (approved: boolean) => void;
+  onRespond: (approved: boolean, remember: boolean) => void;
 };
 
 /** Hộp thoại chặn luồng chat khi agent xin quyền chạy một tool rủi ro. */
 export function ApprovalDialog({ request, onRespond }: Props) {
+  const [remember, setRemember] = useState(false);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onRespond(false);
+      if (event.key === "Escape") onRespond(false, false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -35,7 +36,7 @@ export function ApprovalDialog({ request, onRespond }: Props) {
             type="button"
             className="approval-close"
             aria-label="Từ chối và đóng"
-            onClick={() => onRespond(false)}
+            onClick={() => onRespond(false, false)}
           >
             <IconX size={16} />
           </button>
@@ -79,11 +80,24 @@ export function ApprovalDialog({ request, onRespond }: Props) {
           thông báo để thử cách khác.
         </p>
 
+        <label className="approval-remember">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(event) => setRemember(event.target.checked)}
+          />
+          <span>Cho phép thao tác này trong phiên hiện tại</span>
+        </label>
+
         <div className="approval-actions">
-          <button type="button" className="btn" onClick={() => onRespond(false)}>
+          <button type="button" className="btn" onClick={() => onRespond(false, false)}>
             Từ chối
           </button>
-          <button type="button" className="btn btn-primary" onClick={() => onRespond(true)}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => onRespond(true, remember)}
+          >
             Cho phép chạy
           </button>
         </div>

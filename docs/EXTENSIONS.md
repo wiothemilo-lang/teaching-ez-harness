@@ -7,7 +7,7 @@
 
 ## 1. Skills — prompt pack Markdown
 
-Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Tez đưa một catalog ngắn (id, tên, mô tả) vào system prompt; khi phù hợp, model gọi tool `skill` để nạp toàn bộ nội dung. Cách này giữ context nhẹ và cho model tự chọn skill. Skill không chạy code và không có quyền truy cập dữ liệu.
+Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Tez dùng **hai tầng progressive disclosure**: system prompt chỉ nhận catalog rút gọn theo nguồn (mỗi nguồn một dòng, tối đa 12 id); khi phù hợp, model gọi tool `skill` không kèm `name` để xem danh mục đầy đủ theo nguồn, hoặc kèm `name` để nạp toàn bộ nội dung. Cách này giữ context nhẹ và cho model tự chọn skill. Skill không chạy code và không có quyền truy cập dữ liệu.
 
 ### Vị trí
 
@@ -19,7 +19,7 @@ Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Tez đưa một
   english-writing/SKILL.md
 ```
 
-Lần đầu mở app, bốn skill mặc định được tạo nếu thư mục chưa tồn tại.
+Lần đầu mở app, bốn skill mặc định được tạo nếu thư mục chưa tồn tại. Vì chúng được seed ngay trong `skills/`, registry nạp chúng với nguồn `user` (không phải `builtin`).
 
 ### Định dạng
 
@@ -40,10 +40,16 @@ triggers: giải, bước, chứng minh, tính
 | `name` | Tên hiển thị. Nếu thiếu `id`, tên thư mục được dùng làm id. |
 | `description` | Mô tả ngắn trong Cài đặt → Kỹ năng. |
 | `subjects` | Danh sách id ngữ cảnh, phân tách bằng dấu phẩy. `all` hoặc bỏ trống = mọi ngữ cảnh. |
-| `triggers` | Metadata từ khóa (không phân biệt hoa thường), dùng cho gợi ý/tương lai; catalog hiện đưa toàn bộ skill để model tự chọn. |
+| `triggers` | Metadata từ khóa (không phân biệt hoa thường), dùng cho gợi ý/tương lai; catalog trong system prompt chỉ liệt kê tối đa 12 id/nguồn, danh mục đầy đủ lấy qua tool `skill`. |
 | `id` | Tùy chọn, dùng để đặt id ổn định. |
 
-Phần thân sau `---` được render thành `<skill name="…">…</skill>` và cắt ở 4KB.
+Phần thân sau `---` được trả về trong thẻ `<skill id="…" name="…">…</skill>` khi model gọi `skill` với `name`, và bị cắt ở 12.000 ký tự. Danh mục đầy đủ (khi gọi `skill` không kèm `name`) bị cắt ở 24.000 ký tự.
+
+### Hai tầng nạp
+
+1. **System prompt:** `catalog_overview` gộp skill theo nguồn (`project`, `user`, `plugin`, `plugin:<id>`), mỗi nguồn một dòng kèm số lượng và tối đa 12 id tiêu biểu; phần dư hiện `… +N`.
+2. **Tool `skill` không kèm `name`:** trả danh mục đầy đủ có tiêu đề `[nguồn] số_lượng`, tối đa 200 skill và 24.000 ký tự.
+3. **Tool `skill` kèm `name`:** tìm theo id rồi tên, trả body tối đa 12.000 ký tự; tên sai trả danh sách id khả dụng.
 
 ### Skill mặc định
 
@@ -90,8 +96,20 @@ tez là MCP client tối giản: spawn server, gọi `initialize`, `tools/list`,
 | `env` | Biến môi trường bổ sung. |
 | `cwd` | Thư mục làm việc; plugin mặc định dùng thư mục plugin. |
 | `enabled` | `false` để tạm tắt mà không xóa cấu hình. |
+| `read_only` | `true` để ép mọi tool của server được coi là chỉ đọc. Alias khi đọc file: `readOnly`. |
 
-Đường dẫn: `~/.local/share/teaching-ez/mcp.json`.
+Đường dẫn: `~/.local/share/teaching-ez/mcp.json`. Desktop ghi khóa này dưới dạng `read_only`; `readOnly` được chấp nhận khi bạn sửa file bằng tay.
+
+### Chỉ đọc và Plan
+
+Ngoài `read_only` ở cấp server, tool có thể tự khai báo chỉ đọc qua `annotations.readOnlyHint` (chuẩn MCP) hoặc `readOnly`/`read_only` ở cấp tool. Server `read_only` ghi đè mọi tool con thành chỉ đọc.
+
+- **Plan** chỉ đăng ký các tool MCP được đánh dấu chỉ đọc; tool MCP thay đổi trạng thái không vào Plan.
+- Permission policy cho qua tool read-only sau deny-list và rule `deny`, kể cả khi mode là `read_only`. Rule `ask`/`strict` không hỏi lại các tool này.
+- App **tin vào khai báo của server**, không kiểm chứng hành vi thực tế. Một server khai báo sai vẫn có thể thay đổi dữ liệu; chỉ cài server bạn tin tưởng.
+- Tool read-only có thể đọc tài nguyên ngoài workspace tùy server; Plan không sandbox MCP.
+
+Desktop có checkbox **Chỉ đọc (cho phép trong Plan)** trong form MCP.
 
 ### Tên tool
 
@@ -189,7 +207,7 @@ Khi workspace được chọn (Chat hoặc Code), tez nạp thêm ngữ cảnh n
 
 - `AGENTS.md`, `CLAUDE.md` ở gốc workspace, và bản trong `.tez/` — gộp vào system prompt dưới nhãn `<project-instructions>`, tối đa 24 KB.
 - `.tez/skills/<id>/SKILL.md` — skill riêng của dự án; ghi đè skill cùng id từ user/plugin.
-- `.tez/mcp.json` — MCP server riêng của dự án, cùng schema với `mcp.json` toàn cục. Server dự án thắng server toàn cục khi trùng tên; `cwd` mặc định là gốc dự án.
+- `.tez/mcp.json` — MCP server riêng của dự án, cùng schema với `mcp.json` toàn cục (gồm cả `read_only`). Server dự án thắng server toàn cục khi trùng tên; `cwd` mặc định là gốc dự án.
 
 Ưu tiên khi mâu thuẫn: yêu cầu trực tiếp của người dùng > chỉ dẫn dự án > skill/memory. Không cần bật Code mode để dùng chỉ dẫn dự án; chỉ cần chọn workspace ở sidebar.
 
@@ -220,4 +238,5 @@ Backend dùng hai lệnh `draft_extension` và `save_extension`. Bản nháp ch�
 - MCP server khi trùng tên: dự án > user > plugin.
 - API key vẫn nằm trong vault AES-256-GCM; `mcp.json` chỉ chứa cấu hình, không chứa key provider.
 - Nếu đưa `env` bí mật vào `mcp.json`, file được đặt quyền `0600` nhưng vẫn là plaintext trên đĩa. Ưu tiên biến môi trường của hệ điều hành khi có thể.
+- `read_only`/`readOnlyHint` là khai báo của server, không phải sandbox hay xác minh quyền thực tế. Chỉ dùng trong Plan khi bạn tin server đó.
 - Xóa `plugins/<id>/` là gỡ plugin; xóa `skills/<id>/` là gỡ skill.

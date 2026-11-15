@@ -11,6 +11,7 @@ import { CHAT_SUGGESTIONS, PLAN_SUGGESTIONS, placeholderFor } from "../lib";
 import {
   IconArrowRight,
   IconArrowUp,
+  IconBook,
   IconChevronDown,
   IconImage,
   IconKey,
@@ -43,6 +44,7 @@ type Props = {
   onSend: () => void;
   onStop: () => void;
   onOpenSettings: () => void;
+  onOpenPlan: () => void;
   onOpenHarness: () => void;
   onDismissError: () => void;
 };
@@ -80,6 +82,7 @@ export function ChatView({
   onSend,
   onStop,
   onOpenSettings,
+  onOpenPlan,
   onOpenHarness,
   onDismissError,
 }: Props) {
@@ -158,6 +161,11 @@ export function ChatView({
               </span>
             </span>
           </button>
+          {planMode && (
+            <button className="icon-button" onClick={onOpenPlan} aria-label="Mở kế hoạch">
+              <IconBook size={18} />
+            </button>
+          )}
           <button className="icon-button" onClick={onOpenSettings} aria-label="Mở cài đặt">
             <IconSliders size={18} />
           </button>

@@ -9,6 +9,8 @@ use crate::skills::{self, Skill, SkillRegistry};
 
 /// Giới hạn nội dung skill trả về model để không nuốt cả context.
 const MAX_BODY_CHARS: usize = 12_000;
+/// Giới hạn danh mục khi model gọi `skill` không kèm tên.
+const MAX_CATALOG_CHARS: usize = 24_000;
 /// Số id gợi ý tối đa khi model gọi sai tên.
 const MAX_SUGGESTIONS: usize = 30;
 
@@ -50,6 +52,19 @@ impl SkillTool {
             ids.join(", ")
         )
     }
+
+    fn catalog(&self) -> String {
+        let lines = self.registry.catalog_grouped(200);
+        if lines.is_empty() {
+            return "chưa có skill nào".to_string();
+        }
+        let mut text = lines.join("\n");
+        if text.chars().count() > MAX_CATALOG_CHARS {
+            text = text.chars().take(MAX_CATALOG_CHARS).collect();
+            text.push_str("\n… (danh mục đã cắt bớt)");
+        }
+        text
+    }
 }
 
 #[async_trait]
@@ -58,17 +73,16 @@ impl Tool for SkillTool {
         ToolSpec {
             name: "skill".into(),
             description: "Nạp hướng dẫn đầy đủ của một skill theo id hoặc tên khi danh mục \
-                          skill gợi ý phù hợp."
+                          skill gợi ý phù hợp. Bỏ trống name để xem danh mục đầy đủ theo nguồn."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Id hoặc tên skill, ví dụ: step-by-step"
+                        "description": "Id hoặc tên skill, ví dụ: step-by-step. Bỏ trống để liệt kê danh mục."
                     }
                 },
-                "required": ["name"],
                 "additionalProperties": false
             }),
         }
@@ -78,10 +92,10 @@ impl Tool for SkillTool {
         let name = args
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'name'".into()))?;
-        let name = name.trim();
+            .unwrap_or("")
+            .trim();
         if name.is_empty() {
-            return Ok(ToolOutput::error("tên skill rỗng".to_string()));
+            return Ok(ToolOutput::ok(self.catalog()));
         }
 
         let Some(skill) = self.find(name) else {
@@ -129,12 +143,16 @@ mod tests {
     }
 
     #[test]
-    fn spec_describes_name_argument() {
+    fn spec_describes_optional_name_argument() {
         let (_dir, registry) = review_registry();
         let spec = SkillTool::new(registry).spec();
         assert_eq!(spec.name, "skill");
-        assert_eq!(spec.parameters["required"], json!(["name"]));
+        assert!(spec.parameters["required"].is_null());
         assert_eq!(spec.parameters["properties"]["name"]["type"], "string");
+        assert!(spec.parameters["properties"]["name"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Bỏ trống"));
     }
 
     #[tokio::test]
@@ -172,13 +190,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_missing_and_empty_name() {
+    async fn missing_or_empty_name_returns_catalog() {
         let (_dir, registry) = review_registry();
         let tool = SkillTool::new(registry);
-        let missing = tool.execute(json!({})).await.unwrap_err();
-        assert!(matches!(missing, ToolError::InvalidArgs(_)));
+        let missing = tool.execute(json!({})).await.unwrap();
+        assert!(!missing.is_error, "{}", missing.content);
+        assert!(missing.content.contains("[user]"));
+        assert!(missing.content.contains("review"));
+
         let empty = tool.execute(json!({"name": "   "})).await.unwrap();
-        assert!(empty.is_error);
+        assert!(!empty.is_error, "{}", empty.content);
+        assert_eq!(missing.content, empty.content);
     }
 
     #[tokio::test]

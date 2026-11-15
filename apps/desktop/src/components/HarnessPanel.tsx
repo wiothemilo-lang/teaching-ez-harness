@@ -64,21 +64,35 @@ function formatRules(rules: PermissionRule[]): string {
   return rules.map((rule) => `${rule.action} ${rule.tool} ${rule.pattern}`.trim()).join("\n");
 }
 
-function parseRules(text: string): PermissionRule[] {
+function parseRules(text: string): { rules: PermissionRule[]; errors: string[] } {
   const actions = new Set(["allow", "ask", "deny"]);
   const rules: PermissionRule[] = [];
-  for (const raw of text.split("\n")) {
-    const parts = raw.trim().split(/\s+/).filter(Boolean);
-    if (parts.length < 2) continue;
+  const errors: string[] = [];
+  text.split("\n").forEach((raw, index) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    const label = `Dòng ${index + 1}`;
+    const parts = line.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      errors.push(`${label}: cần ít nhất action và tool.`);
+      return;
+    }
     const action = parts[0].toLowerCase();
-    if (!actions.has(action)) continue;
+    if (!actions.has(action)) {
+      errors.push(`${label}: action phải là allow, ask hoặc deny.`);
+      return;
+    }
+    if (!parts[1]) {
+      errors.push(`${label}: thiếu tên tool.`);
+      return;
+    }
     rules.push({
       action: action as PermissionRule["action"],
       tool: parts[1],
       pattern: parts.slice(2).join(" ") || "*",
     });
-  }
-  return rules;
+  });
+  return { rules, errors };
 }
 
 /** Tab cấu hình harness: quyền, giới hạn agent, compaction, memory và hook. */
@@ -94,6 +108,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
   });
   const [toolsText, setToolsText] = useState("");
   const [rulesText, setRulesText] = useState("");
+  const [ruleErrors, setRuleErrors] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -103,6 +118,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       setDraft(next.config);
       setToolsText(next.config.disabled_tools.join(", "));
       setRulesText(formatRules(next.config.permission_rules));
+      setRuleErrors([]);
     } catch (error) {
       notify("error", "Không tải được cấu hình harness", api.errorMessage(error));
     } finally {
@@ -132,6 +148,10 @@ export function HarnessPanel({ notify, onChanged }: Props) {
 
   const save = async () => {
     if (!draft) return;
+    if (ruleErrors.length > 0) {
+      notify("error", "Permission rules chưa hợp lệ", ruleErrors[0]);
+      return;
+    }
     setSaving(true);
     try {
       const next = await api.saveHarness(draft);
@@ -139,6 +159,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       setDraft(next.config);
       setToolsText(next.config.disabled_tools.join(", "));
       setRulesText(formatRules(next.config.permission_rules));
+      setRuleErrors([]);
       notify("success", "Đã lưu cài đặt agent", "Cấu hình áp dụng từ lượt chat tiếp theo.");
       await onChanged();
     } catch (error) {
@@ -208,7 +229,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
             type="button"
             className="btn btn-sm btn-primary"
             onClick={() => void save()}
-            disabled={saving || !draft}
+            disabled={saving || !draft || ruleErrors.length > 0}
           >
             {saving ? "Đang lưu…" : "Lưu"}
           </button>
@@ -255,8 +276,10 @@ export function HarnessPanel({ notify, onChanged }: Props) {
                 value={rulesText}
                 onChange={(event) => {
                   const value = event.target.value;
+                  const parsed = parseRules(value);
                   setRulesText(value);
-                  patch({ permission_rules: parseRules(value) });
+                  setRuleErrors(parsed.errors);
+                  patch({ permission_rules: parsed.rules });
                 }}
                 placeholder={"allow write_file src/**\nask run_command git push*\ndeny write_file secrets/**"}
                 rows={4}
@@ -268,6 +291,16 @@ export function HarnessPanel({ notify, onChanged }: Props) {
               command; <code>*</code> khớp mọi đối tượng. Deny-list lệnh phá hủy vẫn luôn thắng
               rule.
             </p>
+            {ruleErrors.length > 0 && (
+              <div className="rules-errors" role="alert">
+                <strong>Chưa lưu được rule</strong>
+                <ul>
+                  {ruleErrors.map((error) => (
+                    <li key={error}>{error}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
 
           <div className="harness-block">

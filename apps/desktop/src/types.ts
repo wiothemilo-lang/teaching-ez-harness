@@ -231,6 +231,7 @@ export type McpServerInfo = {
   cwd: string | null;
   env: Record<string, string>;
   enabled: boolean;
+  read_only: boolean;
 };
 
 export type PluginInfo = {
@@ -263,6 +264,11 @@ export type McpTest = {
   error: string | null;
 };
 
+export type PlanInfo = {
+  path: string;
+  text: string;
+};
+
 export type DraftFile = {
   path: string;
   content: string;
@@ -293,6 +299,7 @@ export type SaveMcpPayload = {
   env: Record<string, string>;
   cwd: string | null;
   enabled: boolean;
+  read_only: boolean;
 };
 
 export type ChatPayload = {
