@@ -23,6 +23,7 @@
 | SEC-03 | P0 | MCP stdio chạy với quyền user, đọc được secret trong data dir và gửi dữ liệu ra ngoài | Sandbox bubblewrap tùy chọn theo server: ẩn `master.key`/`providers.json`/DB/audit, chặn mạng mặc định, chỉ bind `writable_paths`; thiếu `bwrap` thì từ chối; UI Settings → MCP | Test `sandboxed_demo_server_discovers_tools`, `mcp_command_hides_secrets_and_blocks_network` |
 | EVAL-01 | P1 | Chưa có eval harness/regression | Thêm `tez eval --suite evals/*.json`: case JSON, kiểm tra `contains`/`not_contains`, báo cáo text/JSON, mã thoát khác 0 khi fail; 8 case mẫu; workflow nightly tự bỏ qua nếu thiếu secret | 4 test `tez-cli`; chạy mock 8/8 pass; `tez eval --json` |
 | CTX-02 | P1 | Provider trả `400 Invalid request` chung chung khi context lớn; compaction cũ chỉ chạy khi vượt giới hạn cứng | Hạ mặc định còn 24.000 ký tự; micro-compact ở 80% và nén về 65%; summary ở 90%; nhận diện `400 Invalid request`/`413` khi context đã dùng ≥50% và thử summary một lần | Test `detects_generic_invalid_request`, `retries_generic_invalid_request_when_context_is_tight`; 395 test workspace |
+| MCP-05 | P2 | HTTP chỉ nhận response qua POST, bỏ qua request/notification server khởi tạo | Mở GET SSE best-effort sau `notifications/initialized`; trả lời `ping`/`roots/list`, request khác trả `-32601`; task bị abort khi connection drop | Test `http_get_stream_answers_server_ping` |
 
 ### Lệnh kiểm chứng
 
@@ -45,7 +46,7 @@ Kết quả local ngày 2026-11-15: fmt sạch, clippy sạch, **395 test pass**
 | SIGN-01 | P1 | Installer Windows chưa ký; update chưa tự cài | Release thủ công, checksum | Ký Authenticode + auto-update có xác minh chữ ký |
 | EVAL-02 | P1 | Chưa chạy eval với provider thật và chưa lưu baseline | Có `tez eval` + 8 case mock; workflow nightly bỏ qua nếu thiếu secret | Cấu hình secret, chạy nightly, lưu baseline và ngưỡng pass |
 | CTX-01 | P2 | Ước lượng token theo ký tự; chưa có context inspector | Compaction 4 bước, dock hiển thị context | Tokenizer theo model + `context inspect` đọc `context_snapshots` |
-| MCP-04 | P2 | MCP stdio spawn mỗi lượt, timeout 20 s, chưa có GET stream server-initiated | Timeout + kill_on_drop | Giữ process dài hạn, backoff restart, GET stream |
+| MCP-04 | P2 | MCP stdio spawn mỗi lượt, timeout 20 s; GET stream server-initiated mới ở mức best-effort, không reconnect | Timeout + kill_on_drop; GET SSE trả lời `ping`/`roots/list`, request khác trả `-32601` | Giữ process dài hạn, backoff/reconnect cho GET stream |
 
 ## 3. Tiêu chí go-live
 

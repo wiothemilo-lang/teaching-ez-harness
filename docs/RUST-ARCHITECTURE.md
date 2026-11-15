@@ -284,8 +284,9 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
   `notifications/initialized`, `tools/list`; `tools/call` đi qua cùng trait.
   Nếu server khai báo capability `resources`/`prompts`, discovery tạo thêm tool
   read-only `mcp__<server>__extras` với action `list_resources`, `read_resource`,
-  `list_prompts`, `get_prompt`. Chưa hỗ trợ GET stream server-initiated hay
-  OAuth; auth HTTP dùng header tĩnh.
+  `list_prompts`, `get_prompt`. Có GET SSE stream best-effort cho
+  request/notification server khởi tạo (`ping`, `roots/list`; request khác trả
+  `-32601`), không tự reconnect; OAuth 2.1 + PKCE lưu token ngoài `mcp.json`.
 - **Web fetch** (`tools/web.rs`): chỉ http/https, chặn userinfo, localhost và IP
   nội bộ (kể cả CGNAT, dải tài liệu IPv6, 6to4). Ở chế độ static, mỗi redirect
   được resolve DNS lại, kiểm tra toàn bộ địa chỉ rồi pin bằng
