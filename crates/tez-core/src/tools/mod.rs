@@ -131,6 +131,17 @@ impl ToolRegistry {
         names
     }
 
+    /// Bản sao bỏ các tool bị người dùng tắt trong cấu hình.
+    pub fn without(&self, blocked: &[String]) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| !blocked.iter().any(|item| item == *name))
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect();
+        Self { tools }
+    }
+
     pub async fn execute(&self, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let tool = self
             .get(name)

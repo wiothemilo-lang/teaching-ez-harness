@@ -49,22 +49,22 @@
 
 > **MVP hiện tại:** desktop gọi Tauri commands in-process, dùng chung crate và DB với CLI; chưa có `tez-server`. Nhóm command chính:
 >
-> - Chat/session: `app_status`, `chat`, `list_sessions`, `load_session`.
+> - Chat/session: `app_status`, `chat`, `stop_chat`, `list_sessions`, `load_session`.
 > - Harness: `respond_approval`, `get_harness`, `save_harness`, `delete_memory`.
 > - Provider: `list_providers`, `save_provider`, `delete_provider`, `activate_provider`, `test_provider`, `test_connection`.
-> - Extension: `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `open_extension_path`.
+> - Extension: `list_extensions`, `save_mcp_server`, `delete_mcp_server`, `test_mcp_server`, `install_sample_plugin`, `draft_extension`, `save_extension`, `open_extension_path`.
 > - Update/file: `check_update`, `download_update`, `launch_update`, `open_external`, `open_workspace`.
 >
-> Khi một tool cần duyệt, `DesktopApprover` phát event `tez://approval-request`; React mở modal rồi gọi `respond_approval({ id, approved })`. Khi cần streaming/SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
+> Khi một tool cần duyệt, `DesktopApprover` phát event `tez://approval-request`; React mở modal rồi gọi `respond_approval({ id, approved })`. Trong lúc agent chạy, text được stream qua event `tez://chat-delta`; `stop_chat` dừng lượt chạy hiện tại. Khi cần SSE hoặc nhiều client, sẽ chuyển sang local server như mô tả dưới đây.
 
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
-- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp môn/từ khóa và đăng ký tool MCP vào cùng registry với tool built-in.
+- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat inject skill khớp từ khóa trong câu hỏi (tối đa 2) và đăng ký tool MCP vào cùng registry với tool built-in.
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
 - Desktop và CLI đều mở SQLite trực tiếp; WAL + `busy_timeout` xử lý tranh chấp ngắn. Không có process server riêng.
 - Mỗi lệnh chat mở Store, nạp session/todo, chạy agent rồi ghi message/tool call/usage; lỗi DB trả về UI dưới dạng chuỗi thân thiện.
 - Provider call nằm trong `tez-core` qua trait `LlmProvider`; vault/keychain nằm trong `tez-auth`.
-- Streaming/SSE và local server vẫn là kế hoạch khi cần nhiều client; hiện tại token trả một lần.
+- Desktop stream text qua `tez://chat-delta`; CLI vẫn trả token một lần. Local server/SSE chỉ cần khi có nhiều client.
 
 ---
 
@@ -185,7 +185,8 @@ tez doctor
 - `tez memory list|search|forget` và `tez harness` xem bộ nhớ dài hạn và cấu
   hình harness.
 - Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
-  thống kê nén đi ra stderr. Chưa có streaming token.
+  thống kê nén đi ra stderr. CLI chưa stream token; desktop stream qua
+  `tez://chat-delta`.
 - Lỗi trả exit code 1 kèm thông báo. `tez doctor` kiểm tra data dir, provider,
   DB, skill, MCP, plugin, harness và dung lượng.
 
@@ -326,7 +327,7 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Phase | Thời lượng | Kết quả |
 |---|---|---|
 | 0. Rust basics | 1–2 tuần | CLI nhỏ, hiểu ownership/async |
-| 1. Core + CLI | 2–3 tuần | `tez chat` (hiện non-streaming) |
+| 1. Core + CLI | 2–3 tuần | `tez chat` (CLI non-streaming; desktop stream sau) |
 | 2. Auth + store | 2 tuần | `tez connect/models`, vault, SQLite |
 | 3. Agent loop + harness | 2–3 tuần | Context + tools + permission/hooks/todo/subagent/compaction/memory |
 | 4. Subject packs | 2–3 tuần | 4 môn mỏng, RAG, evidence, eval |

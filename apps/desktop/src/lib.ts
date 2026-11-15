@@ -12,8 +12,8 @@ export const MODE_LABELS: Record<AppMode, string> = {
 };
 
 export const CHAT_SUGGESTIONS = [
-  "Tóm tắt giúp mình một chủ đề bất kỳ",
-  "Lên kế hoạch học tập cho tuần này",
+  "Tóm tắt cấu trúc dự án này và chỉ ra điểm cần cải thiện",
+  "Lên kế hoạch triển khai một tính năng nhỏ",
   "Giải thích một khái niệm khó bằng ví dụ đời thường",
 ];
 

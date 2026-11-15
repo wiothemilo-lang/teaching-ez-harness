@@ -1110,6 +1110,16 @@ kbd {
   cursor: not-allowed;
 }
 
+.send.is-stop {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid rgba(224, 119, 106, 0.35);
+}
+
+.send.is-stop:hover:not(:disabled) {
+  background: rgba(224, 119, 106, 0.22);
+}
+
 .composer-note {
   width: min(780px, 100%);
   margin: 8px auto 0;
@@ -2858,4 +2868,343 @@ kbd {
     animation-duration: 0.001ms !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ---------- Claude Code-style shell polish ---------- */
+
+.command-trigger {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: left;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.command-trigger:hover {
+  border-color: var(--line-strong);
+  background: var(--surface);
+  color: var(--ink-soft);
+}
+
+.command-trigger span {
+  flex: 1;
+}
+
+.workspace-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.workspace-card:hover {
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+
+.workspace-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.workspace-copy strong {
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-copy small {
+  color: var(--faint);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12vh 20px 20px;
+  background: rgba(8, 7, 6, 0.62);
+  backdrop-filter: blur(6px);
+}
+
+.command-box {
+  width: min(620px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.6);
+}
+
+.command-input {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.command-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.command-input input::placeholder {
+  color: var(--faint);
+}
+
+.command-list {
+  max-height: 52vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.command-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  text-align: left;
+}
+
+.command-item.is-active {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.command-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--accent);
+}
+
+.command-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.command-copy strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.command-copy small {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.command-empty {
+  padding: 22px 14px;
+  color: var(--faint);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* Tighter, calmer reading column */
+.thread {
+  width: min(760px, 100%);
+  margin: 0 auto;
+}
+
+.welcome {
+  padding: 8vh 0 0;
+}
+
+.welcome-title {
+  letter-spacing: -0.025em;
+}
+
+.chat-header {
+  padding-inline: 26px;
+}
+
+.composer-wrap {
+  width: min(780px, calc(100% - 40px));
+  margin: 0 auto;
+}
+
+/* ---------- AI extension builder ---------- */
+
+.create-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(8, 7, 6, 0.66);
+  backdrop-filter: blur(6px);
+}
+
+.create-box {
+  width: min(820px, 100%);
+  max-height: 88vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.62);
+}
+
+.create-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.create-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+
+.create-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border: 1px solid var(--accent-line);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.create-title h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.create-title p {
+  margin: 2px 0 0;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+.create-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  overflow-y: auto;
+}
+
+.create-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.create-error {
+  padding: 10px 12px;
+  border: 1px solid rgba(224, 119, 106, 0.35);
+  border-radius: 7px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+.create-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.create-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.create-file {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-soft);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.create-file.is-active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.create-file code {
+  font-family: var(--mono);
+}
+
+.create-code {
+  max-height: 300px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.create-note {
+  margin: 0;
+  color: var(--faint);
+  font-size: 11px;
 }

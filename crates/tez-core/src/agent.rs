@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tez_llm::{ChatRequest, ChatResponse, LlmError, LlmProvider, Message, Usage};
+use tokio::sync::{mpsc::UnboundedSender, watch};
 
 use crate::compaction::{CompactReport, CompactSettings, Compactor};
 use crate::hooks::{HookContext, HookEvent, HookRegistry};
@@ -23,6 +24,7 @@ pub struct AgentConfig {
     pub max_steps: usize,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub top_p: f32,
     pub max_tool_output: usize,
 }
 
@@ -32,6 +34,7 @@ impl Default for AgentConfig {
             max_steps: 12,
             max_tokens: 1_024,
             temperature: 0.2,
+            top_p: 1.0,
             max_tool_output: DEFAULT_MAX_TOOL_OUTPUT,
         }
     }
@@ -74,6 +77,8 @@ pub enum AgentError {
     MaxSteps(usize),
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Ngữ cảnh một lượt chạy: session, nơi lưu artifact, yêu cầu hiện tại.
@@ -107,6 +112,8 @@ pub struct Agent {
     hooks: Arc<HookRegistry>,
     compactor: Compactor,
     todos: Option<Arc<TodoState>>,
+    stream: Option<UnboundedSender<String>>,
+    cancel: Option<watch::Receiver<bool>>,
 }
 
 impl Agent {
@@ -120,6 +127,8 @@ impl Agent {
             hooks: Arc::new(HookRegistry::new()),
             compactor: Compactor::disabled(),
             todos: None,
+            stream: None,
+            cancel: None,
         }
     }
 
@@ -158,6 +167,54 @@ impl Agent {
         self
     }
 
+    /// Phát từng đoạn text của model ra kênh này (dùng cho streaming UI).
+    pub fn with_stream(mut self, stream: UnboundedSender<String>) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// Dừng lượt chạy khi receiver nhận `true`.
+    pub fn with_cancel(mut self, cancel: watch::Receiver<bool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .map(|cancel| *cancel.borrow())
+            .unwrap_or(false)
+    }
+
+    /// Gọi model, có thể stream và có thể bị hủy giữa chừng.
+    async fn request_model(&self, request: ChatRequest) -> Result<ChatResponse, AgentError> {
+        let provider = Arc::clone(&self.provider);
+        let stream = self.stream.clone();
+        let Some(mut cancel) = self.cancel.clone() else {
+            return provider
+                .chat_stream(request, stream)
+                .await
+                .map_err(AgentError::Llm);
+        };
+        if *cancel.borrow() {
+            return Err(AgentError::Cancelled);
+        }
+
+        let future = provider.chat_stream(request, stream);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return result.map_err(AgentError::Llm),
+                changed = cancel.changed() => match changed {
+                    Ok(()) if *cancel.borrow() => return Err(AgentError::Cancelled),
+                    Ok(()) => continue,
+                    // Sender bị drop: không còn ai hủy, chờ nốt request.
+                    Err(_) => return future.await.map_err(AgentError::Llm),
+                },
+            }
+        }
+    }
+
     pub fn config(&self) -> &AgentConfig {
         &self.config
     }
@@ -187,6 +244,17 @@ impl Agent {
         let mut todo_writes = self.todos.as_ref().map(|state| state.writes()).unwrap_or(0);
 
         for _ in 0..self.config.max_steps {
+            if self.cancelled() {
+                return Ok(self.outcome(
+                    "Đã dừng theo yêu cầu.".to_string(),
+                    steps,
+                    total_usage,
+                    report,
+                    denials,
+                    StopReason::Stopped,
+                ));
+            }
+
             merge_report(&mut report, self.compactor.prepare(&mut messages));
 
             if self.compactor.needs_summary(&messages) {
@@ -205,12 +273,23 @@ impl Agent {
                 messages: messages.clone(),
                 tools: self.tools.specs(),
                 temperature: Some(self.config.temperature),
+                top_p: Some(self.config.top_p),
                 max_tokens: Some(self.config.max_tokens),
             };
 
-            let response = match self.provider.chat(request).await {
+            let response = match self.request_model(request).await {
                 Ok(response) => response,
-                Err(error) => {
+                Err(AgentError::Cancelled) => {
+                    return Ok(self.outcome(
+                        "Đã dừng theo yêu cầu.".to_string(),
+                        steps,
+                        total_usage,
+                        report,
+                        denials,
+                        StopReason::Stopped,
+                    ));
+                }
+                Err(AgentError::Llm(error)) => {
                     if is_context_error(&error) && reactive_retries == 0 {
                         reactive_retries += 1;
                         if let Some((summary, usage)) = self.summarize(model, &messages).await {
@@ -228,6 +307,7 @@ impl Agent {
                     }
                     return Err(AgentError::Llm(error));
                 }
+                Err(other) => return Err(other),
             };
 
             match response {
@@ -442,6 +522,7 @@ impl Agent {
             messages: request_messages,
             tools: Vec::new(),
             temperature: Some(0.0),
+            top_p: None,
             max_tokens: Some(800),
         };
         match self.provider.chat(request).await {

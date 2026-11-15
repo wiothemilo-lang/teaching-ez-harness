@@ -768,7 +768,6 @@ struct TurnContext<'a> {
     dir: &'a Path,
     session_id: &'a str,
     pack: &'a SubjectPack,
-    grade: &'a str,
     model: &'a str,
     provider_id: &'a str,
     provider: Arc<dyn LlmProvider>,
@@ -784,6 +783,8 @@ struct TurnContext<'a> {
     memory_settings: harness::MemorySettings,
     todos: Arc<TodoState>,
     max_steps: usize,
+    system_prompt: &'a str,
+    language: &'a str,
 }
 
 impl TurnContext<'_> {
@@ -823,7 +824,7 @@ impl TurnContext<'_> {
         let mut recent = conversation.clone();
         recent.push(Message::user(prompt));
 
-        let matched = self.skills.matching(self.pack.id, prompt, 2);
+        let matched = self.skills.matching_query(prompt, 2);
         let skill_snippets: Vec<String> =
             matched.iter().map(|skill| skills::render(skill)).collect();
 
@@ -837,21 +838,17 @@ impl TurnContext<'_> {
         };
         let todos = self.todos.snapshot();
 
-        let objectives: Vec<String> = Vec::new();
         let workspace_label = self.workspace.display().to_string();
         let messages = ContextBuilder.build(ContextInput {
-            subject: self.pack,
-            grade: self.grade,
-            objectives: &objectives,
             excerpts: &excerpts,
-            student_summary: None,
-            state: "practice",
             recent: &recent,
             skills: &skill_snippets,
             memory: &recalled,
             todos: &todos,
             mode: self.mode,
             workspace: Some(&workspace_label),
+            instructions: self.system_prompt,
+            language: self.language,
         });
 
         let artifact_dir = session_artifact_dir(self.dir, self.session_id);
@@ -1089,7 +1086,6 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         dir: &dir,
         session_id: &session_id,
         pack,
-        grade: &args.grade,
         model: &connection.model,
         provider_id: &connection.provider_id,
         provider,
@@ -1105,6 +1101,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         memory_settings: config.memory.clone(),
         todos,
         max_steps: config.max_steps,
+        system_prompt: &config.system_prompt,
+        language: &config.language,
     };
 
     let interactive = args.prompt.is_none() && stdin_prompt.is_none();

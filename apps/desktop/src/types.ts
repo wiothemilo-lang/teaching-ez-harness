@@ -55,6 +55,12 @@ export type HarnessConfig = {
   max_steps: number;
   max_tokens: number;
   temperature: number;
+  top_p: number;
+  max_tool_output: number;
+  subagent_max_steps: number;
+  system_prompt: string;
+  language: string;
+  disabled_tools: string[];
   compaction: CompactionSettings;
   memory: MemorySettings;
   hooks: HookConfig[];
@@ -248,6 +254,19 @@ export type McpTest = {
   error: string | null;
 };
 
+export type DraftFile = {
+  path: string;
+  content: string;
+};
+
+export type DraftExtensionResult = {
+  kind: string;
+  files: DraftFile[];
+  notes: string;
+};
+
+export type ExtensionKind = "skill" | "mcp" | "plugin";
+
 export type SaveProviderPayload = {
   id?: string | null;
   name: string;
@@ -268,8 +287,6 @@ export type SaveMcpPayload = {
 };
 
 export type ChatPayload = {
-  subject: string;
-  grade: string;
   message: string;
   session_id: string | null;
   provider_id: string | null;

@@ -48,6 +48,18 @@ pub struct HarnessConfig {
     pub max_tokens: u32,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default = "default_max_tool_output")]
+    pub max_tool_output: usize,
+    #[serde(default = "default_subagent_max_steps")]
+    pub subagent_max_steps: usize,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
     #[serde(default)]
     pub compaction: CompactSettings,
     #[serde(default)]
@@ -65,6 +77,18 @@ fn default_max_tokens() -> u32 {
 fn default_temperature() -> f32 {
     0.2
 }
+fn default_top_p() -> f32 {
+    1.0
+}
+fn default_max_tool_output() -> usize {
+    8 * 1024
+}
+fn default_subagent_max_steps() -> usize {
+    6
+}
+fn default_language() -> String {
+    "vi".to_string()
+}
 
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -73,6 +97,12 @@ impl Default for HarnessConfig {
             max_steps: default_max_steps(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
+            top_p: default_top_p(),
+            max_tool_output: default_max_tool_output(),
+            subagent_max_steps: default_subagent_max_steps(),
+            system_prompt: String::new(),
+            language: default_language(),
+            disabled_tools: Vec::new(),
             compaction: CompactSettings::default(),
             memory: MemorySettings::default(),
             hooks: Vec::new(),
@@ -86,6 +116,18 @@ impl HarnessConfig {
         config.max_steps = config.max_steps.clamp(1, 100);
         config.max_tokens = config.max_tokens.clamp(128, 32_768);
         config.temperature = config.temperature.clamp(0.0, 2.0);
+        config.top_p = config.top_p.clamp(0.0, 1.0);
+        config.max_tool_output = config.max_tool_output.clamp(1_024, 65_536);
+        config.subagent_max_steps = config.subagent_max_steps.clamp(1, 50);
+        if config.language != "en" {
+            config.language = "vi".to_string();
+        }
+        config.system_prompt = config.system_prompt.trim().to_string();
+        if config.system_prompt.chars().count() > 8_000 {
+            config.system_prompt = config.system_prompt.chars().take(8_000).collect();
+        }
+        config.disabled_tools.sort();
+        config.disabled_tools.dedup();
         config.compaction = CompactSettings {
             enabled: config.compaction.enabled,
             ..config.compaction.clone()

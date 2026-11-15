@@ -70,6 +70,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
     command: "",
     timeout_secs: 5,
   });
+  const [toolsText, setToolsText] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -77,6 +78,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       const next = await api.getHarness();
       setInfo(next);
       setDraft(next.config);
+      setToolsText(next.config.disabled_tools.join(", "));
     } catch (error) {
       notify("error", "Không tải được cấu hình harness", api.errorMessage(error));
     } finally {
@@ -111,7 +113,8 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       const next = await api.saveHarness(draft);
       setInfo(next);
       setDraft(next.config);
-      notify("success", "Đã lưu harness", "Cấu hình áp dụng từ lượt chat tiếp theo.");
+      setToolsText(next.config.disabled_tools.join(", "));
+      notify("success", "Đã lưu cài đặt agent", "Cấu hình áp dụng từ lượt chat tiếp theo.");
       await onChanged();
     } catch (error) {
       notify("error", "Không lưu được harness", api.errorMessage(error));
@@ -165,10 +168,10 @@ export function HarnessPanel({ notify, onChanged }: Props) {
     <section className="settings-section harness-section">
       <div className="section-head">
         <div>
-          <h3>Harness</h3>
+          <h3>Agent</h3>
           <p>
-            Cấu hình cách agent xin quyền, nén context, ghi nhớ và chạy hook. Thay đổi có hiệu
-            lực từ lượt chat tiếp theo.
+            Cấu hình quyền, model, context, bộ nhớ và hành vi của agent. Thay đổi có hiệu lực từ
+            lượt chat tiếp theo.
           </p>
         </div>
         <div className="head-actions">
@@ -260,7 +263,97 @@ export function HarnessPanel({ notify, onChanged }: Props) {
                   onChange={(event) => patch({ temperature: Number(event.target.value) || 0 })}
                 />
               </label>
+              <label className="field">
+                <span>Top P</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={draft.top_p}
+                  onChange={(event) => patch({ top_p: Number(event.target.value) || 0 })}
+                />
+              </label>
+              <label className="field">
+                <span>Output tool tối đa (byte)</span>
+                <input
+                  type="number"
+                  min={1024}
+                  max={65536}
+                  step={1024}
+                  value={draft.max_tool_output}
+                  onChange={(event) =>
+                    patch({ max_tool_output: Number(event.target.value) || 1024 })
+                  }
+                />
+              </label>
+              <label className="field">
+                <span>Số bước subagent</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={draft.subagent_max_steps}
+                  onChange={(event) =>
+                    patch({ subagent_max_steps: Number(event.target.value) || 1 })
+                  }
+                />
+              </label>
             </div>
+          </div>
+
+          <div className="harness-block">
+            <div className="harness-block-head">
+              <h4>Hành vi & ngôn ngữ</h4>
+              <p>
+                Chỉ dẫn bổ sung được nối vào system prompt. Dùng cho phong cách trả lời, quy ước
+                riêng hoặc ngôn ngữ mặc định.
+              </p>
+            </div>
+            <label className="field field-wide">
+              <span>System prompt bổ sung</span>
+              <textarea
+                className="system-prompt"
+                value={draft.system_prompt}
+                onChange={(event) => patch({ system_prompt: event.target.value })}
+                placeholder="Ví dụ: trả lời ngắn gọn, luôn nêu rủi ro trước khi sửa file, dùng tiếng Việt…"
+                rows={4}
+              />
+            </label>
+            <div className="field-grid">
+              <label className="field">
+                <span>Ngôn ngữ trả lời</span>
+                <select
+                  value={draft.language}
+                  onChange={(event) => patch({ language: event.target.value })}
+                >
+                  <option value="vi">Tiếng Việt</option>
+                  <option value="en">English</option>
+                </select>
+              </label>
+              <label className="field field-wide">
+                <span>Tool bị tắt</span>
+                <input
+                  value={toolsText}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setToolsText(value);
+                    patch({
+                      disabled_tools: value
+                        .split(",")
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    });
+                  }}
+                  placeholder="ví dụ: run_command, task"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+            <p className="field-note">
+              Tên tool phân tách bằng dấu phẩy. Tool bị tắt sẽ không được gửi cho model ở lượt
+              tiếp theo.
+            </p>
           </div>
 
           <div className="harness-block">

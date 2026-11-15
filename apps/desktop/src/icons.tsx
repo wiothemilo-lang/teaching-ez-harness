@@ -86,6 +86,14 @@ export function IconArrowUp(props: IconProps) {
   );
 }
 
+export function IconStop(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <rect x="7" y="7" width="10" height="10" rx="1.5" />
+    </Glyph>
+  );
+}
+
 export function IconArrowRight(props: IconProps) {
   return (
     <Glyph {...props}>
@@ -306,6 +314,15 @@ export function IconSparkle(props: IconProps) {
     <Glyph {...props}>
       <path d="M12 3.5 13.6 9l5.4 1.6-5.4 1.6L12 17.5l-1.6-5.3L5 10.6 10.4 9z" />
       <path d="M18.5 16.5 19.2 19l2.3.7-2.3.8-.7 2.5-.7-2.5-2.3-.8 2.3-.7z" />
+    </Glyph>
+  );
+}
+
+export function IconSearch(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="m16 16 4 4" />
     </Glyph>
   );
 }

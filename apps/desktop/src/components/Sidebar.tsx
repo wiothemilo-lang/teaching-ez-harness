@@ -1,12 +1,13 @@
 import type { AppMode, AppStatus, SessionInfo, SettingsTab } from "../types";
-import { MODE_LABELS, relativeTime, subjectName } from "../lib";
+import { MODE_LABELS, relativeTime } from "../lib";
 import {
   IconChat,
   IconChevronRight,
   IconCode,
+  IconFolder,
   IconPlus,
+  IconSearch,
   IconSliders,
-  subjectIcon,
 } from "../icons";
 import { Spinner } from "./ui";
 
@@ -14,36 +15,30 @@ type Props = {
   status: AppStatus;
   sessions: SessionInfo[];
   mode: AppMode;
-  subject: string;
-  grade: string;
   workspace: string;
   sessionId: string | null;
   loadingSession: boolean;
   onMode: (mode: AppMode) => void;
-  onSubject: (id: string) => void;
-  onGrade: (grade: string) => void;
   onNewSession: () => void;
   onOpenSession: (id: string) => void;
   onOpenSettings: (tab: SettingsTab) => void;
+  onCommand: () => void;
+  onOpenWorkspace: () => void;
 };
-
-const GRADES = ["10", "11", "12"];
 
 export function Sidebar({
   status,
   sessions,
   mode,
-  subject,
-  grade,
   workspace,
   sessionId,
   loadingSession,
   onMode,
-  onSubject,
-  onGrade,
   onNewSession,
   onOpenSession,
   onOpenSettings,
+  onCommand,
+  onOpenWorkspace,
 }: Props) {
   const modes: AppMode[] = ["chat", "code"];
 
@@ -55,9 +50,21 @@ export function Sidebar({
         </div>
         <div className="brand-copy">
           <div className="brand-name">tez</div>
-          <div className="brand-sub">local-first workspace</div>
+          <div className="brand-sub">agent workspace</div>
         </div>
       </header>
+
+      <button className="command-trigger" onClick={onCommand}>
+        <IconSearch size={15} />
+        <span>Tìm hoặc chạy lệnh…</span>
+        <kbd>Ctrl K</kbd>
+      </button>
+
+      <button className="new-session" onClick={onNewSession}>
+        <IconPlus size={15} />
+        <span>Cuộc trò chuyện mới</span>
+        <kbd>Ctrl N</kbd>
+      </button>
 
       <div className="mode-switch" role="tablist" aria-label="Chế độ làm việc">
         {modes.map((item) => (
@@ -74,63 +81,21 @@ export function Sidebar({
         ))}
       </div>
 
-      <button className="new-session" onClick={onNewSession}>
-        <IconPlus size={15} />
-        <span>{mode === "code" ? "Phiên code mới" : "Hội thoại mới"}</span>
-        <kbd>Ctrl N</kbd>
-      </button>
-
-      {mode === "chat" ? (
-        <>
-          <div className="side-section">
-            <div className="side-label">Chủ đề</div>
-            <nav className="subject-list" aria-label="Chủ đề">
-              {status.subjects.map((item) => {
-                const active = item.id === subject;
-                return (
-                  <button
-                    key={item.id}
-                    className={`subject ${active ? "is-active" : ""}`}
-                    onClick={() => onSubject(item.id)}
-                    aria-current={active ? "true" : undefined}
-                  >
-                    <span className="subject-icon">{subjectIcon(item.id, 16)}</span>
-                    <span className="subject-name">{item.name}</span>
-                    {active && <span className="subject-dot" aria-hidden="true" />}
-                  </button>
-                );
-              })}
-            </nav>
-          </div>
-
-          {subject !== "general" && (
-            <div className="side-section">
-              <div className="side-label">Lớp</div>
-              <div className="grade-group" role="group" aria-label="Lớp">
-                {GRADES.map((item) => (
-                  <button
-                    key={item}
-                    className={item === grade ? "is-active" : ""}
-                    onClick={() => onGrade(item)}
-                    aria-pressed={item === grade}
-                  >
-                    {item}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="side-section">
-          <div className="side-label">Workspace</div>
-          <div className="workspace-chip" title={workspace || "Workspace mặc định"}>
-            <IconCode size={14} />
-            <code>{workspace ? shortPath(workspace) : "mặc định"}</code>
-          </div>
-          <p className="side-hint">Agent chỉ đọc/ghi trong thư mục này.</p>
-        </div>
-      )}
+      <div className="side-section workspace-section">
+        <div className="side-label">Workspace</div>
+        <button className="workspace-card" onClick={onOpenWorkspace} title={workspace || "Chọn workspace"}>
+          <IconFolder size={15} />
+          <span className="workspace-copy">
+            <strong>{workspace ? shortPath(workspace) : "Chưa chọn thư mục"}</strong>
+            <small>
+              {mode === "code"
+                ? "Agent đọc/ghi file trong thư mục này"
+                : "Chuyển sang Code để dùng công cụ file"}
+            </small>
+          </span>
+          <IconChevronRight size={14} />
+        </button>
+      </div>
 
       <div className="side-section sessions-section">
         <div className="side-label sessions-label">
@@ -148,16 +113,14 @@ export function Sidebar({
                   key={session.id}
                   className={`session ${active ? "is-active" : ""}`}
                   onClick={() => onOpenSession(session.id)}
-                  title={subjectName(status.subjects, session.subject)}
+                  title={session.summary ?? undefined}
                 >
                   <span className="session-head">
                     <span className={`session-mode mode-${session.mode}`}>
                       {session.mode === "code" ? "CODE" : "CHAT"}
                     </span>
                     <span className="session-title">
-                      {session.mode === "code"
-                        ? "Phiên code"
-                        : subjectName(status.subjects, session.subject)}
+                      {session.summary?.trim() || (session.mode === "code" ? "Phiên code" : "Hội thoại")}
                     </span>
                   </span>
                   <span className="session-meta">
@@ -183,9 +146,9 @@ export function Sidebar({
           </span>
           <IconChevronRight size={14} />
         </button>
-        <button className="side-settings" onClick={() => onOpenSettings("providers")}>
+        <button className="side-settings" onClick={() => onOpenSettings("harness")}>
           <IconSliders size={16} />
-          <span>Cài đặt</span>
+          <span>Cài đặt agent</span>
           <span className="side-counts">v{status.version}</span>
         </button>
       </footer>

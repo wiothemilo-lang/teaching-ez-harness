@@ -127,22 +127,35 @@ impl SkillRegistry {
 
     /// Chọn tối đa `limit` skill khớp môn và từ khóa.
     pub fn matching(&self, subject: &str, query: &str, limit: usize) -> Vec<&Skill> {
+        self.select(query, limit, |skill| {
+            skill.subjects.is_empty()
+                || skill
+                    .subjects
+                    .iter()
+                    .any(|item| item == "all" || item == subject)
+        })
+    }
+
+    /// Chọn skill chỉ theo từ khóa, không ràng buộc môn học.
+    pub fn matching_query(&self, query: &str, limit: usize) -> Vec<&Skill> {
+        self.select(query, limit, |_| true)
+    }
+
+    fn select<F>(&self, query: &str, limit: usize, subject_ok: F) -> Vec<&Skill>
+    where
+        F: Fn(&Skill) -> bool,
+    {
         let query = query.to_lowercase();
         let mut matched: Vec<&Skill> = self
             .skills
             .iter()
             .filter(|skill| {
-                let subject_ok = skill.subjects.is_empty()
-                    || skill
-                        .subjects
-                        .iter()
-                        .any(|item| item == "all" || item == subject);
                 let trigger_ok = skill.triggers.is_empty()
                     || skill
                         .triggers
                         .iter()
                         .any(|trigger| query.contains(&trigger.to_lowercase()));
-                subject_ok && trigger_ok
+                subject_ok(skill) && trigger_ok
             })
             .collect();
         matched.sort_by(|a, b| a.name.cmp(&b.name));

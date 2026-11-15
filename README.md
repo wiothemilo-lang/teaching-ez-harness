@@ -82,13 +82,13 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
 | Harness: permission pipeline 4 mức, approval desktop/CLI, hook audit + che bí mật | ✅ |
 | Harness: todo plan, subagent `task`, compaction 4 bước, memory dài hạn | ✅ |
-| `harness.json` + tab **Cài đặt → Harness** (quyền, giới hạn, nén, memory, hook) | ✅ |
+| `harness.json` + tab **Cài đặt → Agent** (quyền, model, system prompt, ngôn ngữ, nén, memory, hook) | ✅ |
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
 | SQLite: session (kèm mode), message, tool call, todo, token usage | ✅ |
 | Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
-| Skills Markdown: 4 built-in, khớp môn + từ khóa, chèn vào context | ✅ |
+| Skills Markdown: 4 built-in, khớp ngữ cảnh + từ khóa, chèn vào context, tạo bằng AI | ✅ |
 | MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace | ✅ |
-| Plugin `plugin.json`: gói skills + MCP server, plugin mẫu | ✅ |
+| Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
 | Vault AES-256-GCM cho API key | ✅ |
@@ -96,7 +96,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Disk quota + cleanup (`scripts/disk-guard.sh`) | ✅ |
 | RAG PDF/DOCX, context inspector | ⏳ |
 | Tauri desktop: hai chế độ Chat/Code, tool trace, lịch sử phiên, todo/context dock | ✅ |
-| Desktop: giao diện tối kiểu Claude Code, quản lý provider, skills/MCP/plugin, harness, dữ liệu | ✅ |
+| Desktop: giao diện tối kiểu Claude Code, command palette `Ctrl K`, tạo skill/MCP/plugin bằng AI | ✅ |
 | Kiểm tra + tải cập nhật từ GitHub Releases (desktop & CLI) | ✅ |
 | Đóng gói AppImage Linux + installer Windows (NSIS/MSI) | ✅ |
 
@@ -225,7 +225,7 @@ Hiện hỗ trợ UTF-8 `.txt`/`.md`. PDF/DOCX sẽ thêm ở bước sau (cần
 ./target/debug/tez plugins
 ```
 
-- **Skill** là prompt pack, được khớp theo môn + từ khóa và chèn vào system prompt (tối đa 2 skill/lượt).
+- **Skill** là prompt pack, được khớp theo từ khóa câu hỏi và chèn vào system prompt (tối đa 2 skill/lượt); môn học chỉ còn là bộ lọc tùy chọn cho RAG và preset CLI.
 - **MCP** là tool ngoài qua stdio JSON-RPC; tên tool có dạng `mcp__<server>__<tool>`.
 - **Plugin** là gói `plugin.json` chứa skills + MCP server, không chạy code tùy ý.
 
@@ -278,6 +278,9 @@ Dữ liệu người dùng nằm ở `~/.local/share/teaching-ez/`:
 
 Mọi thứ tự lớn (toolchain, cache, build, log, DB, model Ollama) đều có hạn mức mềm/cứng và quy trình dọn dẹp:
 
+- **Rust build tổng ≤ 30GB** (mềm 24GB): vượt mềm dọn incremental/cache cũ, vượt cứng `cargo clean`.
+- Tự chạy trước mỗi build và mỗi 6 giờ qua cron; không dọn khi `cargo`/`rustc` đang chạy.
+
 ```bash
 ./scripts/disk-guard.sh check
 ./scripts/disk-guard.sh clean
@@ -302,19 +305,19 @@ scripts/desktop.sh appimage        # đóng gói AppImage (release)
 scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 ```
 
-**Sử dụng:** mở **tez — Chat & Code** từ menu → **Cài đặt → Nhà cung cấp** → chọn preset (Groq, Gemini, OpenRouter, OpenAI, Ollama) hoặc Custom → dán API key (để trống nếu endpoint không cần key) → **Lưu nhà cung cấp** → **Kiểm tra**.
+**Sử dụng:** mở **tez — Chat & Code** từ menu → **Cài đặt → Model** → chọn preset (Groq, Gemini, OpenRouter, OpenAI, Ollama) hoặc Custom → dán API key (để trống nếu endpoint không cần key) → **Lưu nhà cung cấp** → **Kiểm tra**.
 
-Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar có công tắc **Chat / Code**; mỗi chế độ có phiên riêng.
+Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar gọn với workspace, danh sách phiên và công tắc **Chat / Code**; `Ctrl K` mở command palette để chuyển chế độ, mở cài đặt hoặc tạo extension.
 
-- **Chat:** trợ lý tổng quát, không bắt chọn môn. Preset môn/lớp vẫn có nếu muốn; tool trace có args/kết quả/thời gian, token usage.
+- **Chat:** trợ lý tổng quát, không bắt chọn môn hay lớp; câu trả lời stream dần, nút gửi đổi thành nút **dừng** khi agent đang chạy; tool trace có args/kết quả/thời gian, token usage.
 - **Code:** nhập hoặc mở workspace; agent dùng `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `todo_write`, `task`, `compact` và bị giới hạn trong thư mục đó.
 - **Duyệt thao tác:** khi permission mode yêu cầu, app hiện hộp thoại kèm lý do, tool và args JSON; chọn **Từ chối** hoặc **Cho phép chạy**.
 - **Dock harness:** ngay trên ô nhập, hiện kế hoạch todo, thanh context so với giới hạn, số lượt nén và số thao tác bị chặn.
-- **Cài đặt → Harness:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), giới hạn bước/token/nhiệt độ, bật/tắt compaction, memory, quản lý hook shell và xoá bản ghi memory.
-- **Cài đặt → Nhà cung cấp:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
-- **Cài đặt → Kỹ năng:** xem skill, môn, từ khóa, nội dung Markdown, mở thư mục.
-- **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool.
-- **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục.
+- **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
+- **Cài đặt → Model:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
+- **Cài đặt → Kỹ năng:** xem skill, ngữ cảnh, từ khóa, nội dung Markdown, mở thư mục, hoặc **Tạo với AI** (mô tả → xem trước `SKILL.md` → lưu).
+- **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool; **Tạo với AI** sinh cấu hình stdio.
+- **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục; **Tạo với AI** sinh `plugin.json` + skill.
 - **Cài đặt → Cập nhật:** kiểm tra GitHub Releases, xem ghi chú, tải installer phù hợp, mở file đã tải.
 - **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình.
 
@@ -332,7 +335,7 @@ Chạy không cần FUSE:
 
 ## Giới hạn hiện tại
 
-- Chưa streaming; câu trả lời hiện về một lần.
+- Streaming phát text theo từng đoạn; tool call vẫn được gom đủ trong một lượt. Nút dừng có hiệu lực giữa các bước, lệnh đang chạy chưa bị kill.
 - RAG chỉ nhận `.txt`/`.md`; PDF/DOCX/OCR chưa có.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
 - MCP chỉ hỗ trợ stdio; server spawn mỗi lượt chat, timeout 20 giây, chưa sandbox.
@@ -361,5 +364,5 @@ Chạy không cần FUSE:
 1. RAG PDF/DOCX + OCR, `context inspect` để xem token từng phần.
 2. Lưu connection vào SQLite + OS keychain (thay master key file).
 3. Thêm tool Anh (`vocabulary_lookup`) và eval 8 case/môn.
-4. Streaming SSE cho desktop.
+4. Permission rule theo tool/đường dẫn, diff preview trước khi ghi file và plan mode.
 5. Ký số installer Windows và bật auto-update có xác minh chữ ký.
