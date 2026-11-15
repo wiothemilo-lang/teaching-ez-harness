@@ -10,11 +10,13 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tez_llm::ToolSpec;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{Tool, ToolError, ToolOutput};
 
 const MAX_READ_BYTES: u64 = 256 * 1024;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_ENTRIES: usize = 300;
 
 /// Thư mục làm việc đã chuẩn hóa, dùng chung cho các tool Code.
@@ -212,6 +214,12 @@ impl Tool for ReadFile {
         if metadata.is_dir() {
             return Ok(ToolOutput::error(
                 "đây là thư mục; dùng list_files để xem nội dung",
+            ));
+        }
+        // FIFO/device/socket: đọc sẽ treo vô hạn và giữ runtime không thoát được.
+        if !metadata.is_file() {
+            return Ok(ToolOutput::error(
+                "đây không phải file thường (FIFO/device/socket); từ chối đọc",
             ));
         }
         if metadata.len() > MAX_READ_BYTES {
@@ -813,21 +821,56 @@ impl Tool for RunCommand {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let child = process
+        // Đưa cả cây lệnh vào một process group để timeout có thể dừng cả process cháu.
+        #[cfg(unix)]
+        process.process_group(0);
+
+        let mut child = process
             .spawn()
             .map_err(|error| ToolError::Execution(format!("không chạy được lệnh: {error}")))?;
+        let pid = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ToolError::Execution("không bắt được stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ToolError::Execution("không bắt được stderr".into()))?;
+        let stdout_task = tokio::spawn(read_capped(stdout));
+        let stderr_task = tokio::spawn(read_capped(stderr));
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await;
 
         match result {
-            Ok(Ok(output)) => {
-                let mut text = format!("exit code: {}", output.status.code().unwrap_or(-1));
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(Ok(status)) => {
+                let (stdout, stdout_total) = match join_reader(stdout_task).await {
+                    Some(value) => value,
+                    None => {
+                        // Process cháu giữ pipe: dừng cả cây để không rò rỉ task/process.
+                        if let Some(pid) = pid {
+                            kill_process_tree(pid);
+                        }
+                        (String::new(), 0)
+                    }
+                };
+                let (stderr, stderr_total) = join_reader(stderr_task).await.unwrap_or_default();
+                let mut text = format!("exit code: {}", status.code().unwrap_or(-1));
+                if stdout_total > stdout.len() {
+                    text.push_str(&format!(
+                        "\n… (stdout bị cắt: {} / {} byte)",
+                        stdout.len(),
+                        stdout_total
+                    ));
+                }
+                if stderr_total > stderr.len() {
+                    text.push_str(&format!(
+                        "\n… (stderr bị cắt: {} / {} byte)",
+                        stderr.len(),
+                        stderr_total
+                    ));
+                }
                 if !stdout.trim().is_empty() {
                     text.push_str("\n--- stdout ---\n");
                     text.push_str(stdout.trim_end());
@@ -840,18 +883,82 @@ impl Tool for RunCommand {
                     text.push_str("\n(không có output)");
                 }
                 cap_text(&mut text);
-                if output.status.success() {
+                if status.success() {
                     Ok(ToolOutput::ok(text))
                 } else {
                     Ok(ToolOutput::error(text))
                 }
             }
-            Ok(Err(error)) => Ok(ToolOutput::error(format!("lỗi khi chờ lệnh: {error}"))),
-            Err(_) => Ok(ToolOutput::error(format!(
-                "lệnh vượt quá {timeout_secs}s và đã bị dừng"
-            ))),
+            Ok(Err(error)) => {
+                if let Some(pid) = pid {
+                    kill_process_tree(pid);
+                }
+                Ok(ToolOutput::error(format!("lỗi khi chờ lệnh: {error}")))
+            }
+            Err(_) => {
+                if let Some(pid) = pid {
+                    kill_process_tree(pid);
+                }
+                let _ = child.kill().await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                })
+                .await;
+                Ok(ToolOutput::error(format!(
+                    "lệnh vượt quá {timeout_secs}s và đã bị dừng"
+                )))
+            }
         }
     }
+}
+
+/// Đọc tối đa `MAX_COMMAND_OUTPUT_BYTES`, vẫn drain hết pipe để process không bị chặn.
+async fn read_capped<R>(mut reader: R) -> (String, usize)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                total += read;
+                let room = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(kept.len());
+                if room > 0 {
+                    kept.extend_from_slice(&buffer[..read.min(room)]);
+                }
+            }
+        }
+    }
+    (String::from_utf8_lossy(&kept).into_owned(), total)
+}
+
+/// Process cháu có thể giữ pipe mở; không chờ nó vô hạn sau khi lệnh chính đã xong.
+async fn join_reader(handle: tokio::task::JoinHandle<(String, usize)>) -> Option<(String, usize)> {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+        Ok(Ok(value)) => Some(value),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(pid: u32) {
+    // Child được spawn với process_group(0), nên pid cũng là pgid.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 #[cfg(test)]
@@ -1003,5 +1110,59 @@ mod tests {
         let read = ReadFile::new(workspace);
         let output = read.execute(json!({"path": "alias.txt"})).await.unwrap();
         assert_eq!(output.content, "hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_fifo_instead_of_blocking() {
+        let (dir, workspace) = workspace();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("không chạy được mkfifo");
+        assert!(status.success());
+
+        let read = ReadFile::new(workspace);
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read.execute(json!({"path": "pipe"})),
+        )
+        .await
+        .expect("đọc FIFO không được treo")
+        .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("file thường"), "{}", output.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caps_large_command_output() {
+        let (_dir, workspace) = workspace();
+        let command = RunCommand::new(workspace);
+        let output = command
+            .execute(json!({"command": "yes x | head -c 200000", "timeout_secs": 10}))
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.len() < 20_000, "output phải được cắt");
+        assert!(output.content.contains("đã cắt bớt output"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_stops_background_children() {
+        let (_dir, workspace) = workspace();
+        let command = RunCommand::new(workspace);
+        let started = std::time::Instant::now();
+        let output = command
+            .execute(json!({"command": "sleep 30 & wait", "timeout_secs": 1}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "timeout phải dừng cả cây lệnh, không chờ sleep 30"
+        );
     }
 }
