@@ -438,14 +438,17 @@ hoạch đúng schema Markdown 6 mục cấp 2: `Mục tiêu`, `Phạm vi`,
 `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`, rồi dừng để người dùng
 chuyển sang Code. `plan.rs` parse heading cấp 2 (heading cấp 3 vẫn thuộc mục
 cha), coi mục thiếu hoặc rỗng là chưa hoàn chỉnh; PlanDialog có form nhập từng
-mục bên cạnh Markdown đầy đủ, hiện cảnh báo mục thiếu; CLI in cảnh báo ra stderr
+mục bên cạnh Markdown đầy đủ, hiện cảnh báo mục thiếu; **Lưu kế hoạch** từ chối
+bản chưa đủ, **Lưu nháp** cho phép giữ bản chưa hoàn chỉnh; CLI in cảnh báo ra stderr
 nhưng vẫn lưu để người dùng bổ sung.
 
 Mỗi lượt Plan, văn bản cuối được lưu vào `plans/<session>.md` qua
 `crates/tez-core/src/plan.rs`; file bị cap 200.000 ký tự và tên session được làm
 sạch (chỉ ASCII chữ/số, `-`, `_`) để không thoát khỏi thư mục `plans/`. Desktop
 dùng chung `ChatView` với cờ `planMode`; nút **Kế hoạch** trên header mở
-`PlanDialog`, gọi `load_session_plan`/`save_session_plan` để xem, sửa và lưu plan
+`PlanDialog`, gọi `load_session_plan`/`save_session_plan` để xem, sửa và lưu plan;
+`save_session_plan` nhận `allow_incomplete` — **Lưu kế hoạch** gửi `false` và bị
+từ chối nếu thiếu mục, **Lưu nháp** gửi `true`
 mà không cần chạy lại agent. CLI nhận `--mode plan` và cũng lưu plan.
 Khi chuyển Plan → Code, desktop giữ nguyên `session_id`, cập nhật mode trong
 SQLite (`Store::update_session_mode`), nạp lại plan đã lưu và chèn chỉ dẫn “thực

@@ -46,8 +46,12 @@ export function loadSessionPlan(sessionId: string): Promise<PlanInfo> {
   return invoke("load_session_plan", { sessionId });
 }
 
-export function saveSessionPlan(sessionId: string, text: string): Promise<PlanInfo> {
-  return invoke("save_session_plan", { sessionId, text });
+export function saveSessionPlan(
+  sessionId: string,
+  text: string,
+  allowIncomplete = false,
+): Promise<PlanInfo> {
+  return invoke("save_session_plan", { sessionId, text, allowIncomplete });
 }
 
 export function respondApproval(

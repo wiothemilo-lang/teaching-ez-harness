@@ -130,16 +130,20 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
 
   const sections = parseSections(text);
 
-  const save = async () => {
+  const save = async (allowIncomplete: boolean) => {
     if (!sessionId || saving) return;
     setSaving(true);
     setError(null);
     try {
-      const info = await api.saveSessionPlan(sessionId, text);
+      const info = await api.saveSessionPlan(sessionId, text, allowIncomplete);
       setPath(info.path);
       setValid(info.valid);
       setMissing(info.missing);
-      notify("success", "Đã lưu kế hoạch", info.path);
+      notify(
+        "success",
+        allowIncomplete ? "Đã lưu bản nháp" : "Đã lưu kế hoạch",
+        info.path,
+      );
     } catch (saveError) {
       setError(api.errorMessage(saveError));
     } finally {
@@ -232,17 +236,25 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
                   Đóng
                 </button>
                 <button
-                  className="btn btn-primary"
-                  onClick={() => void save()}
+                  className="btn"
+                  onClick={() => void save(true)}
                   disabled={saving || !text.trim()}
+                >
+                  Lưu nháp
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void save(false)}
+                  disabled={saving || !text.trim() || !valid}
                 >
                   {saving ? "Đang lưu…" : "Lưu kế hoạch"}
                 </button>
               </div>
 
               <p className="field-note">
-                File nằm ngoài SQLite tại đường dẫn trên. Agent ở chế độ Code sẽ đọc lại kế hoạch
-                này ở lượt tiếp theo.
+                <strong>Lưu kế hoạch</strong> yêu cầu đủ 6 mục; <strong>Lưu nháp</strong> giữ bản
+                chưa hoàn chỉnh. File nằm ngoài SQLite tại đường dẫn trên; agent ở chế độ Code sẽ
+                đọc lại ở lượt tiếp theo.
               </p>
             </>
           )}

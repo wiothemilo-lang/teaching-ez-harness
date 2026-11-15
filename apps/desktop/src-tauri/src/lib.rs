@@ -2071,14 +2071,24 @@ fn load_session_plan(session_id: String) -> Result<PlanInfo, String> {
 }
 
 #[tauri::command]
-fn save_session_plan(session_id: String, text: String) -> Result<PlanInfo, String> {
+fn save_session_plan(
+    session_id: String,
+    text: String,
+    allow_incomplete: bool,
+) -> Result<PlanInfo, String> {
+    let validation = plan::validate(&text);
+    if !allow_incomplete && !validation.valid {
+        return Err(format!(
+            "Kế hoạch thiếu mục: {}. Dùng 'Lưu nháp' nếu muốn giữ bản chưa đủ.",
+            validation.missing.join(", ")
+        ));
+    }
     let dir = data_dir().map_err(friendly)?;
     let path = plan::save_plan(&dir, &session_id, &text).map_err(|error| error.to_string())?;
     let path = path
         .unwrap_or_else(|| plan::plan_path(&dir, &session_id))
         .display()
         .to_string();
-    let validation = plan::validate(&text);
     Ok(PlanInfo {
         path,
         text,
