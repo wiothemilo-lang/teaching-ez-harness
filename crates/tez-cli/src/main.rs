@@ -1179,7 +1179,7 @@ impl TurnContext<'_> {
         let _ = printer.await;
 
         if self.mode == Mode::Plan {
-            if let Err(error) = plan::save_plan(self.dir, self.session_id, &outcome.text) {
+            if let Err(error) = plan::save_plan_if_completed(self.dir, self.session_id, &outcome) {
                 eprintln!("[plan] không lưu được kế hoạch: {error}");
             }
         }
@@ -1542,6 +1542,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             hooks: Arc::clone(&hooks),
             max_steps: config.max_steps,
             compaction: config.compaction.clone(),
+            cancel: None,
+            disabled_tools: config.disabled_tools.clone(),
         });
         tools.register(TaskTool::new(runtime));
     }
@@ -1549,6 +1551,9 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     skills.load_project(&workspace)?;
     tools.register(SkillTool::new(skills.clone()));
     tools.register(WebFetchTool::new());
+    if !config.disabled_tools.is_empty() {
+        tools = tools.without(&config.disabled_tools);
+    }
     let project_instructions = project::ProjectContext::load(&workspace).render();
 
     let turn = TurnContext {

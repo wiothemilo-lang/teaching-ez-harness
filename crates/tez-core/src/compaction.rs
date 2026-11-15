@@ -257,6 +257,15 @@ impl Compactor {
             return 0;
         }
 
+        // Ảnh không tái tạo được từ transcript text; bỏ qua snip nếu vùng bị
+        // cắt có message mang ảnh (summary sẽ giữ lại các message này).
+        if messages[head_end..tail_start]
+            .iter()
+            .any(|message| !message.images.is_empty())
+        {
+            return 0;
+        }
+
         let removed = tail_start - head_end;
         let transcript = self.write_transcript(messages);
         report.transcript = transcript.as_ref().map(|path| path.display().to_string());
@@ -316,7 +325,8 @@ impl Compactor {
         count
     }
 
-    /// Thay lịch sử bằng một message tóm tắt, giữ system prompt.
+    /// Thay lịch sử bằng một message tóm tắt, giữ system prompt và mọi message
+    /// còn mang ảnh đính kèm (ảnh không thể tái tạo từ transcript text).
     pub fn apply_summary(
         &self,
         messages: &mut Vec<Message>,
@@ -327,6 +337,11 @@ impl Compactor {
         let systems: Vec<Message> = messages
             .iter()
             .filter(|message| message.role == "system")
+            .cloned()
+            .collect();
+        let image_messages: Vec<Message> = messages
+            .iter()
+            .filter(|message| message.role != "system" && !message.images.is_empty())
             .cloned()
             .collect();
 
@@ -344,6 +359,7 @@ impl Compactor {
 
         let mut next = systems;
         next.push(Message::user(body));
+        next.extend(image_messages);
         *messages = next;
 
         CompactReport {
@@ -548,6 +564,27 @@ mod tests {
     }
 
     #[test]
+    fn snip_does_not_drop_attached_images() {
+        let compactor = Compactor::new(
+            CompactSettings {
+                trigger_messages: 10,
+                target_messages: 6,
+                ..CompactSettings::default()
+            },
+            None,
+        );
+        let mut messages = conversation(20);
+        messages.insert(
+            8,
+            Message::user_with_images("ảnh cũ", vec!["data:image/png;base64,AAAA".into()]),
+        );
+
+        let report = compactor.prepare(&mut messages);
+        assert_eq!(report.snipped, 0);
+        assert!(messages.iter().any(|message| !message.images.is_empty()));
+    }
+
+    #[test]
     fn micro_compacts_old_results() {
         let dir = tempfile::tempdir().unwrap();
         let compactor = Compactor::new(
@@ -649,5 +686,30 @@ mod tests {
             .unwrap()
             .contains("chạy test"));
         assert!(report.transcript.is_some());
+    }
+
+    #[test]
+    fn summary_preserves_attached_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = Compactor::new(CompactSettings::default(), Some(dir.path().to_path_buf()));
+        let image = "data:image/png;base64,AAAA".to_string();
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("xem ảnh này"),
+            Message::user_with_images("ảnh bài tập", vec![image.clone()]),
+            Message::assistant("đã xem"),
+            Message::user("tiếp tục"),
+        ];
+        compactor.apply_summary(&mut messages, "tóm tắt", Some("giải bài trong ảnh"));
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert!(messages[1].content.as_deref().unwrap().contains("tóm tắt"));
+        let kept = messages
+            .iter()
+            .find(|message| !message.images.is_empty())
+            .expect("message mang ảnh phải được giữ");
+        assert_eq!(kept.images, vec![image]);
+        assert_eq!(kept.content.as_deref(), Some("ảnh bài tập"));
     }
 }

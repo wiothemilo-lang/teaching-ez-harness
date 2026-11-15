@@ -1702,6 +1702,8 @@ async fn chat_inner(
             hooks: Arc::clone(&hooks),
             max_steps: config.subagent_max_steps,
             compaction: config.compaction.clone(),
+            cancel: Some(cancel.clone()),
+            disabled_tools: config.disabled_tools.clone(),
         });
         tools.register(TaskTool::new(runtime));
     }
@@ -1741,7 +1743,7 @@ async fn chat_inner(
     let latency_ms = started.elapsed().as_millis() as u64;
 
     if plan_mode {
-        if let Err(error) = plan::save_plan(&dir, &session_id, &outcome.text) {
+        if let Err(error) = plan::save_plan_if_completed(&dir, &session_id, &outcome) {
             eprintln!("không lưu được kế hoạch: {error}");
         }
     }
