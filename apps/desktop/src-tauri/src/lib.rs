@@ -21,7 +21,7 @@ use tez_core::permission::{
 };
 use tez_core::plugins;
 use tez_core::project;
-use tez_core::skills::{self, SkillRegistry};
+use tez_core::skills::SkillRegistry;
 use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects;
 use tez_core::todo::{TodoItem, TodoState, TodoWrite};
@@ -32,6 +32,8 @@ use tez_core::tools::check_step::CheckStep;
 use tez_core::tools::convert_units::ConvertUnits;
 use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
+use tez_core::tools::skill::SkillTool;
+use tez_core::tools::web::WebFetchTool;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::{code_registry, ToolRegistry};
@@ -177,6 +179,8 @@ struct AppStatus {
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
     message: String,
+    #[serde(default)]
+    images: Vec<String>,
     session_id: Option<String>,
     provider_id: Option<String>,
     #[serde(default)]
@@ -1374,14 +1378,16 @@ async fn chat_inner(
     drop(store);
 
     let mut recent = history;
-    recent.push(Message::user(request.message.clone()));
+    recent.push(Message::user_with_images(
+        request.message.clone(),
+        request.images.clone(),
+    ));
 
     let mut registry = SkillRegistry::load_with_plugins(&dir)?;
     if let Some(root) = workspace.as_deref() {
         registry.load_project(root)?;
     }
-    let matched = registry.matching_query(&request.message, 2);
-    let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
+    let skill_catalog = registry.catalog_lines(50);
 
     let recalled = if config.memory.enabled && config.memory.auto_recall {
         let records = memory_store.search(&request.message, config.memory.recall_limit);
@@ -1403,7 +1409,7 @@ async fn chat_inner(
     let mut messages = ContextBuilder.build(ContextInput {
         recent: &recent,
         excerpts: &excerpts,
-        skills: &skill_snippets,
+        skills: &skill_catalog,
         memory: &recalled,
         todos: &todo_snapshot,
         mode,
@@ -1443,6 +1449,8 @@ async fn chat_inner(
         tools.register(MemoryForget::new(memory_store.clone()));
     }
     tools.register(TodoWrite::new(Arc::clone(&todos)));
+    tools.register(SkillTool::new(registry.clone()));
+    tools.register(WebFetchTool::new());
     if !plan_mode {
         let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
         for tool in discovery.tools {

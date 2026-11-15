@@ -158,6 +158,27 @@ impl SkillRegistry {
         self.skills.iter().find(|skill| skill.id == id)
     }
 
+    /// Các dòng mô tả ngắn để đưa danh mục skill vào prompt.
+    ///
+    /// Skill không có description vẫn hiện, chỉ thiếu phần mô tả. Danh sách
+    /// sắp theo id để prompt ổn định giữa các lần chạy.
+    pub fn catalog_lines(&self, limit: usize) -> Vec<String> {
+        let mut skills: Vec<&Skill> = self.skills.iter().collect();
+        skills.sort_by(|a, b| a.id.cmp(&b.id));
+        skills
+            .into_iter()
+            .take(limit)
+            .map(|skill| {
+                let description = truncate_chars(skill.description.trim(), 160);
+                if description.is_empty() {
+                    format!("- {} — {}", skill.id, skill.name)
+                } else {
+                    format!("- {} — {}: {}", skill.id, skill.name, description)
+                }
+            })
+            .collect()
+    }
+
     /// Chọn tối đa `limit` skill khớp môn và từ khóa.
     pub fn matching(&self, subject: &str, query: &str, limit: usize) -> Vec<&Skill> {
         self.select(query, limit, |skill| {
@@ -221,7 +242,7 @@ pub fn render(skill: &Skill) -> String {
 }
 
 /// Không cho nội dung skill đóng thẻ giả để thoát khỏi khối prompt.
-fn neutralize_closing_tag(body: &str) -> String {
+pub(crate) fn neutralize_closing_tag(body: &str) -> String {
     const NEEDLE: &[u8] = b"</skill";
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
@@ -240,7 +261,7 @@ fn neutralize_closing_tag(body: &str) -> String {
     out
 }
 
-fn sanitize_attribute(value: &str) -> String {
+pub(crate) fn sanitize_attribute(value: &str) -> String {
     value
         .chars()
         .map(|ch| match ch {
@@ -250,6 +271,16 @@ fn sanitize_attribute(value: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// Cắt theo ký tự (không theo byte) để không vỡ UTF-8.
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(limit).collect();
+    out.push('…');
+    out
 }
 
 fn load_file(path: &Path, source: &str) -> Result<Option<Skill>, SkillError> {
@@ -450,6 +481,45 @@ mod tests {
         let registry = SkillRegistry::load(dir.path()).unwrap();
         assert!(registry.find("step-by-step").is_some());
         assert!(registry.find("english-writing").is_some());
+    }
+
+    #[test]
+    fn catalog_lists_skills_sorted_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        let lines = registry.catalog_lines(2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("- english-writing — "));
+        assert!(lines[1].starts_with("- error-diagnosis — "));
+        assert!(lines.iter().all(|line| line.contains(": ")));
+        assert_eq!(registry.catalog_lines(0).len(), 0);
+    }
+
+    #[test]
+    fn catalog_truncates_description_and_keeps_skill_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let long_dir = skills_dir.join("long");
+        std::fs::create_dir_all(&long_dir).unwrap();
+        std::fs::write(
+            long_dir.join("SKILL.md"),
+            format!(
+                "---\nname: Long\ndescription: {}\n---\nBody",
+                "x".repeat(200)
+            ),
+        )
+        .unwrap();
+        let plain_dir = skills_dir.join("plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        std::fs::write(plain_dir.join("SKILL.md"), "---\nname: Plain\n---\nBody").unwrap();
+
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        let lines = registry.catalog_lines(10);
+        assert_eq!(lines.len(), 2);
+        let description = lines[0].split_once(": ").unwrap().1;
+        assert_eq!(description.chars().count(), 161);
+        assert!(description.ends_with('…'));
+        assert_eq!(lines[1], "- plain — Plain");
     }
 
     #[test]

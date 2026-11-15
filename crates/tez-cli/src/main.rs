@@ -25,7 +25,7 @@ use tez_core::permission::{
 };
 use tez_core::plugins;
 use tez_core::project;
-use tez_core::skills::{self, SkillRegistry};
+use tez_core::skills::SkillRegistry;
 use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects::{self, SubjectPack};
 use tez_core::todo::{TodoState, TodoWrite};
@@ -38,6 +38,8 @@ use tez_core::tools::molar_mass::MolarMass;
 use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
+use tez_core::tools::skill::SkillTool;
+use tez_core::tools::web::WebFetchTool;
 use tez_core::tools::{code_registry, ToolError, ToolRegistry};
 use tez_llm::{LlmError, LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
@@ -827,9 +829,7 @@ impl TurnContext<'_> {
         let mut recent = conversation.clone();
         recent.push(Message::user(prompt));
 
-        let matched = self.skills.matching_query(prompt, 2);
-        let skill_snippets: Vec<String> =
-            matched.iter().map(|skill| skills::render(skill)).collect();
+        let skill_catalog = self.skills.catalog_lines(50);
 
         let recalled = if self.memory_settings.enabled && self.memory_settings.auto_recall {
             let records = self
@@ -845,7 +845,7 @@ impl TurnContext<'_> {
         let messages = ContextBuilder.build(ContextInput {
             excerpts: &excerpts,
             recent: &recent,
-            skills: &skill_snippets,
+            skills: &skill_catalog,
             memory: &recalled,
             todos: &todos,
             mode: self.mode,
@@ -1097,6 +1097,8 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     }
     let mut skills = SkillRegistry::load_with_plugins(&dir)?;
     skills.load_project(&workspace)?;
+    tools.register(SkillTool::new(skills.clone()));
+    tools.register(WebFetchTool::new());
     let project_instructions = project::ProjectContext::load(&workspace).render();
 
     let turn = TurnContext {

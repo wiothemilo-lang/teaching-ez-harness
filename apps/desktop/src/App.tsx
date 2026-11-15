@@ -36,6 +36,7 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [images, setImages] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUsage, setLastUsage] = useState<{ input: number; output: number } | null>(null);
@@ -162,6 +163,7 @@ export default function App() {
     setSessionId(null);
     setMessages([]);
     setInput("");
+    setImages([]);
     setError(null);
     setLastUsage(null);
     setTodos([]);
@@ -240,6 +242,7 @@ export default function App() {
             })),
         );
         setLastUsage(null);
+        setImages([]);
         setTodos(detail.todos ?? []);
         setCompaction(null);
         setDenials(0);
@@ -267,17 +270,20 @@ export default function App() {
     }
 
     const optimisticId = uid();
+    const attached = images;
     setMessages((previous) => [
       ...previous,
-      { id: optimisticId, role: "user", text },
+      { id: optimisticId, role: "user", text, images: attached },
     ]);
     setInput("");
+    setImages([]);
     setBusy(true);
     setError(null);
 
     try {
       const reply = await api.chat({
         message: text,
+        images: attached,
         session_id: sessionId,
         provider_id: status.connection.id,
         mode,
@@ -309,6 +315,7 @@ export default function App() {
         ),
       );
       setInput(text);
+      setImages(attached);
       setError(errorMessage(sendError));
     } finally {
       setBusy(false);
@@ -319,6 +326,7 @@ export default function App() {
     loadingSession,
     status,
     sessionId,
+    images,
     mode,
     workspace,
     refresh,
@@ -380,6 +388,8 @@ export default function App() {
         <CodeView
           connection={status.connection}
           messages={messages}
+          images={images}
+          onImagesChange={setImages}
           input={input}
           busy={busy}
           streaming={messages.some((message) => message.id === STREAM_MESSAGE_ID)}
@@ -405,6 +415,8 @@ export default function App() {
           connection={status.connection}
           planMode={mode === "plan"}
           messages={messages}
+          images={images}
+          onImagesChange={setImages}
           input={input}
           busy={busy}
           streaming={messages.some((message) => message.id === STREAM_MESSAGE_ID)}
