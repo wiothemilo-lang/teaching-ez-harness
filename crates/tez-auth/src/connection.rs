@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Vault, VaultError};
+use crate::{storage, Vault, VaultError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionFile {
@@ -48,6 +48,15 @@ pub enum ConnectionError {
     ProviderIdNotFound(String),
 }
 
+impl From<storage::ReadError> for ConnectionError {
+    fn from(error: storage::ReadError) -> Self {
+        match error {
+            storage::ReadError::Io(error) => Self::Io(error),
+            storage::ReadError::Json(error) => Self::Json(error),
+        }
+    }
+}
+
 /// Các provider OpenAI-compatible được hỗ trợ sẵn.
 pub const KNOWN_PROVIDERS: &[&str] =
     &["groq", "openrouter", "openai", "gemini", "ollama", "custom"];
@@ -78,17 +87,64 @@ pub fn requires_api_key(provider: &str) -> bool {
 }
 
 /// Kiểm tra base_url là URL http(s) tuyệt đối có host.
+///
+/// Từ chối userinfo (`user@host`), host rỗng, cổng không hợp lệ và URL có
+/// khoảng trắng/ký tự điều khiển.
 pub fn validate_base_url(base_url: &str) -> Result<(), ConnectionError> {
     let url = base_url.trim();
+    let invalid = || ConnectionError::InvalidBaseUrl(url.to_string());
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| ConnectionError::InvalidBaseUrl(url.to_string()))?;
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if host.is_empty() || url.chars().any(char::is_whitespace) {
-        return Err(ConnectionError::InvalidBaseUrl(url.to_string()));
+        .ok_or_else(invalid)?;
+    if url
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(invalid());
     }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(invalid());
+    }
+
+    if let Some(after_open_bracket) = authority.strip_prefix('[') {
+        // IPv6: [::1] hoặc [::1]:11434
+        let (host, after_bracket) = after_open_bracket.split_once(']').ok_or_else(invalid)?;
+        if host.is_empty() {
+            return Err(invalid());
+        }
+        match after_bracket {
+            "" => {}
+            _ => {
+                let port = after_bracket.strip_prefix(':').ok_or_else(invalid)?;
+                if !valid_port(port) {
+                    return Err(invalid());
+                }
+            }
+        }
+    } else {
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        // Host không được rỗng và IPv6 không có ngoặc vuông là không hợp lệ.
+        if host.is_empty() || host.contains(':') {
+            return Err(invalid());
+        }
+        if let Some(port) = port {
+            if !valid_port(port) {
+                return Err(invalid());
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().map(|value| value != 0).unwrap_or(false)
 }
 
 /// Tên hiển thị mặc định cho từng loại provider.
@@ -104,7 +160,9 @@ pub fn display_name(provider: &str) -> &'static str {
     }
 }
 
-/// Endpoint mặc định cho các provider OpenAI-compatible.
+/// Endpoint mặc định cho các provider có endpoint cố định.
+///
+/// `custom` trả về chuỗi rỗng vì không có endpoint mặc định an toàn.
 pub fn default_base_url(provider: &str) -> &'static str {
     match provider.trim().to_lowercase().as_str() {
         "groq" => "https://api.groq.com/openai/v1",
@@ -112,6 +170,8 @@ pub fn default_base_url(provider: &str) -> &'static str {
         "ollama" => "http://127.0.0.1:11434/v1",
         "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
         "openai" => "https://api.openai.com/v1",
+        // Custom không có endpoint mặc định: rơi về OpenAI sẽ gửi key sai chỗ.
+        "custom" => "",
         _ => "https://api.openai.com/v1",
     }
 }
@@ -133,12 +193,7 @@ pub fn path(dir: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn load(dir: impl AsRef<Path>) -> Result<Option<ConnectionFile>, ConnectionError> {
-    let path = path(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(path)?;
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(storage::read_json::<ConnectionFile>(&path(dir))?)
 }
 
 /// Lưu connection mới. `base_url`/`model` rỗng sẽ dùng mặc định của provider.
@@ -186,8 +241,10 @@ pub fn save(
         encrypted_key,
     };
 
-    std::fs::write(path(dir), serde_json::to_vec_pretty(&connection)?)?;
-    restrict_permissions(&path(dir))?;
+    let bytes = serde_json::to_vec_pretty(&connection)?;
+    storage::write_json(&path(dir), &bytes, |bytes| {
+        serde_json::from_slice::<ConnectionFile>(bytes).is_ok()
+    })?;
     Ok(connection)
 }
 
@@ -198,18 +255,6 @@ pub fn decrypt_key(
     let vault = Vault::load(dir)?;
     let bytes = vault.decrypt(&connection.encrypted_key)?;
     String::from_utf8(bytes).map_err(|_| ConnectionError::InvalidKeyEncoding)
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), ConnectionError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), ConnectionError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -234,8 +279,12 @@ mod tests {
     #[test]
     fn custom_requires_base_url() {
         let dir = tempfile::tempdir().unwrap();
-        let error = save(dir.path(), "custom", None, None, "").unwrap_err();
-        assert!(matches!(error, ConnectionError::MissingBaseUrl));
+        for base_url in [None, Some(""), Some("   ")] {
+            let error = save(dir.path(), "custom", base_url, None, "").unwrap_err();
+            assert!(matches!(error, ConnectionError::MissingBaseUrl));
+        }
+        assert!(!path(dir.path()).exists());
+        assert_eq!(default_base_url("custom"), "");
     }
 
     #[test]
@@ -298,6 +347,16 @@ mod tests {
             "ftp://example.com",
             "https://",
             "https://exa mple.com",
+            "https://api.groq.com@evil.tld/v1",
+            "https://user:pass@api.groq.com/v1",
+            "https:///v1",
+            "https://:8080/v1",
+            "https://api.groq.com:99999/v1",
+            "https://api.groq.com:0/v1",
+            "https://api.groq.com:abc/v1",
+            "https://api.groq.com:/v1",
+            "https://[::1]:99999/v1",
+            "https://[::1/v1",
         ] {
             let error = save(dir.path(), "custom", Some(url), None, "").unwrap_err();
             assert!(
@@ -305,14 +364,31 @@ mod tests {
                 "url {url} phải bị từ chối"
             );
         }
-        assert!(save(
+        for url in [
+            "https://gateway.example.com/v1?api-version=2024-01-01",
+            "https://api.groq.com:8443/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert!(
+                save(dir.path(), "custom", Some(url), None, "").is_ok(),
+                "url {url} phải hợp lệ"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_userinfo_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = save(
             dir.path(),
             "custom",
-            Some("https://gateway.example.com/v1?api-version=2024-01-01"),
+            Some("https://api.groq.com@evil.tld/v1"),
             None,
-            ""
+            "sk-secret",
         )
-        .is_ok());
+        .unwrap_err();
+        assert!(matches!(error, ConnectionError::InvalidBaseUrl(_)));
+        assert!(!path(dir.path()).exists());
     }
 
     #[test]
@@ -322,17 +398,43 @@ mod tests {
         assert_eq!(saved.model, default_model("ollama"));
     }
 
+    #[test]
+    fn rewrites_atomically_and_falls_back_to_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), "groq", None, None, "sk-first").unwrap();
+        let file = path(dir.path());
+        let backup = storage::backup_path(&file);
+        assert!(file.exists());
+        assert!(backup.exists(), "lần ghi đầu vẫn phải tạo .bak");
+
+        save(dir.path(), "groq", None, None, "sk-second").unwrap();
+        let previous: ConnectionFile =
+            serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        assert_eq!(decrypt_key(dir.path(), &previous).unwrap(), "sk-first");
+
+        // File chính hỏng: load phải đọc .bak thay vì mất cấu hình.
+        std::fs::write(&file, b"{ not json").unwrap();
+        let recovered = load(dir.path()).unwrap().unwrap();
+        assert_eq!(decrypt_key(dir.path(), &recovered).unwrap(), "sk-first");
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files còn sót: {leftovers:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn connection_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         save(dir.path(), "ollama", None, None, "").unwrap();
-        let mode = std::fs::metadata(path(dir.path()))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
+        for file in [path(dir.path()), storage::backup_path(&path(dir.path()))] {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }
