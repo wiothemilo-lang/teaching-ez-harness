@@ -15,6 +15,10 @@ pub enum VaultError {
     Io(#[from] std::io::Error),
     #[error("invalid master key length")]
     InvalidKey,
+    #[error(
+        "không tìm thấy master.key trong thư mục dữ liệu — không thể giải mã API key đã lưu. Chạy lại 'tez connect ...' để nhập key mới"
+    )]
+    MissingMasterKey,
     #[error("crypto error")]
     Crypto,
     #[error("invalid ciphertext format")]
@@ -42,6 +46,8 @@ impl Vault {
             if bytes.len() != 32 {
                 return Err(VaultError::InvalidKey);
             }
+            // File cũ có thể được tạo trước khi siết quyền: luôn đặt lại 0600.
+            set_private_permissions(&key_path)?;
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
             key
@@ -54,6 +60,19 @@ impl Vault {
         };
 
         Ok(Self { key, key_path })
+    }
+
+    /// Mở vault đã tồn tại, không tạo master.key mới.
+    ///
+    /// Dùng khi giải mã dữ liệu cũ: tạo key mới sẽ khiến ciphertext cũ vĩnh viễn
+    /// không đọc được và che mất nguyên nhân thật.
+    pub fn load(dir: impl AsRef<Path>) -> Result<Self, VaultError> {
+        let dir = dir.as_ref();
+        let key_path = dir.join("master.key");
+        if !key_path.exists() {
+            return Err(VaultError::MissingMasterKey);
+        }
+        Self::load_or_create(dir)
     }
 
     pub fn key_path(&self) -> &Path {

@@ -149,6 +149,11 @@ pub fn upsert(
     let mut book = load(dir)?;
     let provider = input.provider.trim().to_lowercase();
     connection::validate_provider(&provider)?;
+    if let Some(key) = input.api_key {
+        if connection::requires_api_key(&provider) && key.trim().is_empty() {
+            return Err(connection::ConnectionError::MissingApiKey(provider.clone()));
+        }
+    }
     let requested_id = input
         .id
         .map(str::trim)
@@ -156,14 +161,38 @@ pub fn upsert(
         .map(ToOwned::to_owned);
     let id = requested_id.unwrap_or_else(|| format!("{}-{}", slug(&provider), short_id()));
     let existing = book.find(&id).cloned();
+    let kind_changed = existing
+        .as_ref()
+        .is_some_and(|entry| entry.provider != provider);
+
+    // Không bao giờ tạo master.key mới khi đã có ciphertext: làm vậy sẽ khiến
+    // toàn bộ key cũ vĩnh viễn không giải mã được.
+    if !dir.join("master.key").exists()
+        && book
+            .providers
+            .iter()
+            .any(|entry| !entry.encrypted_key.is_empty())
+    {
+        return Err(ConnectionError::Vault(crate::VaultError::MissingMasterKey));
+    }
 
     let base_url = match input
         .base_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(url) => url.to_string(),
-        None if provider == "custom" => return Err(ConnectionError::MissingBaseUrl),
+        Some(url) => {
+            connection::validate_base_url(url)?;
+            url.to_string()
+        }
+        None if provider == "custom" && kind_changed => {
+            return Err(ConnectionError::MissingBaseUrl)
+        }
+        None if provider == "custom" => existing
+            .as_ref()
+            .map(|entry| entry.base_url.clone())
+            .ok_or(ConnectionError::MissingBaseUrl)?,
+        None if kind_changed => default_base_url(&provider).to_string(),
         None => existing
             .as_ref()
             .map(|entry| entry.base_url.clone())
@@ -174,7 +203,13 @@ pub fn upsert(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| existing.as_ref().map(|entry| entry.model.clone()))
+        .or_else(|| {
+            if kind_changed {
+                None
+            } else {
+                existing.as_ref().map(|entry| entry.model.clone())
+            }
+        })
         .unwrap_or_else(|| default_model(&provider).to_string());
     let trimmed_name = input.name.trim();
     let name = if trimmed_name.is_empty() {
@@ -183,7 +218,13 @@ pub fn upsert(
         trimmed_name.to_string()
     };
     let encrypted_key = match input.api_key {
-        Some(key) => Vault::load_or_create(dir)?.encrypt(key.as_bytes())?,
+        Some(key) => Vault::load_or_create(dir)?.encrypt(key.trim().as_bytes())?,
+        // Đổi loại provider mà không nhập key mới: không tái sử dụng key của
+        // endpoint cũ (tránh gửi nhầm key sang vendor khác).
+        None if kind_changed && connection::requires_api_key(&provider) => {
+            return Err(ConnectionError::MissingApiKey(provider.clone()))
+        }
+        None if kind_changed => Vault::load_or_create(dir)?.encrypt(b"")?,
         None => match existing.as_ref() {
             Some(entry) => entry.encrypted_key.clone(),
             None => Vault::load_or_create(dir)?.encrypt(b"")?,
@@ -214,7 +255,7 @@ pub fn set_active(dir: impl AsRef<Path>, id: &str) -> Result<ProviderEntry, Conn
     let dir = dir.as_ref();
     let mut book = load(dir)?;
     if book.find(id).is_none() {
-        return Err(ConnectionError::ProviderNotFound(id.to_string()));
+        return Err(ConnectionError::ProviderIdNotFound(id.to_string()));
     }
     book.active = Some(id.to_string());
     save(dir, &book)?;
@@ -245,7 +286,7 @@ pub fn decrypt_key(
     dir: impl AsRef<Path>,
     entry: &ProviderEntry,
 ) -> Result<String, ConnectionError> {
-    let vault = Vault::load_or_create(dir)?;
+    let vault = Vault::load(dir)?;
     let bytes = vault.decrypt(&entry.encrypted_key)?;
     String::from_utf8(bytes).map_err(|_| ConnectionError::InvalidKeyEncoding)
 }
@@ -389,6 +430,57 @@ mod tests {
         ));
         assert!(!path(dir.path()).exists());
         assert!(load(dir.path()).unwrap().providers.is_empty());
+    }
+
+    #[test]
+    fn rejects_empty_key_for_cloud_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "groq",
+                api_key: Some("  "),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            connection::ConnectionError::MissingApiKey(_)
+        ));
+        assert!(!path(dir.path()).exists());
+
+        let ollama = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "ollama",
+                api_key: Some(""),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decrypt_key(dir.path(), &ollama).unwrap(), "");
+    }
+
+    #[test]
+    fn trims_key_before_encrypting() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "groq",
+                api_key: Some("  sk-test\n"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(decrypt_key(dir.path(), &entry).unwrap(), "sk-test");
     }
 
     #[test]

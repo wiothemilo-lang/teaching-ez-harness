@@ -78,7 +78,7 @@ const PRESETS: Preset[] = [
     id: "groq",
     name: "Groq",
     baseUrl: "https://api.groq.com/openai/v1",
-    model: "llama-3.3-70b-versatile",
+    model: "openai/gpt-oss-120b",
     keyHint: "gsk_…",
     note: "Free tier, phản hồi rất nhanh",
   },
@@ -86,7 +86,7 @@ const PRESETS: Preset[] = [
     id: "gemini",
     name: "Google Gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    model: "gemini-2.0-flash",
+    model: "gemini-3.5-flash",
     keyHint: "AIza…",
     note: "Free tier, context dài",
   },
@@ -278,7 +278,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
         provider: draft.provider,
         base_url: baseUrl,
         model,
-        api_key: draft.id && draft.api_key === "" ? null : draft.api_key,
+        api_key: draft.id && draft.api_key === "" ? null : draft.api_key.trim(),
         set_active: draft.set_active,
       });
       setDraft(null);
@@ -617,7 +617,11 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
                   <span>Loại</span>
                   <select
                     value={draft.provider}
-                    onChange={(event) => updateDraft({ provider: event.target.value })}
+                    onChange={(event) => {
+                      const preset = PRESETS.find((item) => item.id === event.target.value);
+                      if (preset) applyPreset(preset);
+                      else updateDraft({ provider: event.target.value });
+                    }}
                   >
                     {PRESETS.map((preset) => (
                       <option key={preset.id} value={preset.id}>

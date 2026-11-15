@@ -41,6 +41,23 @@ const SAMPLE_PLUGIN_SERVER: &str =
 const SAMPLE_PLUGIN_SKILL: &str =
     include_str!("../../../../examples/plugins/study-toolkit/skills/exam-strategy/SKILL.md");
 
+/// Dọn session mới nếu lượt chat lỗi giữa đường (key sai, mạng, MCP...).
+struct NewSessionGuard {
+    db: PathBuf,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for NewSessionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(store) = Store::open(&self.db) {
+                let _ = store.abandon_session(&self.id);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SaveProviderRequest {
     id: Option<String>,
@@ -405,6 +422,13 @@ fn resolve_connection(dir: &Path, id: Option<&str>) -> anyhow::Result<ResolvedCo
         })?,
     };
     let api_key = providers::decrypt_key(dir, &entry)?;
+    if api_key.trim().is_empty() && tez_auth::connection::requires_api_key(&entry.provider) {
+        anyhow::bail!(
+            "Chưa có API key cho '{}'. Mở Cài đặt để nhập key, hoặc dùng provider \
+             ollama/custom nếu endpoint không cần key.",
+            entry.provider
+        );
+    }
 
     Ok(ResolvedConnection {
         id: entry.id,
@@ -541,6 +565,12 @@ fn list_providers() -> Result<Vec<ProviderInfo>, String> {
 #[tauri::command]
 fn save_provider(request: SaveProviderRequest) -> Result<ProviderInfo, String> {
     let dir = data_dir().map_err(friendly)?;
+    // Mở DB trước khi ghi provider: nếu DB lỗi thì không báo "lưu thất bại"
+    // trong khi providers.json đã được ghi.
+    let store = Store::open(dir.join("tez.db")).map_err(|error| error.to_string())?;
+    store
+        .ensure_profile("default", "Học sinh")
+        .map_err(|error| error.to_string())?;
     let entry = providers::upsert(
         &dir,
         ProviderInput {
@@ -554,11 +584,6 @@ fn save_provider(request: SaveProviderRequest) -> Result<ProviderInfo, String> {
         },
     )
     .map_err(|error| error.to_string())?;
-
-    let store = Store::open(dir.join("tez.db")).map_err(|error| error.to_string())?;
-    store
-        .ensure_profile("default", "Học sinh")
-        .map_err(|error| error.to_string())?;
 
     let book = providers::load(&dir).map_err(|error| error.to_string())?;
     Ok(provider_info(&dir, &book, &entry))
@@ -588,7 +613,22 @@ async fn test_provider_inner(id: Option<&str>) -> anyhow::Result<ConnectionTest>
     let saved = resolve_connection(&dir, id)?;
     let provider = OpenAiCompatible::new(&saved.provider_id, &saved.base_url, &saved.api_key);
     let started = Instant::now();
-    let message = tez_llm::ping(&provider, &saved.model).await?;
+    let message = tez_llm::ping(&provider, &saved.model).await.map_err(|error| {
+        match &error {
+            tez_llm::LlmError::Api { status, .. } if *status == 401 || *status == 403 => {
+                anyhow::anyhow!(
+                    "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt."
+                )
+            }
+            tez_llm::LlmError::Api { status, .. } if *status == 429 => {
+                anyhow::anyhow!("Provider đang giới hạn tốc độ (HTTP 429). Chờ rồi thử lại.")
+            }
+            tez_llm::LlmError::Http(err) if err.is_timeout() => {
+                anyhow::anyhow!("Provider không phản hồi kịp (timeout). Kiểm tra mạng/base_url.")
+            }
+            _ => anyhow::anyhow!(error),
+        }
+    })?;
     let latency_ms = started.elapsed().as_millis() as u64;
 
     Ok(ConnectionTest {
@@ -840,7 +880,17 @@ async fn chat(
 ) -> Result<ChatReply, String> {
     chat_inner(app, Arc::clone(&broker), request)
         .await
-        .map_err(friendly)
+        .map_err(|error| match error.downcast_ref::<tez_llm::LlmError>() {
+            Some(tez_llm::LlmError::Api { status, .. }) if *status == 401 || *status == 403 => {
+                format!(
+                    "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt."
+                )
+            }
+            Some(tez_llm::LlmError::Api { status, .. }) if *status == 429 => {
+                format!("Provider đang giới hạn tốc độ (HTTP {status}). Chờ rồi thử lại.")
+            }
+            _ => friendly(error),
+        })
 }
 
 async fn chat_inner(
@@ -873,7 +923,7 @@ async fn chat_inner(
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Học sinh")?;
 
-    let (session_id, history, todo_json) = match request.session_id.as_deref() {
+    let (session_id, history, todo_json, created) = match request.session_id.as_deref() {
         Some(id) => {
             if !store.session_exists(id)? {
                 anyhow::bail!("session '{id}' không tồn tại");
@@ -888,14 +938,20 @@ async fn chat_inner(
                     _ => None,
                 })
                 .collect();
-            (id.to_string(), history, store.load_todos(id)?)
+            (id.to_string(), history, store.load_todos(id)?, false)
         }
         None => (
             store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
             Vec::new(),
             None,
+            true,
         ),
     };
+    let mut session_guard = created.then(|| NewSessionGuard {
+        db: dir.join("tez.db"),
+        id: session_id.clone(),
+        armed: true,
+    });
 
     let todos = Arc::new(TodoState::new());
     if let Some(json) = todo_json {
@@ -1052,6 +1108,10 @@ async fn chat_inner(
     })?;
     store.resume_session(&session_id)?;
     drop(store);
+
+    if let Some(guard) = session_guard.as_mut() {
+        guard.armed = false;
+    }
 
     Ok(ChatReply {
         session_id,
