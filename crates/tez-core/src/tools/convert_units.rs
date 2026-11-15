@@ -76,6 +76,12 @@ impl Tool for ConvertUnits {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu 'to'".into()))?;
 
+        if !value.is_finite() {
+            return Err(ToolError::InvalidArgs(
+                "'value' phải là số hữu hạn".to_string(),
+            ));
+        }
+
         let from_unit = lookup(from)
             .ok_or_else(|| ToolError::InvalidArgs(format!("không biết đơn vị '{from}'")))?;
         let to_unit = lookup(to)
@@ -89,6 +95,11 @@ impl Tool for ConvertUnits {
         }
 
         let converted = value * from_unit.factor / to_unit.factor;
+        if !converted.is_finite() {
+            return Ok(ToolOutput::error(
+                "kết quả đổi đơn vị không hữu hạn (giá trị quá lớn)".to_string(),
+            ));
+        }
         Ok(ToolOutput::ok(format!(
             "{} {} = {} {}",
             trim(value),
@@ -100,7 +111,8 @@ impl Tool for ConvertUnits {
 }
 
 fn trim(value: f64) -> String {
-    let mut s = format!("{value:.6}");
+    // 12 chữ số thập phân để 1 mm → km (1e-6) không bị làm tròn thành 0.
+    let mut s = format!("{value:.12}");
     while s.contains('.') && s.ends_with('0') {
         s.pop();
     }
@@ -123,6 +135,33 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert_eq!(out.content, "1.5 km = 1500 m");
+    }
+
+    #[tokio::test]
+    async fn keeps_small_conversions() {
+        let tool = ConvertUnits;
+        let out = tool
+            .execute(json!({"value": 1.0, "from": "mm", "to": "km"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(out.content, "1 mm = 0.000001 km");
+        let out = tool
+            .execute(json!({"value": 1.0, "from": "mg", "to": "kg"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "1 mg = 0.000001 kg");
+    }
+
+    #[tokio::test]
+    async fn rejects_overflowing_result() {
+        let tool = ConvertUnits;
+        let out = tool
+            .execute(json!({"value": 1e308, "from": "km", "to": "mm"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("không hữu hạn"));
     }
 
     #[tokio::test]

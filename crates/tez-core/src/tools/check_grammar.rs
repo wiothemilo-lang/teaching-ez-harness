@@ -9,10 +9,40 @@ fn trim_word(word: &str) -> &str {
 }
 
 fn starts_with_vowel(word: &str) -> bool {
-    matches!(
-        word.chars().next().map(|c| c.to_ascii_lowercase()),
-        Some('a' | 'e' | 'i' | 'o' | 'u')
-    )
+    match word.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => true,
+        // "an 8", "an 11", "an 18", "an 80" — số đọc bắt đầu bằng nguyên âm.
+        Some(c) if c.is_ascii_digit() => {
+            let number: String = word.chars().take_while(|c| c.is_ascii_digit()).collect();
+            number.starts_with('8') || number.starts_with("11") || number.starts_with("18")
+        }
+        _ => false,
+    }
+}
+
+/// Từ viết tắt mà dấu chấm không phải là kết thúc câu.
+const ABBREVIATIONS: &[&str] = &[
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e", "a.m", "p.m",
+    "u.s", "u.k", "approx", "dept", "est", "fig", "no", "vol",
+];
+
+fn is_abbreviation_period(chars: &[char], index: usize) -> bool {
+    let mut start = index;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let word: String = chars[start..index].iter().collect();
+    let cleaned = word
+        .trim_end_matches('.')
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '.')
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+    if cleaned.chars().count() == 1 && cleaned.chars().all(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    ABBREVIATIONS.contains(&cleaned.as_str())
 }
 
 /// Các từ bắt đầu bằng nguyên âm nhưng đọc như phụ âm (a university).
@@ -61,8 +91,9 @@ fn check_repeated_words(text: &str, issues: &mut Vec<String>) {
 }
 
 fn check_capitalization(text: &str, issues: &mut Vec<String>) {
+    let chars: Vec<char> = text.chars().collect();
     let mut at_sentence_start = true;
-    for ch in text.chars() {
+    for (index, &ch) in chars.iter().enumerate() {
         if at_sentence_start {
             if ch.is_whitespace() || ch == '"' || ch == '\'' {
                 continue;
@@ -73,6 +104,10 @@ fn check_capitalization(text: &str, issues: &mut Vec<String>) {
             at_sentence_start = false;
         }
         if matches!(ch, '.' | '!' | '?') {
+            // "e.g." / "Mr." không mở câu mới.
+            if ch == '.' && is_abbreviation_period(&chars, index) {
+                continue;
+            }
             at_sentence_start = true;
         }
     }
@@ -90,8 +125,8 @@ fn check_punctuation_spacing(text: &str, issues: &mut Vec<String>) {
         let Some(&next) = chars.get(index + 1) else {
             continue;
         };
-        // Bỏ qua số thập phân và dấu chấm cuối câu.
-        if ch == '.' && next.is_ascii_digit() {
+        // Bỏ qua số thập phân, từ viết tắt và dấu chấm cuối câu.
+        if ch == '.' && (next.is_ascii_digit() || is_abbreviation_period(&chars, index)) {
             continue;
         }
         if next.is_alphabetic() {
@@ -137,6 +172,7 @@ impl Tool for CheckGrammar {
         if text.trim().is_empty() {
             return Ok(ToolOutput::error("đoạn văn rỗng".to_string()));
         }
+        super::check_input_bounds(text).map_err(ToolError::InvalidArgs)?;
 
         let mut issues = Vec::new();
         if text.contains("  ") {
@@ -195,6 +231,41 @@ mod tests {
             .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("Không phát hiện"));
+    }
+
+    #[tokio::test]
+    async fn accepts_an_before_number_with_vowel_sound() {
+        let out = CheckGrammar
+            .execute(json!({"text": "An 8-year-old boy is here."}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("Không phát hiện"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn ignores_abbreviation_periods() {
+        let out = CheckGrammar
+            .execute(json!({"text": "Use e.g. this example, i.e. the first one."}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(!out.content.contains("viết hoa"), "{}", out.content);
+        assert!(
+            !out.content.contains("thiếu khoảng trắng"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_text() {
+        let text = "a".repeat(5000);
+        let error = CheckGrammar
+            .execute(json!({"text": text}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs(_)));
     }
 
     #[tokio::test]

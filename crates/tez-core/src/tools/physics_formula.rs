@@ -284,8 +284,8 @@ impl Tool for PhysicsFormula {
             .get("query")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'query'".into()))?;
-        let needle = normalize(query);
-        if needle.trim().is_empty() {
+        let needle = normalize(query.trim());
+        if needle.is_empty() {
             return Ok(ToolOutput::error("cần nhập tên hoặc từ khóa".to_string()));
         }
 
@@ -342,6 +342,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.is_error);
+        assert!(out.content.contains("I = U / R"));
+    }
+
+    #[tokio::test]
+    async fn trims_surrounding_spaces_in_query() {
+        let out = PhysicsFormula
+            .execute(json!({"query": "  Ohm  "}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("I = U / R"));
     }
 
