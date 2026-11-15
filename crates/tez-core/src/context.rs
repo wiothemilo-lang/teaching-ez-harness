@@ -28,6 +28,8 @@ pub struct ContextInput<'a> {
     pub workspace: Option<&'a str>,
     /// Chỉ dẫn bổ sung của người dùng (harness `system_prompt`).
     pub instructions: &'a str,
+    /// Chỉ dẫn dự án đã render (xem [`crate::project::ProjectContext::render`]).
+    pub project: &'a str,
     /// Ngôn ngữ trả lời: `vi` hoặc `en`.
     pub language: &'a str,
 }
@@ -44,6 +46,7 @@ impl<'a> ContextInput<'a> {
             mode: Mode::Chat,
             workspace: None,
             instructions: "",
+            project: "",
             language: "vi",
         }
     }
@@ -75,6 +78,14 @@ impl ContextBuilder {
         if !input.instructions.trim().is_empty() {
             system.push_str("\nChỉ dẫn bổ sung của người dùng:\n");
             system.push_str(input.instructions.trim());
+            system.push('\n');
+        }
+
+        if !input.project.trim().is_empty() {
+            system.push_str(
+                "\nChỉ dẫn của dự án (áp dụng khi làm việc trong workspace này; yêu cầu trực tiếp của người dùng được ưu tiên):\n",
+            );
+            system.push_str(input.project.trim());
             system.push('\n');
         }
 
@@ -143,6 +154,8 @@ mod tests {
             mode: Mode::Chat,
             workspace: None,
             instructions: "Luôn nêu rủi ro trước khi sửa file.",
+            project:
+                "<project-instructions path=\"AGENTS.md\">Chạy test trước.</project-instructions>",
             language: "vi",
         });
 
@@ -153,6 +166,7 @@ mod tests {
         assert!(system.contains("<memory name=\"style\">"));
         assert!(system.contains("Đọc tài liệu"));
         assert!(system.contains("Luôn nêu rủi ro trước khi sửa file."));
+        assert!(system.contains("Chạy test trước."));
         assert!(system.contains("Trả lời bằng tiếng Việt"));
         assert_eq!(messages[1].role, "user");
     }
@@ -185,6 +199,7 @@ mod tests {
             mode: Mode::Code,
             workspace: Some("/tmp/demo-project"),
             instructions: "",
+            project: "",
             language: "vi",
         });
         let system = messages[0].content.as_deref().unwrap();

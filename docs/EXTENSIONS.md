@@ -183,7 +183,19 @@ tez plugins
 
 ---
 
-## 4. Tạo extension bằng AI
+## 4. Extension theo dự án
+
+Khi workspace được chọn (Chat hoặc Code), tez nạp thêm ngữ cảnh ngay trong dự án:
+
+- `AGENTS.md`, `CLAUDE.md` ở gốc workspace, và bản trong `.tez/` — gộp vào system prompt dưới nhãn `<project-instructions>`, tối đa 24 KB.
+- `.tez/skills/<id>/SKILL.md` — skill riêng của dự án; ghi đè skill cùng id từ user/plugin.
+- `.tez/mcp.json` — MCP server riêng của dự án, cùng schema với `mcp.json` toàn cục. Server dự án thắng server toàn cục khi trùng tên; `cwd` mặc định là gốc dự án.
+
+Ưu tiên khi mâu thuẫn: yêu cầu trực tiếp của người dùng > chỉ dẫn dự án > skill/memory. Không cần bật Code mode để dùng chỉ dẫn dự án; chỉ cần chọn workspace ở sidebar.
+
+---
+
+## 5. Tạo extension bằng AI
 
 Desktop có luồng **mô tả → xem trước → lưu** cho cả skill, MCP và plugin:
 
@@ -202,10 +214,10 @@ Backend dùng hai lệnh `draft_extension` và `save_extension`. Bản nháp ch�
 
 ---
 
-## 5. Thứ tự ưu tiên và an toàn
+## 6. Thứ tự ưu tiên và an toàn
 
-- Skill của user nằm trong `skills/`; skill từ plugin được nạp thêm và có thể ghi đè skill cùng id.
-- MCP server user thắng plugin khi trùng tên.
+- Skill của user nằm trong `skills/`; skill từ plugin và skill dự án được nạp thêm. Khi trùng id: dự án > user > plugin.
+- MCP server khi trùng tên: dự án > user > plugin.
 - API key vẫn nằm trong vault AES-256-GCM; `mcp.json` chỉ chứa cấu hình, không chứa key provider.
 - Nếu đưa `env` bí mật vào `mcp.json`, file được đặt quyền `0600` nhưng vẫn là plaintext trên đĩa. Ưu tiên biến môi trường của hệ điều hành khi có thể.
 - Xóa `plugins/<id>/` là gỡ plugin; xóa `skills/<id>/` là gỡ skill.

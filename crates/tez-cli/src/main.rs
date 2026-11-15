@@ -24,6 +24,7 @@ use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
 use tez_core::plugins;
+use tez_core::project;
 use tez_core::skills::{self, SkillRegistry};
 use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects::{self, SubjectPack};
@@ -785,6 +786,7 @@ struct TurnContext<'a> {
     max_steps: usize,
     system_prompt: &'a str,
     language: &'a str,
+    project_instructions: &'a str,
 }
 
 impl TurnContext<'_> {
@@ -848,6 +850,7 @@ impl TurnContext<'_> {
             mode: self.mode,
             workspace: Some(&workspace_label),
             instructions: self.system_prompt,
+            project: self.project_instructions,
             language: self.language,
         });
 
@@ -1060,7 +1063,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         });
         tools.register(TaskTool::new(runtime));
     }
-    let discovery = mcp::discover(&dir).await?;
+    let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
     let mcp_count = discovery.tools.len();
     for server in &discovery.servers {
         if !server.ok {
@@ -1080,7 +1083,9 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             discovery.servers.len()
         );
     }
-    let skills = SkillRegistry::load_with_plugins(&dir)?;
+    let mut skills = SkillRegistry::load_with_plugins(&dir)?;
+    skills.load_project(&workspace)?;
+    let project_instructions = project::ProjectContext::load(&workspace).render();
 
     let turn = TurnContext {
         dir: &dir,
@@ -1103,6 +1108,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         max_steps: config.max_steps,
         system_prompt: &config.system_prompt,
         language: &config.language,
+        project_instructions: &project_instructions,
     };
 
     let interactive = args.prompt.is_none() && stdin_prompt.is_none();

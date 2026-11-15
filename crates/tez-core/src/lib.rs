@@ -10,6 +10,7 @@ pub mod memory;
 pub mod modes;
 pub mod permission;
 pub mod plugins;
+pub mod project;
 pub mod skills;
 pub mod subagent;
 pub mod subjects;

@@ -19,6 +19,7 @@ use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
 use tez_core::plugins;
+use tez_core::project;
 use tez_core::skills::{self, SkillRegistry};
 use tez_core::subagent::{SubagentRuntime, TaskTool};
 use tez_core::subjects;
@@ -1195,7 +1196,15 @@ async fn chat_inner(
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
     let workspace = match mode {
         Mode::Code => Some(resolve_workspace(request.workspace.as_deref())?),
-        Mode::Chat => None,
+        Mode::Chat => match request
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(_) => Some(resolve_workspace(request.workspace.as_deref())?),
+            None => None,
+        },
     };
     let connection = resolve_connection(&dir, request.provider_id.as_deref())?;
 
@@ -1284,7 +1293,10 @@ async fn chat_inner(
     let mut recent = history;
     recent.push(Message::user(request.message.clone()));
 
-    let registry = SkillRegistry::load_with_plugins(&dir)?;
+    let mut registry = SkillRegistry::load_with_plugins(&dir)?;
+    if let Some(root) = workspace.as_deref() {
+        registry.load_project(root)?;
+    }
     let matched = registry.matching_query(&request.message, 2);
     let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
 
@@ -1300,6 +1312,11 @@ async fn chat_inner(
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+    let project_text = workspace
+        .as_deref()
+        .map(project::ProjectContext::load)
+        .map(|context| context.render())
+        .unwrap_or_default();
     let messages = ContextBuilder.build(ContextInput {
         recent: &recent,
         excerpts: &excerpts,
@@ -1309,6 +1326,7 @@ async fn chat_inner(
         mode,
         workspace: Some(&workspace_label),
         instructions: &config.system_prompt,
+        project: &project_text,
         language: &config.language,
     });
 
@@ -1326,7 +1344,7 @@ async fn chat_inner(
     tools.register(MemorySearch::new(memory_store.clone()));
     tools.register(MemoryForget::new(memory_store.clone()));
     tools.register(TodoWrite::new(Arc::clone(&todos)));
-    let discovery = mcp::discover(&dir).await?;
+    let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
     for tool in discovery.tools {
         tools.register(tool);
     }

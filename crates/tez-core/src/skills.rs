@@ -68,6 +68,15 @@ impl SkillRegistry {
         Ok(registry)
     }
 
+    /// Nạp skill riêng của dự án từ `<root>/.tez/skills`.
+    ///
+    /// Skill dự án ghi đè skill cùng id từ user/plugin, để dự án có thể tùy
+    /// biến hành vi mà không sửa dữ liệu toàn cục.
+    pub fn load_project(&mut self, root: impl AsRef<Path>) -> Result<(), SkillError> {
+        let dir = root.as_ref().join(".tez").join("skills");
+        self.load_dir(&dir, "project")
+    }
+
     /// Nạp thêm skill từ plugin (đường dẫn tuyệt đối hoặc tương đối với plugin).
     pub fn load_extra(&mut self, paths: &[PathBuf], source: &str) -> Result<(), SkillError> {
         for path in paths {
@@ -417,5 +426,31 @@ mod tests {
         let skill = registry.find("plugin-skill").unwrap();
         assert_eq!(skill.source, "demo");
         assert_eq!(skill.body, "Từ plugin.");
+    }
+
+    #[test]
+    fn loads_project_skills_and_overrides_user_skill() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let skill_dir = project
+            .path()
+            .join(".tez")
+            .join("skills")
+            .join("step-by-step");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Giải từng bước\ndescription: bản dự án\ntriggers: giải\n---\nQuy ước của dự án.",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::load(data.path()).unwrap();
+        registry.load_project(project.path()).unwrap();
+
+        let skill = registry.find("step-by-step").unwrap();
+        assert_eq!(skill.source, "project");
+        assert_eq!(skill.body, "Quy ước của dự án.");
+        let matched = registry.matching_query("giải bài này", 2);
+        assert!(matched.iter().any(|item| item.id == "step-by-step"));
     }
 }
