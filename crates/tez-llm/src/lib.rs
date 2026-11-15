@@ -4,6 +4,7 @@
 //! Ollama, LM Studio, vLLM và nhiều gateway nội bộ.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -11,6 +12,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Timeout tổng cho request không streaming. Streaming dùng idle timeout
+/// theo từng lần đọc để không cắt ngang câu trả lời dài.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Thời gian chờ tối đa giữa hai lần đọc của một stream.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -222,6 +230,8 @@ pub struct OpenAiCompatible {
     base_url: String,
     api_key: String,
     client: reqwest::Client,
+    /// Khoảng thời gian tối đa chờ dữ liệu mới của một stream.
+    idle_timeout: Duration,
 }
 
 impl OpenAiCompatible {
@@ -234,13 +244,21 @@ impl OpenAiCompatible {
             name: name.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into().trim().to_string(),
-            // Không để một provider treo làm kẹt cả agent loop.
+            // Chỉ giới hạn thời gian kết nối ở cấp client. Request không
+            // streaming tự đặt timeout tổng, còn stream dùng idle timeout
+            // để câu trả lời dài không bị cắt ở giây thứ 120.
             client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            idle_timeout: STREAM_IDLE_TIMEOUT,
         }
+    }
+
+    /// Đặt idle timeout cho stream (hữu ích cho test và provider chậm).
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     /// URL chat completions, giữ nguyên query string của `base_url`.
@@ -293,6 +311,175 @@ fn message_json(m: &Message) -> Value {
     obj
 }
 
+/// Rút gọn body lỗi để không flood UI/log.
+fn body_preview(text: &str) -> String {
+    text.chars().take(500).collect()
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct StreamState {
+    content: String,
+    calls: BTreeMap<usize, PartialToolCall>,
+    usage: Usage,
+    next_index: usize,
+    /// Đã thấy `[DONE]` hoặc `finish_reason` chưa.
+    completed: bool,
+}
+
+enum LineAction {
+    Continue,
+    Done,
+    /// Consumer đã đóng kênh; dừng đọc stream.
+    Cancelled,
+}
+
+impl StreamState {
+    /// Xử lý một dòng SSE đã hoàn chỉnh (không gồm `\n`).
+    fn handle_line(
+        &mut self,
+        line: &[u8],
+        tx: &UnboundedSender<String>,
+    ) -> Result<LineAction, LlmError> {
+        // Chỉ decode khi đã có trọn dòng, nhờ vậy ký tự UTF-8 bị chia
+        // giữa hai lần đọc không bị hỏng.
+        let line = std::str::from_utf8(line)
+            .map_err(|error| LlmError::Invalid(format!("stream line không phải UTF-8: {error}")))?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(LineAction::Continue);
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(LineAction::Continue);
+        }
+        if data == "[DONE]" {
+            self.completed = true;
+            return Ok(LineAction::Done);
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return Ok(LineAction::Continue);
+        };
+
+        // Một số provider báo lỗi giữa stream bằng frame `{"error": {...}}`
+        // với HTTP status vẫn là 200.
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string());
+            return Err(LlmError::Invalid(format!("stream error: {message}")));
+        }
+
+        if let Some(raw_usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            self.usage = Usage {
+                input_tokens: raw_usage
+                    .get("prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                output_tokens: raw_usage
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            };
+        }
+
+        let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) else {
+            return Ok(LineAction::Continue);
+        };
+        // Không dừng ngay: provider có thể gửi thêm frame usage sau
+        // finish_reason. Chỉ ghi nhận là stream đã hoàn tất.
+        if choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null())
+        {
+            self.completed = true;
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(LineAction::Continue);
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            if !text.is_empty() {
+                self.content.push_str(text);
+                if tx.send(text.to_string()).is_err() {
+                    return Ok(LineAction::Cancelled);
+                }
+            }
+        }
+        if let Some(items) = delta.get("tool_calls").and_then(Value::as_array) {
+            for item in items {
+                self.merge_tool_call(item);
+            }
+        }
+        Ok(LineAction::Continue)
+    }
+
+    fn merge_tool_call(&mut self, item: &Value) {
+        let index = self.resolve_index(item);
+        let entry = self.calls.entry(index).or_default();
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                entry.id = id.to_string();
+            }
+        }
+        if let Some(function) = item.get("function") {
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                if !name.is_empty() && entry.name.is_empty() {
+                    entry.name = name.to_string();
+                }
+            }
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                entry.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    /// Provider không gửi `index` (một số gateway cũ): cấp index tuần tự
+    /// cho từng call mới thay vì dồn tất cả vào slot 0. Fragment arguments
+    /// không có id/name được nối vào call gần nhất.
+    fn resolve_index(&mut self, item: &Value) -> usize {
+        if let Some(index) = item.get("index").and_then(Value::as_u64) {
+            let index = index as usize;
+            self.next_index = self.next_index.max(index.saturating_add(1));
+            return index;
+        }
+
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !id.is_empty() {
+            if let Some((&index, _)) = self.calls.iter().find(|(_, call)| call.id == id) {
+                return index;
+            }
+            return self.allocate_index();
+        }
+
+        let name = item
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !name.is_empty() || self.calls.is_empty() {
+            self.allocate_index()
+        } else if let Some(&last) = self.calls.keys().next_back() {
+            last
+        } else {
+            self.allocate_index()
+        }
+    }
+
+    fn allocate_index(&mut self) -> usize {
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCompatible {
     fn name(&self) -> &str {
@@ -328,13 +515,13 @@ impl LlmProvider for OpenAiCompatible {
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
         }
-        let response = request.json(&body).send().await?;
+        let response = request.timeout(REQUEST_TIMEOUT).json(&body).send().await?;
 
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
             // Giới hạn body để không flood UI/log và không lộ toàn bộ phản hồi.
-            let body: String = text.chars().take(500).collect();
+            let body = body_preview(&text);
             return Err(LlmError::Api {
                 status: status.as_u16(),
                 body,
@@ -434,116 +621,127 @@ impl LlmProvider for OpenAiCompatible {
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
         }
-        let response = request.json(&body).send().await?;
+        // Chỉ chờ headers; phần thân stream được đọc với idle timeout từng
+        // chunk nên câu trả lời dài không bị cắt ở một mốc tổng cố định.
+        let response = tokio::time::timeout(self.idle_timeout, request.json(&body).send())
+            .await
+            .map_err(|_| LlmError::Invalid("stream timeout waiting for response".into()))??;
+
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await?;
-            let body: String = text.chars().take(500).collect();
+            let text = tokio::time::timeout(self.idle_timeout, response.text())
+                .await
+                .map_err(|_| LlmError::Invalid("timeout reading error response".into()))??;
             return Err(LlmError::Api {
                 status: status.as_u16(),
-                body,
+                body: body_preview(&text),
             });
         }
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut content = String::new();
-        let mut calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
-        let mut usage = Usage::default();
+        // 200 nhưng không phải SSE thường là body JSON lỗi của gateway.
+        // Trước đây các body này bị bỏ qua và trả về Ok rỗng/một phần.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !content_type.is_empty() && !content_type.contains("text/event-stream") {
+            let text = tokio::time::timeout(self.idle_timeout, response.text())
+                .await
+                .map_err(|_| LlmError::Invalid("timeout reading non-SSE response".into()))??;
+            return Err(LlmError::Invalid(format!(
+                "expected text/event-stream, got {content_type}: {}",
+                body_preview(&text)
+            )));
+        }
 
-        'stream: while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(position) = buffer.find('\n') {
-                let line: String = buffer.drain(..=position).collect();
-                let line = line.trim_end_matches(['\r', '\n']);
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() {
-                    continue;
+        let mut stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut state = StreamState::default();
+        let mut stopped = false;
+        let mut cancelled = false;
+
+        'stream: loop {
+            let chunk = match tokio::time::timeout(self.idle_timeout, stream.next()).await {
+                Ok(Some(chunk)) => chunk?,
+                Ok(None) => break,
+                // Đã thấy finish_reason thì việc server giữ kết nối thêm
+                // không làm stream trở thành lỗi.
+                Err(_) if state.completed => break,
+                Err(_) => {
+                    return Err(LlmError::Invalid(format!(
+                        "stream idle timeout after {:?}",
+                        self.idle_timeout
+                    )))
                 }
-                if data == "[DONE]" {
-                    break 'stream;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if let Some(raw_usage) = value.get("usage").filter(|value| !value.is_null()) {
-                    usage = Usage {
-                        input_tokens: raw_usage
-                            .get("prompt_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        output_tokens: raw_usage
-                            .get("completion_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    };
-                }
-                let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) else {
-                    continue;
-                };
-                let Some(delta) = choice.get("delta") else {
-                    continue;
-                };
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        content.push_str(text);
-                        let _ = tx.send(text.to_string());
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=position).collect();
+                // Bỏ '\n'; '\r' (nếu có) do handle_line xử lý.
+                let line = &line[..line.len() - 1];
+                match state.handle_line(line, &tx)? {
+                    LineAction::Continue => {}
+                    LineAction::Done => {
+                        stopped = true;
+                        break 'stream;
                     }
-                }
-                if let Some(items) = delta.get("tool_calls").and_then(Value::as_array) {
-                    for item in items {
-                        let index = item.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        let entry = calls.entry(index).or_default();
-                        if let Some(id) = item.get("id").and_then(Value::as_str) {
-                            if !id.is_empty() {
-                                entry.0 = id.to_string();
-                            }
-                        }
-                        if let Some(function) = item.get("function") {
-                            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                                if !name.is_empty() && entry.1.is_empty() {
-                                    entry.1 = name.to_string();
-                                }
-                            }
-                            if let Some(arguments) =
-                                function.get("arguments").and_then(Value::as_str)
-                            {
-                                entry.2.push_str(arguments);
-                            }
-                        }
+                    LineAction::Cancelled => {
+                        cancelled = true;
+                        stopped = true;
+                        break 'stream;
                     }
                 }
             }
         }
 
-        let calls: Vec<ToolCall> = calls
+        // Dòng cuối có thể không có '\n' trước khi server đóng kết nối.
+        if !stopped && !buffer.is_empty() {
+            match state.handle_line(&buffer, &tx)? {
+                LineAction::Continue | LineAction::Done => {}
+                LineAction::Cancelled => cancelled = true,
+            }
+        }
+
+        // EOF trước [DONE]/finish_reason là stream bị cắt, không phải thành công.
+        if !cancelled && !state.completed {
+            return Err(LlmError::Invalid(
+                "stream ended without [DONE] or finish_reason".into(),
+            ));
+        }
+
+        let calls: Vec<ToolCall> = state
+            .calls
             .into_iter()
-            .map(|(index, (id, name, arguments))| ToolCall {
-                id: if id.is_empty() {
+            .map(|(index, call)| ToolCall {
+                id: if call.id.is_empty() {
                     format!("call_{index}")
                 } else {
-                    id
+                    call.id
                 },
                 kind: "function".to_string(),
-                function: FunctionCall { name, arguments },
+                function: FunctionCall {
+                    name: call.name,
+                    arguments: call.arguments,
+                },
             })
             .collect();
 
         if calls.is_empty() {
-            Ok(ChatResponse::Text { content, usage })
+            Ok(ChatResponse::Text {
+                content: state.content,
+                usage: state.usage,
+            })
         } else {
             Ok(ChatResponse::ToolCalls {
-                content: if content.is_empty() {
+                content: if state.content.is_empty() {
                     None
                 } else {
-                    Some(content)
+                    Some(state.content)
                 },
                 calls,
-                usage,
+                usage: state.usage,
             })
         }
     }
@@ -555,17 +753,54 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    async fn serve_sse(body: &'static str) -> String {
+    const SSE_HEADERS: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+
+    /// Server TCP tối giản: ghi từng chunk riêng biệt để mô phỏng dữ liệu
+    /// đến không đúng ranh giới (đặc biệt là ký tự UTF-8 bị chia đôi).
+    async fn serve_chunks(chunks: Vec<Vec<u8>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = [0u8; 4096];
             let _ = socket.read(&mut buffer).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
+            for chunk in chunks {
+                if socket.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn serve_sse(body: &str) -> String {
+        let mut response = SSE_HEADERS.to_vec();
+        response.extend_from_slice(body.as_bytes());
+        serve_chunks(vec![response]).await
+    }
+
+    async fn serve_http(content_type: &str, body: &str) -> String {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n{body}"
+        );
+        serve_chunks(vec![response.into_bytes()]).await
+    }
+
+    /// Ghi phần đầu rồi giữ kết nối im lặng để kiểm tra idle timeout.
+    async fn serve_stalled(prefix: Vec<u8>, stall: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket.write_all(&prefix).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(stall).await;
             let _ = socket.shutdown().await;
         });
         format!("http://{address}")
@@ -582,6 +817,14 @@ mod tests {
         }
     }
 
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut deltas = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            deltas.push(delta);
+        }
+        deltas
+    }
+
     #[tokio::test]
     async fn streams_text_deltas_and_usage() {
         let body = concat!(
@@ -596,17 +839,175 @@ mod tests {
 
         let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
 
-        let mut deltas = Vec::new();
-        while let Ok(delta) = rx.try_recv() {
-            deltas.push(delta);
-        }
-        assert_eq!(deltas, vec!["Xin ".to_string(), "chào".to_string()]);
+        assert_eq!(drain(&mut rx), vec!["Xin ".to_string(), "chào".to_string()]);
         match response {
             ChatResponse::Text { content, usage } => {
                 assert_eq!(content, "Xin chào");
                 assert_eq!(usage.input_tokens, 7);
                 assert_eq!(usage.output_tokens, 2);
             }
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_utf8_character_split_across_reads() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"chào \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"bạn\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let bytes = body.as_bytes().to_vec();
+        // Cắt ngay giữa hai byte của "à" (C3 A0).
+        let split = bytes.iter().position(|&byte| byte == 0xC3).unwrap() + 1;
+        let base_url = serve_chunks(vec![
+            SSE_HEADERS.to_vec(),
+            bytes[..split].to_vec(),
+            bytes[split..].to_vec(),
+        ])
+        .await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
+
+        assert_eq!(drain(&mut rx), vec!["chào ".to_string(), "bạn".to_string()]);
+        match response {
+            ChatResponse::Text { content, .. } => assert_eq!(content, "chào bạn"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_frame_is_returned() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"provider overloaded\",\"type\":\"server_error\"}}\n\n",
+        );
+        let base_url = serve_sse(body).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = provider.chat_stream(request(), Some(tx)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("provider overloaded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_sse_200_body_is_an_error() {
+        let base_url = serve_http(
+            "application/json",
+            r#"{"error":{"message":"model not found"}}"#,
+        )
+        .await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = provider.chat_stream(request(), Some(tx)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("model not found"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_done_is_an_error() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"cut\"}}]}\n\n";
+        let base_url = serve_sse(body).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = provider.chat_stream(request(), Some(tx)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("without [DONE]"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_trailing_line_without_newline() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Xin \"}}]}\n\n",
+            r#"data: {"choices":[{"delta":{"content":"cuối"},"finish_reason":"stop"}]}"#,
+        );
+        let base_url = serve_sse(body).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
+
+        assert_eq!(drain(&mut rx), vec!["Xin ".to_string(), "cuối".to_string()]);
+        match response {
+            ChatResponse::Text { content, .. } => assert_eq!(content, "Xin cuối"),
+            other => panic!("expected text response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_calls_without_index_get_distinct_slots() {
+        let body = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}},{"id":"call_b","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = serve_sse(body).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
+
+        match response {
+            ChatResponse::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].id, "call_a");
+                assert_eq!(calls[0].function.name, "read_file");
+                assert_eq!(calls[0].function.arguments, r#"{"path":"a"}"#);
+                assert_eq!(calls[1].id, "call_b");
+                assert_eq!(calls[1].function.name, "list_dir");
+                assert_eq!(calls[1].function.arguments, r#"{"path":"."}"#);
+            }
+            other => panic!("expected tool calls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_aborts_stalled_stream() {
+        let mut prefix = SSE_HEADERS.to_vec();
+        prefix.extend_from_slice(b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n");
+        let base_url = serve_stalled(prefix, Duration::from_secs(5)).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key")
+            .with_idle_timeout(Duration::from_millis(50));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let error = provider.chat_stream(request(), Some(tx)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("idle timeout"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_stream_when_receiver_is_dropped() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let base_url = serve_sse(body).await;
+        let provider = OpenAiCompatible::new("test", &base_url, "key");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+
+        let response = provider.chat_stream(request(), Some(tx)).await.unwrap();
+
+        match response {
+            ChatResponse::Text { content, .. } => assert_eq!(content, "first"),
             other => panic!("expected text response, got {other:?}"),
         }
     }
