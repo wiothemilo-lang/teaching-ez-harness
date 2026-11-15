@@ -5,6 +5,7 @@ import {
   IconBook,
   IconChat,
   IconCode,
+  IconPlan,
   IconDatabase,
   IconDownload,
   IconFolder,
@@ -73,6 +74,13 @@ export function CommandPalette({
         hint: "Hỏi đáp, viết, lập kế hoạch",
         icon: <IconChat size={16} />,
         run: () => onMode("chat"),
+      },
+      {
+        id: "mode-plan",
+        label: "Chuyển sang Plan",
+        hint: "Chỉ đọc, khảo sát và lập kế hoạch",
+        icon: <IconPlan size={16} />,
+        run: () => onMode("plan"),
       },
       {
         id: "mode-code",

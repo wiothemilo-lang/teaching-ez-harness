@@ -18,6 +18,7 @@ export function ApprovalDialog({ request, onRespond }: Props) {
   }, [onRespond]);
 
   const args = JSON.stringify(request.args ?? {}, null, 2);
+  const preview = request.preview?.trim() ? request.preview : null;
 
   return (
     <div className="approval-backdrop" role="dialog" aria-modal="true" aria-labelledby="approval-title">
@@ -44,7 +45,35 @@ export function ApprovalDialog({ request, onRespond }: Props) {
           <span>Tool</span>
           <code>{request.tool}</code>
         </div>
-        <pre className="approval-args">{args}</pre>
+        {preview ? (
+          <>
+            <div className="approval-tool">
+              <span>Thay đổi</span>
+              <code>diff trước khi ghi</code>
+            </div>
+            <pre className="approval-diff">
+              {preview.split("\n").map((line, index) => (
+                <span
+                  key={index}
+                  className={
+                    line.startsWith("+") && !line.startsWith("+++")
+                      ? "diff-add"
+                      : line.startsWith("-") && !line.startsWith("---")
+                        ? "diff-del"
+                        : line.startsWith("@@")
+                          ? "diff-hunk"
+                          : "diff-line"
+                  }
+                >
+                  {line}
+                  {"\n"}
+                </span>
+              ))}
+            </pre>
+          </>
+        ) : (
+          <pre className="approval-args">{args}</pre>
+        )}
         <p className="approval-note">
           Chỉ cho phép khi bạn hiểu thao tác này. Từ chối sẽ dừng tool và agent sẽ nhận được
           thông báo để thử cách khác.

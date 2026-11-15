@@ -69,6 +69,53 @@ impl PermissionMode {
     }
 }
 
+/// Hành động của một rule do người dùng cấu hình.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Một rule áp cho tool + đối tượng (đường dẫn hoặc lệnh).
+///
+/// `tool` nhận `*` hoặc tên chính xác. `pattern` là glob khớp path với tool
+/// file, khớp command với `run_command`; rỗng hoặc `*` nghĩa là mọi đối tượng.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub action: RuleAction,
+    pub tool: String,
+    #[serde(default)]
+    pub pattern: String,
+}
+
+impl PermissionRule {
+    pub fn new(action: RuleAction, tool: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self {
+            action,
+            tool: tool.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    fn matches(&self, tool: &str, target: &str) -> bool {
+        if self.tool != "*" && self.tool != tool {
+            return false;
+        }
+        let pattern = self.pattern.trim();
+        if pattern.is_empty() || pattern == "*" {
+            return true;
+        }
+        if target.is_empty() {
+            return false;
+        }
+        glob::Pattern::new(pattern)
+            .map(|glob| glob.matches(target))
+            .unwrap_or(false)
+    }
+}
+
 /// Kết quả đánh giá một tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -91,6 +138,9 @@ pub struct ApprovalRequest {
     pub args: Value,
     pub reason: String,
     pub session_id: Option<String>,
+    /// Diff hoặc mô tả thay đổi do lớp UI chuẩn bị (không bắt buộc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -109,7 +159,13 @@ impl ApprovalRequest {
             args,
             reason: reason.into(),
             session_id,
+            preview: None,
         }
+    }
+
+    pub fn with_preview(mut self, preview: Option<String>) -> Self {
+        self.preview = preview;
+        self
     }
 }
 
@@ -143,6 +199,7 @@ impl Approver for DenyApprover {
 #[derive(Debug, Clone)]
 pub struct PermissionPolicy {
     mode: PermissionMode,
+    rules: Vec<PermissionRule>,
 }
 
 impl Default for PermissionPolicy {
@@ -153,17 +210,43 @@ impl Default for PermissionPolicy {
 
 impl PermissionPolicy {
     pub fn new(mode: PermissionMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            rules: Vec::new(),
+        }
+    }
+
+    /// Gắn rule người dùng. Rule không bao giờ vượt qua deny-list lệnh phá hủy.
+    pub fn with_rules(mut self, rules: Vec<PermissionRule>) -> Self {
+        self.rules = rules;
+        self
     }
 
     pub fn mode(&self) -> PermissionMode {
         self.mode
     }
 
-    /// Ba cổng: deny → ask → allow.
+    pub fn rules(&self) -> &[PermissionRule] {
+        &self.rules
+    }
+
+    /// Ba cổng: deny → ask → allow, với rule người dùng chen giữa.
     pub fn evaluate(&self, tool: &str, args: &Value) -> PermissionDecision {
         if let Some(reason) = deny_reason(tool, args) {
             return PermissionDecision::Deny { reason };
+        }
+
+        let target = rule_target(tool, args);
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.action == RuleAction::Deny && rule.matches(tool, &target))
+        {
+            return PermissionDecision::Deny {
+                reason: format!("rule deny: {} {}", rule.tool, rule.pattern)
+                    .trim()
+                    .to_string(),
+            };
         }
 
         if self.mode == PermissionMode::ReadOnly && is_mutating(tool) {
@@ -172,10 +255,30 @@ impl PermissionPolicy {
             };
         }
 
+        if self
+            .rules
+            .iter()
+            .any(|rule| rule.action == RuleAction::Allow && rule.matches(tool, &target))
+        {
+            return PermissionDecision::Allow;
+        }
+
         if let Some(reason) = ask_reason(tool, args) {
             return match self.mode {
                 PermissionMode::Trust => PermissionDecision::Allow,
                 _ => PermissionDecision::Ask { reason },
+            };
+        }
+
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.action == RuleAction::Ask && rule.matches(tool, &target))
+        {
+            return PermissionDecision::Ask {
+                reason: format!("rule ask: {} {}", rule.tool, rule.pattern)
+                    .trim()
+                    .to_string(),
             };
         }
 
@@ -187,6 +290,21 @@ impl PermissionPolicy {
 
         PermissionDecision::Allow
     }
+}
+
+/// Đối tượng mà rule so khớp: path với tool file, command với `run_command`.
+fn rule_target(tool: &str, args: &Value) -> String {
+    if tool == "run_command" {
+        return args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    args.get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn is_mutating(tool: &str) -> bool {
@@ -579,6 +697,69 @@ mod tests {
         let policy = PermissionPolicy::new(PermissionMode::Strict);
         assert!(matches!(
             policy.evaluate("write_file", &json!({"path": "a", "content": "x"})),
+            PermissionDecision::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn user_rules_allow_ask_and_deny() {
+        let policy = PermissionPolicy::default().with_rules(vec![
+            PermissionRule::new(RuleAction::Allow, "run_command", "git status*"),
+            PermissionRule::new(RuleAction::Ask, "run_command", "git push*"),
+            PermissionRule::new(RuleAction::Deny, "write_file", "secrets/**"),
+        ]);
+
+        assert!(policy
+            .evaluate("run_command", &json!({"command": "git status --short"}))
+            .is_allowed());
+        assert!(matches!(
+            policy.evaluate("run_command", &json!({"command": "git push origin main"})),
+            PermissionDecision::Ask { .. }
+        ));
+        assert!(matches!(
+            policy.evaluate("write_file", &json!({"path": "secrets/key.txt"})),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_rule_overrides_builtin_ask_but_not_catastrophic_deny() {
+        let policy = PermissionPolicy::default().with_rules(vec![PermissionRule::new(
+            RuleAction::Allow,
+            "run_command",
+            "*",
+        )]);
+
+        assert!(policy
+            .evaluate("run_command", &json!({"command": "rm notes.txt"}))
+            .is_allowed());
+        assert!(matches!(
+            policy.evaluate("run_command", &json!({"command": "rm -rf /"})),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn read_only_mode_wins_over_allow_rules() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_rules(vec![PermissionRule::new(RuleAction::Allow, "*", "*")]);
+
+        assert!(matches!(
+            policy.evaluate("write_file", &json!({"path": "a", "content": "x"})),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn wildcard_tool_rule_matches_file_paths() {
+        let policy = PermissionPolicy::new(PermissionMode::Strict)
+            .with_rules(vec![PermissionRule::new(RuleAction::Allow, "*", "src/**")]);
+
+        assert!(policy
+            .evaluate("write_file", &json!({"path": "src/main.rs"}))
+            .is_allowed());
+        assert!(matches!(
+            policy.evaluate("write_file", &json!({"path": "README.md"})),
             PermissionDecision::Ask { .. }
         ));
     }

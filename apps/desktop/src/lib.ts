@@ -8,6 +8,7 @@ export const STRATEGY_LABELS: Record<string, string> = {
 
 export const MODE_LABELS: Record<AppMode, string> = {
   chat: "Chat",
+  plan: "Plan",
   code: "Code",
 };
 
@@ -21,6 +22,12 @@ export const CODE_SUGGESTIONS = [
   "Đọc cấu trúc dự án và tóm tắt kiến trúc",
   "Tìm nguyên nhân lỗi build gần nhất",
   "Thêm test cho hàm quan trọng nhất",
+];
+
+export const PLAN_SUGGESTIONS = [
+  "Khảo sát dự án và lập kế hoạch thêm một tính năng nhỏ",
+  "Lên kế hoạch sửa lỗi build mà không đổi hành vi",
+  "Đề xuất kế hoạch refactor file lớn nhất, kèm cách kiểm chứng",
 ];
 
 export const SUBJECT_HINTS: Record<string, string> = {
@@ -82,11 +89,15 @@ export function subjectName(subjects: { id: string; name: string }[], id: string
 }
 
 export function suggestionsFor(subjectId: string, mode: AppMode): string[] {
+  if (mode === "plan") return PLAN_SUGGESTIONS;
   if (mode === "code") return CODE_SUGGESTIONS;
   return SUBJECT_SUGGESTIONS[subjectId] ?? CHAT_SUGGESTIONS;
 }
 
 export function placeholderFor(subjectId: string, mode: AppMode): string {
+  if (mode === "plan") {
+    return "Mô tả việc cần lập kế hoạch; agent chỉ đọc và trình kế hoạch trước khi sửa…";
+  }
   if (mode === "code") return "Mô tả thay đổi, lỗi cần sửa hoặc câu hỏi về code…";
   return SUBJECT_HINTS[subjectId] ?? "Hỏi bất cứ điều gì…";
 }

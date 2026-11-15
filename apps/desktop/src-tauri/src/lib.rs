@@ -10,11 +10,12 @@ use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
 use tez_core::agent::{Agent, AgentConfig, RunContext, StopReason};
 use tez_core::compaction::{session_artifact_dir, CompactReport, Compactor};
 use tez_core::context::{ContextBuilder, ContextInput};
+use tez_core::diff;
 use tez_core::harness::{self, HarnessConfig};
 use tez_core::hooks::{self};
 use tez_core::mcp::{self, McpServerConfig};
 use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
-use tez_core::modes::Mode;
+use tez_core::modes::{Mode, PLAN_TOOLS};
 use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
@@ -289,7 +290,12 @@ impl StopBroker {
     }
 
     fn stop(&self) -> bool {
-        match self.current.lock().ok().and_then(|current| current.as_ref().cloned()) {
+        match self
+            .current
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().cloned())
+        {
             Some(tx) => tx.send(true).is_ok(),
             None => false,
         }
@@ -305,13 +311,21 @@ struct ChatDelta {
 struct DesktopApprover {
     app: AppHandle,
     broker: Arc<ApprovalBroker>,
+    workspace: Option<PathBuf>,
 }
 
 #[async_trait]
 impl Approver for DesktopApprover {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
+        let mut request = request.clone();
+        if request.preview.is_none() {
+            request.preview = self
+                .workspace
+                .as_deref()
+                .and_then(|root| approval_preview(root, &request));
+        }
         let receiver = self.broker.register(&request.id);
-        if let Err(error) = self.app.emit("tez://approval-request", request) {
+        if let Err(error) = self.app.emit("tez://approval-request", &request) {
             eprintln!("[permission] không gửi được yêu cầu duyệt: {error}");
             self.broker.cancel(&request.id);
             return false;
@@ -325,6 +339,63 @@ impl Approver for DesktopApprover {
             }
         }
     }
+}
+
+/// Diff trước khi ghi/sửa file, chỉ đọc trong workspace.
+fn approval_preview(root: &Path, request: &ApprovalRequest) -> Option<String> {
+    if !matches!(request.tool.as_str(), "write_file" | "edit_file") {
+        return None;
+    }
+    let raw = request.args.get("path")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        root.join(raw)
+    };
+    let root_canon = root.canonicalize().ok()?;
+    let full = candidate.canonicalize().ok().or_else(|| {
+        let parent = candidate.parent()?.canonicalize().ok()?;
+        Some(parent.join(candidate.file_name()?))
+    })?;
+    if !full.starts_with(&root_canon) {
+        return None;
+    }
+
+    let old = std::fs::read_to_string(&full).unwrap_or_default();
+    let new = match request.tool.as_str() {
+        "write_file" => request.args.get("content")?.as_str()?.to_string(),
+        "edit_file" => {
+            let old_string = request.args.get("old_string")?.as_str()?;
+            let new_string = request.args.get("new_string")?.as_str()?;
+            let replace_all = request
+                .args
+                .get("replace_all")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if old_string.is_empty() || !old.contains(old_string) {
+                return None;
+            }
+            if !replace_all && old.matches(old_string).count() != 1 {
+                return None;
+            }
+            if replace_all {
+                old.replace(old_string, new_string)
+            } else {
+                old.replacen(old_string, new_string, 1)
+            }
+        }
+        _ => return None,
+    };
+
+    let mut preview = diff::unified_diff(&old, &new, raw);
+    if preview.chars().count() > 24_000 {
+        preview = preview.chars().take(24_000).collect::<String>();
+        preview.push_str("\n… diff đã rút gọn\n");
+    }
+    (!preview.is_empty()).then_some(preview)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1168,16 +1239,14 @@ async fn chat(
     let result = chat_inner(app, Arc::clone(&broker), request, cancel).await;
     stop.clear();
     result.map_err(|error| match error.downcast_ref::<tez_llm::LlmError>() {
-            Some(tez_llm::LlmError::Api { status, .. }) if *status == 401 || *status == 403 => {
-                format!(
-                    "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt."
-                )
-            }
-            Some(tez_llm::LlmError::Api { status, .. }) if *status == 429 => {
-                format!("Provider đang giới hạn tốc độ (HTTP {status}). Chờ rồi thử lại.")
-            }
-            _ => friendly(error),
-        })
+        Some(tez_llm::LlmError::Api { status, .. }) if *status == 401 || *status == 403 => {
+            format!("API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt.")
+        }
+        Some(tez_llm::LlmError::Api { status, .. }) if *status == 429 => {
+            format!("Provider đang giới hạn tốc độ (HTTP {status}). Chờ rồi thử lại.")
+        }
+        _ => friendly(error),
+    })
 }
 
 #[tauri::command]
@@ -1195,7 +1264,7 @@ async fn chat_inner(
     let dir = data_dir()?;
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
     let workspace = match mode {
-        Mode::Code => Some(resolve_workspace(request.workspace.as_deref())?),
+        Mode::Code | Mode::Plan => Some(resolve_workspace(request.workspace.as_deref())?),
         Mode::Chat => match request
             .workspace
             .as_deref()
@@ -1209,13 +1278,20 @@ async fn chat_inner(
     let connection = resolve_connection(&dir, request.provider_id.as_deref())?;
 
     let config = harness::load(&dir);
-    let policy = Arc::new(PermissionPolicy::new(config.permission_mode));
-    let approver: Arc<dyn Approver> = if config.permission_mode == PermissionMode::Trust {
+    let policy_mode = if mode == Mode::Plan {
+        PermissionMode::ReadOnly
+    } else {
+        config.permission_mode
+    };
+    let policy =
+        Arc::new(PermissionPolicy::new(policy_mode).with_rules(config.permission_rules.clone()));
+    let approver: Arc<dyn Approver> = if policy_mode == PermissionMode::Trust {
         Arc::new(AutoApprover)
     } else {
         Arc::new(DesktopApprover {
             app,
             broker: Arc::clone(&broker),
+            workspace: workspace.clone(),
         })
     };
     let hooks = Arc::new(hooks::build_registry(Some(&dir), &config.hooks));
@@ -1224,30 +1300,36 @@ async fn chat_inner(
     let store = Store::open(dir.join("tez.db"))?;
     store.ensure_profile("default", "Người dùng")?;
 
-    let (session_id, history, todo_json, created) = match request.session_id.as_deref() {
-        Some(id) => {
-            if !store.session_exists(id)? {
-                anyhow::bail!("session '{id}' không tồn tại");
+    let (session_id, history, todo_json, created, previous_mode) =
+        match request.session_id.as_deref() {
+            Some(id) => {
+                let row = store
+                    .get_session(id)?
+                    .ok_or_else(|| anyhow::anyhow!("session '{id}' không tồn tại"))?;
+                let previous = Mode::parse(&row.mode);
+                if row.mode != mode.as_str() {
+                    store.update_session_mode(id, mode.as_str())?;
+                }
+                store.resume_session(id)?;
+                let history = store
+                    .load_messages(id, 40)?
+                    .into_iter()
+                    .filter_map(|message| match message.role.as_str() {
+                        "user" => Some(Message::user(message.content)),
+                        "assistant" => Some(Message::assistant(message.content)),
+                        _ => None,
+                    })
+                    .collect();
+                (id.to_string(), history, store.load_todos(id)?, false, Some(previous))
             }
-            store.resume_session(id)?;
-            let history = store
-                .load_messages(id, 40)?
-                .into_iter()
-                .filter_map(|message| match message.role.as_str() {
-                    "user" => Some(Message::user(message.content)),
-                    "assistant" => Some(Message::assistant(message.content)),
-                    _ => None,
-                })
-                .collect();
-            (id.to_string(), history, store.load_todos(id)?, false)
-        }
-        None => (
-            store.create_session_mode("default", None, None, mode.as_str())?,
-            Vec::new(),
-            None,
-            true,
-        ),
-    };
+            None => (
+                store.create_session_mode("default", None, None, mode.as_str())?,
+                Vec::new(),
+                None,
+                true,
+                None,
+            ),
+        };
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let emitter_session = session_id.clone();
     let emitter = tokio::spawn(async move {
@@ -1262,7 +1344,8 @@ async fn chat_inner(
         }
     });
 
-    let mut session_guard = created.then(|| NewSessionGuard {        db: dir.join("tez.db"),
+    let mut session_guard = created.then(|| NewSessionGuard {
+        db: dir.join("tez.db"),
         id: session_id.clone(),
         armed: true,
     });
@@ -1317,7 +1400,7 @@ async fn chat_inner(
         .map(project::ProjectContext::load)
         .map(|context| context.render())
         .unwrap_or_default();
-    let messages = ContextBuilder.build(ContextInput {
+    let mut messages = ContextBuilder.build(ContextInput {
         recent: &recent,
         excerpts: &excerpts,
         skills: &skill_snippets,
@@ -1330,23 +1413,41 @@ async fn chat_inner(
         language: &config.language,
     });
 
+    if previous_mode == Some(Mode::Plan) && mode == Mode::Code {
+        if let Some(content) = messages.first_mut().and_then(|system| system.content.as_mut()) {
+            content.push_str(
+                "\nNgười dùng vừa duyệt kế hoạch và chuyển từ Plan sang Code. \
+                 Thực thi theo kế hoạch trong lịch sử và todos; nếu kế hoạch thiếu thông tin \
+                 hoặc phạm vi thay đổi, nói rõ trước khi mở rộng.\n",
+            );
+        }
+    }
+
     let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatible::new(
         &connection.provider_id,
         &connection.base_url,
         &connection.api_key,
     ));
 
+    let plan_mode = mode == Mode::Plan;
     let mut tools = match (&mode, workspace.as_deref()) {
         (Mode::Code, Some(root)) => code_registry(root)?,
+        (Mode::Plan, Some(root)) => code_registry(root)?.filtered(PLAN_TOOLS),
         _ => full_registry(),
     };
-    tools.register(MemorySave::new(memory_store.clone()));
+    if !plan_mode {
+        tools.register(MemorySave::new(memory_store.clone()));
+    }
     tools.register(MemorySearch::new(memory_store.clone()));
-    tools.register(MemoryForget::new(memory_store.clone()));
+    if !plan_mode {
+        tools.register(MemoryForget::new(memory_store.clone()));
+    }
     tools.register(TodoWrite::new(Arc::clone(&todos)));
-    let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
-    for tool in discovery.tools {
-        tools.register(tool);
+    if !plan_mode {
+        let discovery = mcp::discover_with_project(&dir, workspace.as_deref()).await?;
+        for tool in discovery.tools {
+            tools.register(tool);
+        }
     }
 
     if mode == Mode::Code {

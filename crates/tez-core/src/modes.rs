@@ -1,4 +1,5 @@
-//! Hai chế độ làm việc của tez: Chat (trò chuyện tổng quát) và Code (trợ lý lập trình).
+//! Ba chế độ làm việc của tez: Chat (trò chuyện tổng quát), Plan (chỉ đọc và
+//! lập kế hoạch) và Code (trợ lý lập trình).
 
 use std::path::Path;
 
@@ -8,6 +9,8 @@ pub enum Mode {
     /// Trò chuyện, hỏi đáp, học tập — không giới hạn môn học.
     #[default]
     Chat,
+    /// Chỉ đọc workspace, khảo sát và trình kế hoạch trước khi thực thi.
+    Plan,
     /// Trợ lý lập trình: đọc/sửa file và chạy lệnh trong một workspace.
     Code,
 }
@@ -22,6 +25,7 @@ impl Mode {
     pub fn try_parse(value: &str) -> Option<Self> {
         match value.trim().to_lowercase().as_str() {
             "chat" => Some(Self::Chat),
+            "plan" | "planning" | "plan_mode" | "plan-mode" => Some(Self::Plan),
             "code" | "coding" | "dev" => Some(Self::Code),
             _ => None,
         }
@@ -30,6 +34,7 @@ impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Chat => "chat",
+            Self::Plan => "plan",
             Self::Code => "code",
         }
     }
@@ -37,9 +42,41 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Chat => "Chat",
+            Self::Plan => "Plan",
             Self::Code => "Code",
         }
     }
+}
+
+/// Tool được phép dùng trong chế độ Plan: chỉ đọc và ghi kế hoạch.
+pub const PLAN_TOOLS: &[&str] = &[
+    "read_file",
+    "list_files",
+    "glob",
+    "grep",
+    "todo_write",
+    "memory_search",
+];
+
+/// Prompt system cho chế độ Plan.
+pub fn plan_system_prompt(workspace: &Path) -> String {
+    format!(
+        "Bạn là agent lập kế hoạch trong tez, chạy local trên máy người dùng.\n\
+         Workspace hiện tại: {workspace}.\n\n\
+         Chế độ Plan chỉ đọc: không ghi file, không chạy lệnh, không gọi tool thay đổi trạng thái.\n\
+         Nhiệm vụ: khảo sát workspace bằng read_file/list_files/glob/grep, xác định file và ràng buộc liên quan, \
+         rồi trình một kế hoạch ngắn gọn để người dùng duyệt trước khi chuyển sang Code.\n\n\
+         Kế hoạch cần có:\n\
+         - Mục tiêu và phạm vi (ngoài phạm vi thì không làm).\n\
+         - File/thư mục sẽ đọc hoặc sửa, kèm lý do.\n\
+         - Các bước thực hiện theo thứ tự, mỗi bước nhỏ và kiểm chứng được.\n\
+         - Rủi ro, điểm chưa chắc chắn và câu hỏi cần người dùng trả lời.\n\
+         - Cách kiểm chứng sau khi thực thi (build, test, lệnh cụ thể).\n\n\
+         Dùng todo_write để lưu kế hoạch. Không tự chuyển sang thực thi; khi người dùng chuyển sang Code, \
+         kế hoạch sẽ là nguồn chỉ dẫn.\n\
+         Trả lời ngắn gọn; code và tên định danh giữ nguyên tiếng Anh.\n",
+        workspace = workspace.display()
+    )
 }
 
 /// Tool được phép dùng trong chế độ Code.
@@ -88,12 +125,25 @@ mod tests {
         assert_eq!(Mode::parse("code"), Mode::Code);
         assert_eq!(Mode::parse(" CODE "), Mode::Code);
         assert_eq!(Mode::parse("chat"), Mode::Chat);
+        assert_eq!(Mode::parse("plan"), Mode::Plan);
         assert_eq!(Mode::parse(""), Mode::Chat);
         assert_eq!(Mode::default(), Mode::Chat);
         assert_eq!(Mode::Code.as_str(), "code");
+        assert_eq!(Mode::Plan.as_str(), "plan");
         assert_eq!(Mode::try_parse("code"), Some(Mode::Code));
         assert_eq!(Mode::try_parse("chat"), Some(Mode::Chat));
+        assert_eq!(Mode::try_parse("plan"), Some(Mode::Plan));
         assert_eq!(Mode::try_parse("bogus"), None);
+    }
+
+    #[test]
+    fn plan_prompt_is_read_only() {
+        let prompt = plan_system_prompt(Path::new("/tmp/project"));
+        assert!(prompt.contains("/tmp/project"));
+        assert!(prompt.contains("Chế độ Plan chỉ đọc"));
+        assert!(prompt.contains("todo_write"));
+        assert!(!PLAN_TOOLS.contains(&"write_file"));
+        assert!(!PLAN_TOOLS.contains(&"run_command"));
     }
 
     #[test]

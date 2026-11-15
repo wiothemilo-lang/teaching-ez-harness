@@ -19,7 +19,7 @@ use tez_core::harness;
 use tez_core::hooks::{self, HookRegistry};
 use tez_core::mcp;
 use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
-use tez_core::modes::{self, Mode};
+use tez_core::modes::{self, Mode, PLAN_TOOLS};
 use tez_core::permission::{
     ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
 };
@@ -160,10 +160,10 @@ struct ChatArgs {
     /// Môn học tùy chọn: math, physics, chemistry, english. Bỏ trống = tổng quát.
     #[arg(long, default_value = "general")]
     subject: String,
-    /// Chế độ: chat (mặc định) hoặc code.
+    /// Chế độ: chat (mặc định), plan hoặc code.
     #[arg(long, default_value = "chat")]
     mode: String,
-    /// Thư mục làm việc cho chế độ code (mặc định: thư mục hiện tại).
+    /// Thư mục làm việc cho chế độ plan/code (mặc định: thư mục hiện tại).
     #[arg(long)]
     workspace: Option<PathBuf>,
     #[arg(long, default_value = "10")]
@@ -369,6 +369,7 @@ fn registry_for_mode(
 ) -> anyhow::Result<ToolRegistry> {
     match mode {
         Mode::Chat => Ok(registry_for(pack)),
+        Mode::Plan => Ok(code_registry(workspace)?.filtered(PLAN_TOOLS)),
         Mode::Code => Ok(code_registry(workspace)?),
     }
 }
@@ -454,7 +455,7 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
 
     // Đảm bảo DB và profile tồn tại ngay từ đầu.
     let store = Store::open(dir.join("tez.db"))?;
-    store.ensure_profile("default", "Học sinh")?;
+    store.ensure_profile("default", "Người dùng")?;
 
     println!(
         "Đã kết nối. Sổ provider: {}",
@@ -982,7 +983,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     };
 
     let store = Store::open(dir.join("tez.db"))?;
-    store.ensure_profile("default", "Học sinh")?;
+    store.ensure_profile("default", "Người dùng")?;
     let (session_id, mut conversation, todo_json) = match args.session.as_deref() {
         Some(id) => {
             let row = store.get_session(id)?.ok_or_else(|| {
@@ -1029,9 +1030,14 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     if args.no_memory {
         config.memory.auto_recall = false;
     }
-    let policy = Arc::new(PermissionPolicy::new(config.permission_mode));
-    let approver: Arc<dyn Approver> = if args.yes || config.permission_mode == PermissionMode::Trust
-    {
+    let policy_mode = if mode == Mode::Plan {
+        PermissionMode::ReadOnly
+    } else {
+        config.permission_mode
+    };
+    let policy =
+        Arc::new(PermissionPolicy::new(policy_mode).with_rules(config.permission_rules.clone()));
+    let approver: Arc<dyn Approver> = if args.yes || policy_mode == PermissionMode::Trust {
         Arc::new(AutoApprover)
     } else {
         Arc::new(CliApprover)
@@ -1046,9 +1052,13 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
     ));
 
     let mut tools = registry_for_mode(pack, mode, &workspace)?;
-    tools.register(MemorySave::new(memory.clone()));
+    if mode != Mode::Plan {
+        tools.register(MemorySave::new(memory.clone()));
+    }
     tools.register(MemorySearch::new(memory.clone()));
-    tools.register(MemoryForget::new(memory.clone()));
+    if mode != Mode::Plan {
+        tools.register(MemoryForget::new(memory.clone()));
+    }
     tools.register(TodoWrite::new(Arc::clone(&todos)));
     if mode == Mode::Code {
         let runtime = Arc::new(SubagentRuntime {
@@ -1063,25 +1073,27 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         });
         tools.register(TaskTool::new(runtime));
     }
-    let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
-    let mcp_count = discovery.tools.len();
-    for server in &discovery.servers {
-        if !server.ok {
+    if mode != Mode::Plan {
+        let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
+        let mcp_count = discovery.tools.len();
+        for server in &discovery.servers {
+            if !server.ok {
+                eprintln!(
+                    "[mcp] {}: {}",
+                    server.name,
+                    server.error.as_deref().unwrap_or("không khả dụng")
+                );
+            }
+        }
+        for tool in discovery.tools {
+            tools.register(tool);
+        }
+        if mcp_count > 0 {
             eprintln!(
-                "[mcp] {}: {}",
-                server.name,
-                server.error.as_deref().unwrap_or("không khả dụng")
+                "[mcp] {mcp_count} tool từ {} server",
+                discovery.servers.len()
             );
         }
-    }
-    for tool in discovery.tools {
-        tools.register(tool);
-    }
-    if mcp_count > 0 {
-        eprintln!(
-            "[mcp] {mcp_count} tool từ {} server",
-            discovery.servers.len()
-        );
     }
     let mut skills = SkillRegistry::load_with_plugins(&dir)?;
     skills.load_project(&workspace)?;
@@ -1127,6 +1139,10 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         match mode {
             Mode::Code => {
                 println!("tez code — workspace {}", workspace.display());
+                println!("session {session_id}");
+            }
+            Mode::Plan => {
+                println!("tez plan — chỉ đọc, workspace {}", workspace.display());
                 println!("session {session_id}");
             }
             Mode::Chat => {
@@ -1542,7 +1558,7 @@ fn doc_add(args: DocAddArgs) -> anyhow::Result<()> {
 
     let dir = data_dir()?;
     let store = Store::open(dir.join("tez.db"))?;
-    store.ensure_profile("default", "Học sinh")?;
+    store.ensure_profile("default", "Người dùng")?;
     let source = args.path.to_string_lossy().to_string();
     let mime = if matches!(extension.as_str(), "md" | "markdown") {
         "text/markdown"

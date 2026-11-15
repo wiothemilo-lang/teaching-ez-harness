@@ -266,14 +266,18 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
   và tool harness (`todo_write`, `task`, `memory_*`, `compact`). Mỗi subject
   pack lọc allowlist; chế độ Code dùng `code_registry(root)`.
 - **Permission pipeline** (`crates/tez-core/src/permission.rs`) có bốn mode:
-  `read_only`, `strict`, `standard` (mặc định), `trust`. Mỗi call đi qua ba cổng
-  theo thứ tự: deny-list (lệnh phá hủy) → ask rules (xóa, `git reset --hard`,
-  cài package, `curl | sh`, tool MCP…) → allow. `read_only` chặn mọi thao tác
-  ghi/chạy lệnh; `strict` hỏi trước mọi thay đổi; `trust` bỏ qua ask nhưng vẫn
-  giữ deny-list.
+  `read_only`, `strict`, `standard` (mặc định), `trust`. Mỗi call đi qua:
+  deny-list (lệnh phá hủy) → rule `deny` của người dùng → chặn `read_only` →
+  rule `allow` → ask mặc định (xóa, `git reset --hard`, cài package,
+  `curl | sh`, tool MCP…) → rule `ask` → `strict`. Rule lưu trong
+  `harness.json` dưới dạng `{action, tool, pattern}`; `tool` nhận `*`, pattern
+  là glob khớp path (tool file) hoặc command (`run_command`). Deny-list lệnh phá
+  hủy luôn thắng rule, và `read_only` không bị rule `allow` vượt qua.
 - **Approver**: trait async. Desktop hiển thị dialog và trả lời qua event
-  `tez://approval-request` + command `respond_approval`; CLI dùng
-  `dialoguer::Confirm`, có `--yes` để tự duyệt và `--permission` để ghi đè mode.
+  `tez://approval-request` + command `respond_approval`; với `write_file` và
+  `edit_file`, desktop đọc file cũ trong workspace và gửi kèm unified diff ở
+  `preview` để người dùng duyệt trước khi ghi. CLI dùng `dialoguer::Confirm`,
+  có `--yes` để tự duyệt và `--permission` để ghi đè mode.
 - **Hooks** (`crates/tez-core/src/hooks.rs`): `UserPromptSubmit`, `PreToolUse`,
   `PostToolUse`, `Stop`. Hook built-in ghi audit JSONL
   (`<data_dir>/audit.jsonl`) và che API key/private key trong output tool.
@@ -377,6 +381,19 @@ tầng ứng dụng, không phải sandbox OS. `tools::code_registry(root)` đă
 tool file/lệnh; `CODE_TOOL_NAMES` là danh sách chuẩn. `Mode::Code` trong
 `crates/tez-core/src/modes.rs` chọn prompt system gắn workspace và allowlist
 `CODE_TOOLS`, bao gồm cả `todo_write`, `task`, `compact` và `memory_*`.
+
+### 5.6 Chế độ Plan
+
+`Mode::Plan` dùng cùng workspace với Code nhưng chỉ đăng ký `PLAN_TOOLS`
+(`read_file`, `list_files`, `glob`, `grep`, `todo_write`, `memory_search`);
+không có tool ghi, chạy lệnh, `task` hay MCP. Policy bị ép về `read_only` bất kể
+cấu hình, nên kể cả rule `allow` cũng không mở được thao tác thay đổi. Prompt
+`plan_system_prompt` yêu cầu agent khảo sát, nêu mục tiêu/phạm vi, file sẽ sửa,
+các bước, rủi ro và cách kiểm chứng, rồi dừng để người dùng chuyển sang Code.
+Desktop dùng chung `ChatView` với cờ `planMode`; CLI nhận `--mode plan`.
+Khi chuyển Plan → Code, desktop giữ nguyên `session_id`, cập nhật mode trong
+SQLite (`Store::update_session_mode`) và chèn chỉ dẫn “thực thi theo kế hoạch”
+vào system prompt; todos và lịch sử vẫn được nạp lại như một phiên bình thường.
 
 ## 6. Subject packs
 

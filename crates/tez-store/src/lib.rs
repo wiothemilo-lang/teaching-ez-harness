@@ -521,6 +521,15 @@ impl Store {
         Ok(())
     }
 
+    /// Đổi mode của session khi người dùng chuyển Plan ↔ Code mà vẫn giữ mạch.
+    pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET mode = ?2 WHERE id = ?1",
+            params![session_id, mode],
+        )?;
+        Ok(())
+    }
+
     pub fn session_exists(&self, session_id: &str) -> Result<bool, StoreError> {
         let exists: i64 = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
@@ -1032,6 +1041,20 @@ mod tests {
         assert_eq!(row.messages, 0);
 
         assert!(store.get_session("không-tồn-tại").unwrap().is_none());
+    }
+
+    #[test]
+    fn updates_session_mode_on_plan_to_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Người dùng").unwrap();
+        let id = store
+            .create_session_mode("default", None, None, "plan")
+            .unwrap();
+
+        store.update_session_mode(&id, "code").unwrap();
+        let row = store.get_session(&id).unwrap().unwrap();
+        assert_eq!(row.mode, "code");
     }
 
     #[test]

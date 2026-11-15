@@ -208,8 +208,11 @@ export default function App() {
 
   const handleMode = (next: AppMode) => {
     if (busy || next === mode) return;
+    // Plan ↔ Code giữ nguyên phiên để kế hoạch, todos và hội thoại đi theo.
+    const keepSession =
+      (mode === "plan" && next === "code") || (mode === "code" && next === "plan");
     setMode(next);
-    newSession();
+    if (!keepSession) newSession();
   };
 
   const openWorkspace = useCallback(() => {
@@ -242,7 +245,7 @@ export default function App() {
         setDenials(0);
         const found = sessions.find((session) => session.id === id);
         if (found) {
-          setMode(found.mode === "code" ? "code" : "chat");
+          setMode(found.mode === "code" ? "code" : found.mode === "plan" ? "plan" : "chat");
         }
       } catch (openError) {
         notify("error", "Không mở được buổi học", errorMessage(openError));
@@ -400,6 +403,7 @@ export default function App() {
       ) : (
         <ChatView
           connection={status.connection}
+          planMode={mode === "plan"}
           messages={messages}
           input={input}
           busy={busy}
