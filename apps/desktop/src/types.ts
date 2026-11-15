@@ -7,7 +7,7 @@ export type SettingsTab =
   | "update"
   | "data";
 
-export type AppMode = "chat" | "code";
+export type AppMode = "chat" | "plan" | "code";
 
 export type PermissionMode = "read_only" | "strict" | "standard" | "trust";
 
@@ -50,8 +50,15 @@ export type HookConfig = {
   enabled: boolean;
 };
 
+export type PermissionRule = {
+  action: "allow" | "ask" | "deny";
+  tool: string;
+  pattern: string;
+};
+
 export type HarnessConfig = {
   permission_mode: PermissionMode;
+  permission_rules: PermissionRule[];
   max_steps: number;
   max_tokens: number;
   temperature: number;
@@ -88,6 +95,7 @@ export type ApprovalRequest = {
   args: unknown;
   reason: string;
   session_id: string | null;
+  preview?: string | null;
 };
 
 export type SubjectInfo = {

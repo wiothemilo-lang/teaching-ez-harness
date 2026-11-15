@@ -79,8 +79,9 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Rust workspace (`tez-llm`, `tez-core`, `tez-store`, `tez-auth`, `tez-update`, `tez-cli`) | ✅ |
 | Agent loop: tool call, timeout 60s, cap output 8KB, tối đa 12 bước (chỉnh được) | ✅ |
 | Chat tổng quát (không giới hạn môn) + 4 preset Toán/Lý/Hóa/Anh | ✅ |
+| Plan mode: chỉ đọc workspace, khảo sát và trình kế hoạch trước khi sửa | ✅ |
 | Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
-| Harness: permission pipeline 4 mức, approval desktop/CLI, hook audit + che bí mật | ✅ |
+| Harness: permission pipeline 4 mức + rule theo tool/path, approval kèm diff, hook audit + che bí mật | ✅ |
 | Harness: todo plan, subagent `task`, compaction 4 bước, memory dài hạn | ✅ |
 | `harness.json` + tab **Cài đặt → Agent** (quyền, model, system prompt, ngôn ngữ, nén, memory, hook) | ✅ |
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
@@ -311,11 +312,12 @@ scripts/desktop.sh appimage-debug  # AppImage bản debug, nhanh hơn
 Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền mảnh, nhãn monospace, accent cam đất, không gradient rực rỡ. Sidebar gọn với workspace, danh sách phiên và công tắc **Chat / Code**; `Ctrl K` mở command palette để chuyển chế độ, mở cài đặt hoặc tạo extension.
 
 - **Chat:** trợ lý tổng quát, không bắt chọn môn hay lớp; câu trả lời stream dần, nút gửi đổi thành nút **dừng** khi agent đang chạy; tool trace có args/kết quả/thời gian, token usage.
+- **Plan:** chỉ đọc workspace; agent khảo sát, đặt câu hỏi và trình kế hoạch (mục tiêu, file, bước, rủi ro, cách kiểm chứng) trước khi bạn chuyển sang Code. Chuyển Plan → Code giữ nguyên phiên, todos và hội thoại.
 - **Code:** nhập hoặc mở workspace; agent dùng `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command`, `todo_write`, `task`, `compact` và bị giới hạn trong thư mục đó.
 - **Ngữ cảnh dự án:** khi đã chọn workspace, agent đọc `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), nạp skill ở `.tez/skills/` và MCP server ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
-- **Duyệt thao tác:** khi permission mode yêu cầu, app hiện hộp thoại kèm lý do, tool và args JSON; chọn **Từ chối** hoặc **Cho phép chạy**.
+- **Duyệt thao tác:** khi permission mode hoặc rule yêu cầu, app hiện hộp thoại kèm lý do, tool và **diff trước khi ghi** cho `write_file`/`edit_file`; chọn **Từ chối** hoặc **Cho phép chạy**.
 - **Dock harness:** ngay trên ô nhập, hiện kế hoạch todo, thanh context so với giới hạn, số lượt nén và số thao tác bị chặn.
-- **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
+- **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), viết **permission rule** dạng `allow|ask|deny tool pattern`, giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
 - **Cài đặt → Model:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
 - **Cài đặt → Kỹ năng:** xem skill, ngữ cảnh, từ khóa, nội dung Markdown, mở thư mục, hoặc **Tạo với AI** (mô tả → xem trước `SKILL.md` → lưu).
 - **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool; **Tạo với AI** sinh cấu hình stdio.
@@ -366,5 +368,5 @@ Chạy không cần FUSE:
 1. RAG PDF/DOCX + OCR, `context inspect` để xem token từng phần.
 2. Lưu connection vào SQLite + OS keychain (thay master key file).
 3. Thêm tool Anh (`vocabulary_lookup`) và eval 8 case/môn.
-4. Permission rule theo tool/đường dẫn, diff preview trước khi ghi file và plan mode.
+4. Skill tool do model tự gọi (thay keyword-match), web fetch và multimodal input.
 5. Ký số installer Windows và bật auto-update có xác minh chữ ký.

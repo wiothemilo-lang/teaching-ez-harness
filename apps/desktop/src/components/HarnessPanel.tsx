@@ -6,6 +6,7 @@ import type {
   HookConfig,
   MemoryRecord,
   PermissionMode,
+  PermissionRule,
   ToastKind,
 } from "../types";
 import { IconPlus, IconRefresh, IconTrash } from "../icons";
@@ -59,6 +60,27 @@ type HookDraft = {
   timeout_secs: number;
 };
 
+function formatRules(rules: PermissionRule[]): string {
+  return rules.map((rule) => `${rule.action} ${rule.tool} ${rule.pattern}`.trim()).join("\n");
+}
+
+function parseRules(text: string): PermissionRule[] {
+  const actions = new Set(["allow", "ask", "deny"]);
+  const rules: PermissionRule[] = [];
+  for (const raw of text.split("\n")) {
+    const parts = raw.trim().split(/\s+/).filter(Boolean);
+    if (parts.length < 2) continue;
+    const action = parts[0].toLowerCase();
+    if (!actions.has(action)) continue;
+    rules.push({
+      action: action as PermissionRule["action"],
+      tool: parts[1],
+      pattern: parts.slice(2).join(" ") || "*",
+    });
+  }
+  return rules;
+}
+
 /** Tab cấu hình harness: quyền, giới hạn agent, compaction, memory và hook. */
 export function HarnessPanel({ notify, onChanged }: Props) {
   const [info, setInfo] = useState<HarnessInfo | null>(null);
@@ -71,6 +93,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
     timeout_secs: 5,
   });
   const [toolsText, setToolsText] = useState("");
+  const [rulesText, setRulesText] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -79,6 +102,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       setInfo(next);
       setDraft(next.config);
       setToolsText(next.config.disabled_tools.join(", "));
+      setRulesText(formatRules(next.config.permission_rules));
     } catch (error) {
       notify("error", "Không tải được cấu hình harness", api.errorMessage(error));
     } finally {
@@ -114,6 +138,7 @@ export function HarnessPanel({ notify, onChanged }: Props) {
       setInfo(next);
       setDraft(next.config);
       setToolsText(next.config.disabled_tools.join(", "));
+      setRulesText(formatRules(next.config.permission_rules));
       notify("success", "Đã lưu cài đặt agent", "Cấu hình áp dụng từ lượt chat tiếp theo.");
       await onChanged();
     } catch (error) {
@@ -223,6 +248,26 @@ export function HarnessPanel({ notify, onChanged }: Props) {
                 </label>
               ))}
             </div>
+            <label className="field field-wide">
+              <span>Permission rules</span>
+              <textarea
+                className="system-prompt rules-input"
+                value={rulesText}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setRulesText(value);
+                  patch({ permission_rules: parseRules(value) });
+                }}
+                placeholder={"allow write_file src/**\nask run_command git push*\ndeny write_file secrets/**"}
+                rows={4}
+                spellCheck={false}
+              />
+            </label>
+            <p className="field-note">
+              Mỗi dòng: <code>allow|ask|deny tool pattern</code>. Pattern là glob cho path hoặc
+              command; <code>*</code> khớp mọi đối tượng. Deny-list lệnh phá hủy vẫn luôn thắng
+              rule.
+            </p>
           </div>
 
           <div className="harness-block">

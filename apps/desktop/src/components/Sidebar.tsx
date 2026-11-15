@@ -5,6 +5,7 @@ import {
   IconChevronRight,
   IconCode,
   IconFolder,
+  IconPlan,
   IconPlus,
   IconSearch,
   IconSliders,
@@ -40,7 +41,7 @@ export function Sidebar({
   onCommand,
   onOpenWorkspace,
 }: Props) {
-  const modes: AppMode[] = ["chat", "code"];
+  const modes: AppMode[] = ["chat", "plan", "code"];
 
   return (
     <aside className="sidebar">
@@ -75,7 +76,13 @@ export function Sidebar({
             className={`mode-option ${mode === item ? "is-active" : ""}`}
             onClick={() => onMode(item)}
           >
-            {item === "chat" ? <IconChat size={15} /> : <IconCode size={15} />}
+            {item === "chat" ? (
+              <IconChat size={15} />
+            ) : item === "plan" ? (
+              <IconPlan size={15} />
+            ) : (
+              <IconCode size={15} />
+            )}
             <span>{MODE_LABELS[item]}</span>
           </button>
         ))}
@@ -90,7 +97,9 @@ export function Sidebar({
             <small>
               {mode === "code"
                 ? "Agent đọc/ghi file trong thư mục này"
-                : "Dùng cho chỉ dẫn dự án và ngữ cảnh"}
+                : mode === "plan"
+                  ? "Chỉ đọc để khảo sát và lập kế hoạch"
+                  : "Dùng cho chỉ dẫn dự án và ngữ cảnh"}
             </small>
           </span>
           <IconChevronRight size={14} />
@@ -117,10 +126,15 @@ export function Sidebar({
                 >
                   <span className="session-head">
                     <span className={`session-mode mode-${session.mode}`}>
-                      {session.mode === "code" ? "CODE" : "CHAT"}
+                      {session.mode === "code" ? "CODE" : session.mode === "plan" ? "PLAN" : "CHAT"}
                     </span>
                     <span className="session-title">
-                      {session.summary?.trim() || (session.mode === "code" ? "Phiên code" : "Hội thoại")}
+                      {session.summary?.trim() ||
+                        (session.mode === "code"
+                          ? "Phiên code"
+                          : session.mode === "plan"
+                            ? "Phiên plan"
+                            : "Hội thoại")}
                     </span>
                   </span>
                   <span className="session-meta">

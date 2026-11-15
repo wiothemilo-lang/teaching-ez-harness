@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tez_llm::Message;
 
-use crate::modes::{code_system_prompt, Mode};
+use crate::modes::{code_system_prompt, plan_system_prompt, Mode};
 use crate::todo::TodoItem;
 
 /// Prompt system cho chế độ Chat: agent tổng quát, không gắn môn học hay lớp.
@@ -63,6 +63,10 @@ impl ContextBuilder {
             Mode::Code => {
                 let workspace = input.workspace.unwrap_or(".");
                 code_system_prompt(Path::new(workspace))
+            }
+            Mode::Plan => {
+                let workspace = input.workspace.unwrap_or(".");
+                plan_system_prompt(Path::new(workspace))
             }
             Mode::Chat => CHAT_SYSTEM_PROMPT.to_string(),
         };
@@ -205,5 +209,25 @@ mod tests {
         let system = messages[0].content.as_deref().unwrap();
         assert!(system.contains("/tmp/demo-project"));
         assert!(system.contains("trợ lý lập trình"));
+    }
+
+    #[test]
+    fn plan_mode_is_read_only() {
+        let messages = ContextBuilder.build(ContextInput {
+            recent: &[Message::user("Lên kế hoạch refactor")],
+            excerpts: &[],
+            skills: &[],
+            memory: &[],
+            todos: &[],
+            mode: Mode::Plan,
+            workspace: Some("/tmp/demo-project"),
+            instructions: "",
+            project: "",
+            language: "vi",
+        });
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(system.contains("/tmp/demo-project"));
+        assert!(system.contains("Chế độ Plan chỉ đọc"));
+        assert!(!system.contains("trợ lý lập trình"));
     }
 }

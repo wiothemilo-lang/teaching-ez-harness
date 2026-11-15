@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::CompactSettings;
 use crate::hooks::HookConfig;
-use crate::permission::PermissionMode;
+use crate::permission::{PermissionMode, PermissionRule};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySettings {
@@ -42,6 +42,8 @@ impl Default for MemorySettings {
 pub struct HarnessConfig {
     #[serde(default)]
     pub permission_mode: PermissionMode,
+    #[serde(default)]
+    pub permission_rules: Vec<PermissionRule>,
     #[serde(default = "default_max_steps")]
     pub max_steps: usize,
     #[serde(default = "default_max_tokens")]
@@ -94,6 +96,7 @@ impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             permission_mode: PermissionMode::Standard,
+            permission_rules: Vec::new(),
             max_steps: default_max_steps(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
@@ -128,6 +131,14 @@ impl HarnessConfig {
         }
         config.disabled_tools.sort();
         config.disabled_tools.dedup();
+        config
+            .permission_rules
+            .retain(|rule| !rule.tool.trim().is_empty());
+        for rule in &mut config.permission_rules {
+            rule.tool = rule.tool.trim().to_string();
+            rule.pattern = rule.pattern.trim().to_string();
+        }
+        config.permission_rules.truncate(200);
         config.compaction = CompactSettings {
             enabled: config.compaction.enabled,
             ..config.compaction.clone()

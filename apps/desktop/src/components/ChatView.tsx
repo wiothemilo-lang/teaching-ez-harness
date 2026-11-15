@@ -7,7 +7,7 @@ import type {
   TodoItem,
   ToolTrace,
 } from "../types";
-import { CHAT_SUGGESTIONS, placeholderFor } from "../lib";
+import { CHAT_SUGGESTIONS, PLAN_SUGGESTIONS, placeholderFor } from "../lib";
 import {
   IconArrowRight,
   IconArrowUp,
@@ -24,6 +24,7 @@ import { HarnessDock } from "./HarnessDock";
 
 type Props = {
   connection: ConnectionInfo | null;
+  planMode: boolean;
   messages: ChatMessage[];
   input: string;
   busy: boolean;
@@ -45,6 +46,7 @@ type Props = {
 
 export function ChatView({
   connection,
+  planMode,
   messages,
   input,
   busy,
@@ -64,8 +66,8 @@ export function ChatView({
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const suggestions = CHAT_SUGGESTIONS;
-  const placeholder = placeholderFor("general", "chat");
+  const suggestions = planMode ? PLAN_SUGGESTIONS : CHAT_SUGGESTIONS;
+  const placeholder = placeholderFor("general", planMode ? "plan" : "chat");
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -90,8 +92,8 @@ export function ChatView({
     <main className="chat">
       <header className="chat-header">
         <div className="chat-heading">
-          <div className="chat-eyebrow">LOCAL AGENT</div>
-          <h1 className="chat-title">Chat</h1>
+          <div className="chat-eyebrow">{planMode ? "READ-ONLY PLANNER" : "LOCAL AGENT"}</div>
+          <h1 className="chat-title">{planMode ? "Plan" : "Chat"}</h1>
         </div>
         <div className="chat-header-actions">
           <button className="provider-chip" onClick={onOpenSettings} title="Quản lý nhà cung cấp">
@@ -137,12 +139,22 @@ export function ChatView({
               <div className="welcome-mark tone-general" aria-hidden="true">
                 <IconSparkle size={22} />
               </div>
-              <div className="welcome-eyebrow">TEZ AGENT</div>
-              <h2 className="welcome-title">Bắt đầu từ bất cứ điều gì.</h2>
+              <div className="welcome-eyebrow">{planMode ? "TEZ PLAN" : "TEZ AGENT"}</div>
+              <h2 className="welcome-title">
+                {planMode ? "Khảo sát trước, sửa sau." : "Bắt đầu từ bất cứ điều gì."}
+              </h2>
               <p className="welcome-copy">
-                Hỏi, viết, lập kế hoạch hoặc chuyển sang Code để đọc và sửa file. Mọi dữ liệu ở lại
-                trên máy bạn.
+                {planMode
+                  ? "Agent chỉ đọc workspace, đặt câu hỏi và trình kế hoạch. Khi duyệt xong, chuyển sang Code để thực thi."
+                  : "Hỏi, viết, lập kế hoạch hoặc chuyển sang Code để đọc và sửa file. Mọi dữ liệu ở lại trên máy bạn."}
               </p>
+
+              {planMode && (
+                <div className="plan-note">
+                  Chế độ Plan không ghi file và không chạy lệnh. Tool bị giới hạn còn đọc, tìm kiếm và
+                  todo. Chuyển sang Code sẽ giữ nguyên hội thoại và kế hoạch.
+                </div>
+              )}
 
               {!connection && (
                 <div className="connect-notice">

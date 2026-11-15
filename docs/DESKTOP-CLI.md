@@ -179,8 +179,9 @@ tez doctor
 
 - `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
   tương tác; có pipe thì đọc một lần từ stdin.
-- `--mode code` dùng workspace tools; `--workspace` mặc định là thư mục hiện
-  tại. `--session` khôi phục mode/môn học đã lưu.
+- `--mode code` dùng workspace tools; `--mode plan` chỉ đọc workspace và trình
+  kế hoạch; `--workspace` mặc định là thư mục hiện tại. `--session` khôi phục
+  mode/môn học đã lưu.
 - `--yes` tự duyệt mọi thao tác cần permission; `--permission` ghi đè
   `harness.json`; `--max-steps` và `--no-memory` ghi đè cho riêng lượt chạy.
 - `tez memory list|search|forget` và `tez harness` xem bộ nhớ dài hạn và cấu
