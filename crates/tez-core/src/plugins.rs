@@ -7,7 +7,7 @@
 //! Cách này giữ bề mặt tin cậy nhỏ: muốn thêm tool thì dùng MCP, muốn thêm
 //! hướng dẫn sư phạm thì dùng skill.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -73,7 +73,29 @@ pub fn plugins_dir(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join("plugins")
 }
 
+const MAX_PLUGIN_ID_CHARS: usize = 64;
+
+/// Plugin không được mạo danh các nguồn có quyền cao hơn trong registry.
+fn reserved_plugin_id(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().as_str(),
+        "user" | "project" | "builtin" | "system"
+    )
+}
+
+fn valid_plugin_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= MAX_PLUGIN_ID_CHARS
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        && !reserved_plugin_id(id)
+}
+
 /// Nạp mọi plugin hợp lệ trong `plugins/*/plugin.json`.
+///
+/// Một manifest hỏng chỉ bị bỏ qua; các plugin còn lại vẫn được nạp. Id trùng
+/// nhau bị coi là xung đột và plugin đến sau bị bỏ để hành vi ổn định.
 pub fn load_all(dir: impl AsRef<Path>) -> Result<Vec<Plugin>, PluginError> {
     let root = plugins_dir(dir);
     if !root.is_dir() {
@@ -87,6 +109,7 @@ pub fn load_all(dir: impl AsRef<Path>) -> Result<Vec<Plugin>, PluginError> {
     entries.sort();
 
     let mut plugins = Vec::new();
+    let mut seen_ids = HashSet::new();
     for entry in entries {
         if !entry.is_dir() {
             continue;
@@ -97,12 +120,41 @@ pub fn load_all(dir: impl AsRef<Path>) -> Result<Vec<Plugin>, PluginError> {
         }
         let bytes = match std::fs::read(&manifest_path) {
             Ok(bytes) => bytes,
-            Err(_) => continue,
+            Err(error) => {
+                eprintln!(
+                    "[plugins] bỏ qua '{}': không đọc được manifest ({error})",
+                    manifest_path.display()
+                );
+                continue;
+            }
         };
-        let manifest: PluginManifest = match serde_json::from_slice(&bytes) {
+        let mut manifest: PluginManifest = match serde_json::from_slice(&bytes) {
             Ok(manifest) => manifest,
-            Err(_) => continue,
+            Err(error) => {
+                eprintln!(
+                    "[plugins] bỏ qua '{}': manifest không hợp lệ ({error})",
+                    manifest_path.display()
+                );
+                continue;
+            }
         };
+        manifest.id = manifest.id.trim().to_string();
+        if !valid_plugin_id(&manifest.id) {
+            eprintln!(
+                "[plugins] bỏ qua '{}': id '{}' không hợp lệ hoặc bị đặt trùng tên nguồn hệ thống",
+                manifest_path.display(),
+                manifest.id
+            );
+            continue;
+        }
+        if !seen_ids.insert(manifest.id.to_ascii_lowercase()) {
+            eprintln!(
+                "[plugins] bỏ qua '{}': id '{}' bị trùng với plugin đã nạp",
+                manifest_path.display(),
+                manifest.id
+            );
+            continue;
+        }
         plugins.push(Plugin {
             manifest,
             dir: entry,
@@ -148,6 +200,63 @@ mod tests {
         let broken = dir.path().join("plugins").join("broken");
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::write(broken.join("plugin.json"), "{ not json").unwrap();
+
+        let plugins = load_all(dir.path()).unwrap();
+        assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn malformed_manifest_does_not_drop_valid_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins");
+        let broken = root.join("a-broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("plugin.json"), "{ not json").unwrap();
+        let valid = root.join("b-valid");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(
+            valid.join("plugin.json"),
+            r#"{"id":"valid","name":"Valid"}"#,
+        )
+        .unwrap();
+
+        let plugins = load_all(dir.path()).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.id, "valid");
+    }
+
+    #[test]
+    fn duplicate_plugin_ids_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins");
+        for (folder, name) in [("a-first", "First"), ("b-second", "Second")] {
+            let plugin = root.join(folder);
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(
+                plugin.join("plugin.json"),
+                format!(r#"{{"id":"demo","name":"{name}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let plugins = load_all(dir.path()).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.name, "First");
+    }
+
+    #[test]
+    fn rejects_plugin_ids_that_spoof_system_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins");
+        for id in ["user", "project", "builtin", "Project", "bad id"] {
+            let plugin = root.join(id.replace(' ', "-"));
+            std::fs::create_dir_all(&plugin).unwrap();
+            std::fs::write(
+                plugin.join("plugin.json"),
+                format!(r#"{{"id":"{id}","name":"Spoof"}}"#),
+            )
+            .unwrap();
+        }
 
         let plugins = load_all(dir.path()).unwrap();
         assert!(plugins.is_empty());

@@ -59,7 +59,8 @@ pub struct McpServerConfig {
     pub cwd: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Ép mọi tool của server này được coi là chỉ đọc (dùng cho Plan).
+    /// Chỉ có hiệu lực khi server đến từ cấu hình của user. Server tự khai báo
+    /// `readOnlyHint` trong `tools/list` không được tin.
     #[serde(default, alias = "readOnly")]
     pub read_only: bool,
     /// Endpoint Streamable HTTP. Có `url` thì bỏ qua `command`/`args`.
@@ -74,10 +75,17 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpConfig {
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
+    /// Bật rõ ràng cho `.tez/mcp.json` do repo kiểm soát. Mặc định tắt.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trusted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +100,8 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    pub read_only: bool,
+    /// Hint do server khai báo. Chỉ dùng để hiển thị; không dùng cho permission.
+    pub read_only_hint: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +116,8 @@ pub struct McpServerStatus {
 pub struct McpDiscovery {
     pub tools: Vec<McpTool>,
     pub servers: Vec<McpServerStatus>,
+    /// Tên tool MCP được user cấu hình `read_only`; dùng để miễn hỏi duyệt.
+    pub read_only_tools: Vec<String>,
 }
 
 pub fn config_path(dir: impl AsRef<Path>) -> PathBuf {
@@ -134,6 +145,59 @@ pub fn load_project_config(root: impl AsRef<Path>) -> Result<McpConfig, McpError
     }
     let bytes = std::fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Nạp cấu hình dự án nhưng không bao giờ làm hỏng phiên chat.
+///
+/// `.tez/mcp.json` do repo kiểm soát nên có thể hỏng, quá lớn hoặc bị sửa bởi
+/// người khác. Khi đó chỉ cảnh báo và bỏ qua file, không trả lỗi cho caller.
+fn load_project_config_lenient(root: impl AsRef<Path>) -> McpConfig {
+    let path = project_config_path(root);
+    if !path.exists() {
+        return McpConfig::default();
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "[mcp] bỏ qua '{}': không đọc được file ({error})",
+                path.display()
+            );
+            return McpConfig::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "[mcp] bỏ qua '{}': JSON không hợp lệ ({error})",
+                path.display()
+            );
+            McpConfig::default()
+        }
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Repo chỉ được tự chạy MCP server khi người dùng bật rõ ràng.
+pub fn project_mcp_trusted(config: &McpConfig) -> bool {
+    config.trusted || env_truthy("TEZ_TRUST_PROJECT_MCP")
+}
+
+/// `read_only` chỉ đáng tin khi đến từ cấu hình user, không phải từ server
+/// tự khai báo hay từ repo/plugin.
+fn trusted_read_only(source: &str, config: &McpServerConfig) -> bool {
+    source == "user" && config.read_only
 }
 
 pub fn save_config(dir: impl AsRef<Path>, config: &McpConfig) -> Result<(), McpError> {
@@ -168,20 +232,28 @@ pub fn load_servers_with_project(
         .collect();
 
     if let Some(root) = project_root {
-        let project = load_project_config(root)?;
-        for (name, mut config) in project.servers {
-            if config.cwd.is_none() {
-                config.cwd = Some(root.to_string_lossy().to_string());
-            }
-            let entry = ServerEntry {
-                name: name.clone(),
-                config,
-                source: "project".to_string(),
-            };
-            if let Some(existing) = entries.iter_mut().find(|item| item.name == name) {
-                *existing = entry;
-            } else {
-                entries.push(entry);
+        let project = load_project_config_lenient(root);
+        if !project.servers.is_empty() && !project_mcp_trusted(&project) {
+            eprintln!(
+                "[mcp] bỏ qua MCP server của dự án '{}': chưa được tin cậy. \
+                 Thêm \"trusted\": true vào .tez/mcp.json hoặc đặt TEZ_TRUST_PROJECT_MCP=1.",
+                root.display()
+            );
+        } else {
+            for (name, mut config) in project.servers {
+                if config.cwd.is_none() {
+                    config.cwd = Some(root.to_string_lossy().to_string());
+                }
+                let entry = ServerEntry {
+                    name: name.clone(),
+                    config,
+                    source: "project".to_string(),
+                };
+                if let Some(existing) = entries.iter_mut().find(|item| item.name == name) {
+                    *existing = entry;
+                } else {
+                    entries.push(entry);
+                }
             }
         }
     }
@@ -220,6 +292,7 @@ pub async fn discover_with_project(
     let entries = load_servers_with_project(dir, project_root)?;
     let mut tools = Vec::new();
     let mut servers = Vec::new();
+    let mut read_only_tools = Vec::new();
 
     for entry in entries {
         if !entry.config.enabled {
@@ -233,14 +306,17 @@ pub async fn discover_with_project(
             continue;
         }
 
+        let read_only = trusted_read_only(&entry.source, &entry.config);
         match McpClient::connect(&entry.name, &entry.config).await {
             Ok((client, infos)) => {
                 let tool_names = infos.iter().map(|info| info.name.clone()).collect();
-                for mut info in infos {
-                    if entry.config.read_only {
-                        info.read_only = true;
+                for info in infos {
+                    let tool =
+                        McpTool::new(entry.name.clone(), info, read_only, Arc::clone(&client));
+                    if read_only {
+                        read_only_tools.push(tool.spec().name);
                     }
-                    tools.push(McpTool::new(entry.name.clone(), info, Arc::clone(&client)));
+                    tools.push(tool);
                 }
                 servers.push(McpServerStatus {
                     name: entry.name,
@@ -260,7 +336,11 @@ pub async fn discover_with_project(
         }
     }
 
-    Ok(McpDiscovery { tools, servers })
+    Ok(McpDiscovery {
+        tools,
+        servers,
+        read_only_tools,
+    })
 }
 
 pub struct McpTool {
@@ -274,7 +354,7 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    fn new(server: String, info: McpToolInfo, client: Arc<McpClient>) -> Self {
+    fn new(server: String, info: McpToolInfo, read_only: bool, client: Arc<McpClient>) -> Self {
         let tool_name = sanitize_tool_name(&server, &info.name);
         let description = format!("[MCP: {}] {}", server, info.description.trim());
         Self {
@@ -283,7 +363,7 @@ impl McpTool {
             tool_name,
             description,
             parameters: info.input_schema,
-            read_only: info.read_only,
+            read_only,
             client,
         }
     }
@@ -296,6 +376,7 @@ impl McpTool {
         &self.raw_name
     }
 
+    /// Chỉ `true` khi user cấu hình `read_only`; hint của server bị bỏ qua.
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
@@ -749,18 +830,17 @@ fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                    let read_only = item
+                    let read_only_hint = item
                         .get("annotations")
                         .and_then(|value| value.get("readOnlyHint"))
                         .and_then(Value::as_bool)
-                        .or_else(|| item.get("readOnly").and_then(Value::as_bool))
-                        .or_else(|| item.get("read_only").and_then(Value::as_bool))
+                        .or_else(|| item.get("readOnlyHint").and_then(Value::as_bool))
                         .unwrap_or(false);
                     Some(McpToolInfo {
                         name,
                         description,
                         input_schema,
-                        read_only,
+                        read_only_hint,
                     })
                 })
                 .collect()
@@ -885,10 +965,10 @@ mod tests {
             ]
         }));
         assert_eq!(tools.len(), 4);
-        assert!(tools[0].read_only);
-        assert!(!tools[1].read_only);
-        assert!(tools[2].read_only);
-        assert!(!tools[3].read_only);
+        assert!(tools[0].read_only_hint);
+        assert!(!tools[1].read_only_hint);
+        assert!(!tools[2].read_only_hint);
+        assert!(!tools[3].read_only_hint);
     }
 
     #[test]
@@ -941,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn project_servers_override_user_servers() {
+    fn project_servers_require_explicit_trust() {
         let data = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
 
@@ -965,6 +1045,41 @@ mod tests {
         std::fs::write(
             project.path().join(".tez").join("mcp.json"),
             r#"{"servers":{"demo":{"command":"project"},"extra":{"command":"extra"}}}"#,
+        )
+        .unwrap();
+
+        let entries = load_servers_with_project(data.path(), Some(project.path())).unwrap();
+        let demo = entries.iter().find(|entry| entry.name == "demo").unwrap();
+        assert_eq!(demo.config.command, "global");
+        assert_eq!(demo.source, "user");
+        assert!(entries.iter().all(|entry| entry.name != "extra"));
+    }
+
+    #[test]
+    fn project_servers_override_user_servers_when_trusted() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut config = McpConfig::default();
+        config.servers.insert(
+            "demo".into(),
+            McpServerConfig {
+                command: "global".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                enabled: true,
+                read_only: false,
+                url: None,
+                headers: HashMap::new(),
+            },
+        );
+        save_config(data.path(), &config).unwrap();
+
+        std::fs::create_dir_all(project.path().join(".tez")).unwrap();
+        std::fs::write(
+            project.path().join(".tez").join("mcp.json"),
+            r#"{"trusted":true,"servers":{"demo":{"command":"project"},"extra":{"command":"extra"}}}"#,
         )
         .unwrap();
 
@@ -1139,5 +1254,43 @@ mod tests {
         assert_eq!(output.content, "pong");
         assert!(!output.is_error);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn malformed_project_config_is_ignored_not_fatal() {
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".tez")).unwrap();
+        std::fs::write(project.path().join(".tez").join("mcp.json"), "{ not json").unwrap();
+
+        let entries = load_servers_with_project(data.path(), Some(project.path())).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn server_read_only_hint_is_parsed_but_not_trusted() {
+        let infos = parse_tools(&json!({
+            "tools": [{
+                "name": "write",
+                "description": "ghi",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": true}
+            }]
+        }));
+        assert!(infos[0].read_only_hint);
+
+        let user_read_only = McpServerConfig {
+            command: "demo".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            read_only: true,
+            url: None,
+            headers: HashMap::new(),
+        };
+        assert!(trusted_read_only("user", &user_read_only));
+        assert!(!trusted_read_only("project", &user_read_only));
+        assert!(!trusted_read_only("demo", &user_read_only));
     }
 }

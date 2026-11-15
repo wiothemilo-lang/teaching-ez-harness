@@ -3,6 +3,7 @@ use std::path::Path;
 use tez_llm::Message;
 
 use crate::modes::{code_system_prompt, plan_system_prompt, Mode};
+use crate::subjects::SubjectPack;
 use crate::todo::TodoItem;
 
 /// Prompt system cho chế độ Chat: agent tổng quát, không gắn môn học hay lớp.
@@ -34,6 +35,9 @@ pub struct ContextInput<'a> {
     pub project: &'a str,
     /// Ngôn ngữ trả lời: `vi` hoặc `en`.
     pub language: &'a str,
+    /// Pack môn học đang dùng; `tutor_prompt` và `strategy` được chèn vào
+    /// system prompt thay vì chỉ hiển thị ở lệnh `subjects show`.
+    pub subject: Option<&'a SubjectPack>,
 }
 
 impl<'a> ContextInput<'a> {
@@ -50,6 +54,7 @@ impl<'a> ContextInput<'a> {
             instructions: "",
             project: "",
             language: "vi",
+            subject: None,
         }
     }
 }
@@ -72,6 +77,15 @@ impl ContextBuilder {
             }
             Mode::Chat => CHAT_SYSTEM_PROMPT.to_string(),
         };
+
+        if let Some(subject) = input.subject {
+            let prompt = subject.system_prompt();
+            if !prompt.trim().is_empty() {
+                system.push_str("\nBối cảnh môn học:\n");
+                system.push_str(prompt.trim());
+                system.push('\n');
+            }
+        }
 
         if input.language == "en" {
             system.push_str("\nRespond in English unless the user writes in another language.\n");
@@ -165,6 +179,7 @@ mod tests {
             project:
                 "<project-instructions path=\"AGENTS.md\">Chạy test trước.</project-instructions>",
             language: "vi",
+            subject: None,
         });
 
         assert_eq!(messages.len(), 2);
@@ -185,6 +200,21 @@ mod tests {
         let system = messages[0].content.as_deref().unwrap();
         assert!(!system.contains("gia sư môn"));
         assert!(system.contains("local-first"));
+    }
+
+    #[test]
+    fn injects_subject_tutor_prompt_and_strategy() {
+        let recent = [Message::user("Giải bài này")];
+        let mut input = ContextInput::chat(&recent);
+        input.subject = Some(&crate::subjects::MATH);
+        let messages = ContextBuilder.build(input);
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(system.contains("Bạn là gia sư môn Toán"), "{system}");
+        assert!(system.contains("Chiến lược dạy: socratic"), "{system}");
+        assert!(
+            system.contains("Hướng dẫn từng bước, hỏi học sinh trước khi chốt đáp án."),
+            "{system}"
+        );
     }
 
     #[test]
@@ -209,6 +239,7 @@ mod tests {
             instructions: "",
             project: "",
             language: "vi",
+            subject: None,
         });
         let system = messages[0].content.as_deref().unwrap();
         assert!(system.contains("/tmp/demo-project"));
@@ -228,6 +259,7 @@ mod tests {
             instructions: "",
             project: "",
             language: "vi",
+            subject: None,
         });
         let system = messages[0].content.as_deref().unwrap();
         assert!(system.contains("/tmp/demo-project"));

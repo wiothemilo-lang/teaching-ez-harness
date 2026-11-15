@@ -1137,6 +1137,7 @@ impl TurnContext<'_> {
             instructions: self.system_prompt,
             project: &project_context,
             language: self.language,
+            subject: Some(self.pack),
         });
 
         let artifact_dir = session_artifact_dir(self.dir, self.session_id);
