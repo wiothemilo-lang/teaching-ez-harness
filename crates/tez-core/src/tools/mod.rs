@@ -208,6 +208,14 @@ impl ToolRegistry {
 
 /// Registry cho chế độ Code, giới hạn trong `root`.
 pub fn code_registry(root: impl AsRef<Path>) -> Result<ToolRegistry, ToolError> {
+    code_registry_with_sandbox(root, None)
+}
+
+/// Registry cho chế độ Code, có thể chạy `run_command` trong sandbox OS.
+pub fn code_registry_with_sandbox(
+    root: impl AsRef<Path>,
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
+) -> Result<ToolRegistry, ToolError> {
     let workspace = workspace::Workspace::new(root)?;
     let mut registry = ToolRegistry::new();
     registry.register(workspace::ReadFile::new(workspace.clone()));
@@ -216,7 +224,10 @@ pub fn code_registry(root: impl AsRef<Path>) -> Result<ToolRegistry, ToolError> 
     registry.register(workspace::ListFiles::new(workspace.clone()));
     registry.register(workspace::GlobFiles::new(workspace.clone()));
     registry.register(workspace::GrepFiles::new(workspace.clone()));
-    registry.register(workspace::RunCommand::new(workspace));
+    registry.register(match sandbox {
+        Some(policy) => workspace::RunCommand::with_sandbox(workspace, policy),
+        None => workspace::RunCommand::new(workspace),
+    });
     registry.register(compact::Compact);
     Ok(registry)
 }

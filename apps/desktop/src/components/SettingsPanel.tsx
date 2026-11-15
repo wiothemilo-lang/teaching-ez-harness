@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import * as api from "../api";
 import type {
   AppStatus,
+  BackupInfo,
   ExtensionKind,
   ExtensionsInfo,
   McpServerInfo,
@@ -35,6 +36,7 @@ import {
 import { Callout, EmptyNote, Spinner, Tag } from "./ui";
 import { CreateWithAI } from "./CreateWithAI";
 import { HarnessPanel } from "./HarnessPanel";
+import { McpExtrasDialog } from "./McpExtrasDialog";
 import { UpdatePanel } from "./UpdatePanel";
 
 type Props = {
@@ -80,6 +82,16 @@ type McpDraft = {
   url: string;
   headersText: string;
   bearerTokenEnv: string;
+  oauthAuthorizationUrl: string;
+  oauthTokenUrl: string;
+  oauthClientId: string;
+  oauthClientSecretEnv: string;
+  oauthScopesText: string;
+  oauthRedirectUri: string;
+  oauthResource: string;
+  sandboxEnabled: boolean;
+  sandboxAllowNetwork: boolean;
+  sandboxWritableText: string;
 };
 
 const PRESETS: Preset[] = [
@@ -180,19 +192,26 @@ export function SettingsPanel({
   const [mcpSaving, setMcpSaving] = useState(false);
   const [mcpTests, setMcpTests] = useState<Record<string, McpTest | "loading">>({});
   const [confirmMcpDelete, setConfirmMcpDelete] = useState<string | null>(null);
+  const [oauthBusy, setOauthBusy] = useState<string | null>(null);
+  const [extrasServer, setExtrasServer] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [createKind, setCreateKind] = useState<ExtensionKind | null>(null);
+  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [restorePath, setRestorePath] = useState("");
   const panelRef = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextProviders, nextExtensions] = await Promise.all([
+      const [nextProviders, nextExtensions, nextBackups] = await Promise.all([
         api.listProviders(),
         api.listExtensions(),
+        api.listBackups(),
       ]);
       setProviders(nextProviders);
       setExtensions(nextExtensions);
+      setBackups(nextBackups);
     } catch (error) {
       notify("error", "Không tải được cài đặt", api.errorMessage(error));
     } finally {
@@ -371,6 +390,16 @@ export function SettingsPanel({
       url: "",
       headersText: "",
       bearerTokenEnv: "",
+      oauthAuthorizationUrl: "",
+      oauthTokenUrl: "",
+      oauthClientId: "",
+      oauthClientSecretEnv: "",
+      oauthScopesText: "",
+      oauthRedirectUri: "",
+      oauthResource: "",
+      sandboxEnabled: false,
+      sandboxAllowNetwork: false,
+      sandboxWritableText: "",
     });
   };
 
@@ -392,6 +421,16 @@ export function SettingsPanel({
         .map(([key, value]) => `${key}=${value}`)
         .join("\n"),
       bearerTokenEnv: server.bearer_token_env ?? "",
+      oauthAuthorizationUrl: server.oauth?.authorization_url ?? "",
+      oauthTokenUrl: server.oauth?.token_url ?? "",
+      oauthClientId: server.oauth?.client_id ?? "",
+      oauthClientSecretEnv: server.oauth?.client_secret_env ?? "",
+      oauthScopesText: server.oauth?.scopes.join(" ") ?? "",
+      oauthRedirectUri: server.oauth?.redirect_uri ?? "",
+      oauthResource: server.oauth?.resource ?? "",
+      sandboxEnabled: server.sandbox?.enabled ?? false,
+      sandboxAllowNetwork: server.sandbox?.allow_network ?? false,
+      sandboxWritableText: (server.sandbox?.writable_paths ?? []).join("\n"),
     });
   };
 
@@ -419,6 +458,25 @@ export function SettingsPanel({
       return;
     }
 
+    const oauth =
+      mcpDraft.oauthAuthorizationUrl.trim() ||
+      mcpDraft.oauthTokenUrl.trim() ||
+      mcpDraft.oauthClientId.trim()
+        ? {
+            authorization_url: mcpDraft.oauthAuthorizationUrl.trim(),
+            token_url: mcpDraft.oauthTokenUrl.trim(),
+            client_id: mcpDraft.oauthClientId.trim(),
+            client_secret_env: mcpDraft.oauthClientSecretEnv.trim() || null,
+            client_secret: null,
+            scopes: mcpDraft.oauthScopesText
+              .split(/[\s,]+/)
+              .map((value) => value.trim())
+              .filter(Boolean),
+            redirect_uri: mcpDraft.oauthRedirectUri.trim() || null,
+            resource: mcpDraft.oauthResource.trim() || null,
+          }
+        : null;
+
     setMcpSaving(true);
     try {
       await api.saveMcpServer({
@@ -432,6 +490,15 @@ export function SettingsPanel({
         url: url || null,
         headers,
         bearer_token_env: mcpDraft.bearerTokenEnv.trim() || null,
+        oauth,
+        sandbox: {
+          enabled: mcpDraft.sandboxEnabled,
+          allow_network: mcpDraft.sandboxAllowNetwork,
+          writable_paths: mcpDraft.sandboxWritableText
+            .split("\n")
+            .map((value) => value.trim())
+            .filter(Boolean),
+        },
       });
       setMcpDraft(null);
       await reload();
@@ -475,6 +542,34 @@ export function SettingsPanel({
     }
   };
 
+  const connectOAuth = async (name: string) => {
+    setOauthBusy(name);
+    try {
+      await api.startMcpOAuth(name);
+      await reload();
+      await onChanged();
+      notify("success", "Đã kết nối OAuth", name);
+    } catch (error) {
+      notify("error", "Không kết nối được OAuth", api.errorMessage(error));
+    } finally {
+      setOauthBusy(null);
+    }
+  };
+
+  const disconnectOAuth = async (name: string) => {
+    setOauthBusy(name);
+    try {
+      await api.disconnectMcpOAuth(name);
+      await reload();
+      await onChanged();
+      notify("success", "Đã ngắt OAuth", name);
+    } catch (error) {
+      notify("error", "Không ngắt được OAuth", api.errorMessage(error));
+    } finally {
+      setOauthBusy(null);
+    }
+  };
+
   const installSample = async () => {
     setInstalling(true);
     try {
@@ -494,6 +589,54 @@ export function SettingsPanel({
       await api.openExtensionPath(kind);
     } catch (error) {
       notify("error", "Không mở được thư mục", api.errorMessage(error));
+    }
+  };
+
+  const makeBackup = async () => {
+    setBackupBusy(true);
+    try {
+      const result = await api.createBackup(null);
+      setBackups(await api.listBackups());
+      notify(
+        "success",
+        "Đã sao lưu dữ liệu",
+        `${result.files} file · ${result.path}`,
+      );
+    } catch (error) {
+      notify("error", "Không sao lưu được", api.errorMessage(error));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const restoreFromBackup = async () => {
+    const path = restorePath.trim();
+    if (!path) {
+      notify("info", "Chưa nhập đường dẫn", "Dán đường dẫn thư mục bản sao lưu có manifest.json.");
+      return;
+    }
+    if (
+      !window.confirm(
+        "Phục hồi dữ liệu từ bản sao lưu này? Dữ liệu hiện tại sẽ được sao lưu an toàn trước.",
+      )
+    ) {
+      return;
+    }
+    setBackupBusy(true);
+    try {
+      const result = await api.restoreBackup(path, true);
+      notify(
+        "success",
+        "Đã phục hồi dữ liệu",
+        `${result.files} file${result.safety_backup ? ` · bản an toàn: ${result.safety_backup}` : ""}`,
+      );
+      setRestorePath("");
+      await reload();
+      await onChanged();
+    } catch (error) {
+      notify("error", "Không phục hồi được", api.errorMessage(error));
+    } finally {
+      setBackupBusy(false);
     }
   };
 
@@ -880,6 +1023,14 @@ export function SettingsPanel({
                         {server.url && <Tag tone="neutral">HTTP</Tag>}
                         {!server.enabled && <Tag tone="neutral">Đang tắt</Tag>}
                         {server.read_only && <Tag tone="forest">Chỉ đọc</Tag>}
+                        {server.sandbox?.enabled && <Tag tone="forest">Sandbox</Tag>}
+                        {server.oauth && <Tag tone="clay">OAuth</Tag>}
+                        {server.oauth &&
+                          (server.authorized ? (
+                            <Tag tone="forest">Đã kết nối</Tag>
+                          ) : (
+                            <Tag tone="neutral">Cần kết nối</Tag>
+                          ))}
                       </div>
                       <code className="server-command">
                         {server.url ?? `${server.command} ${server.args.join(" ")}`}
@@ -909,6 +1060,31 @@ export function SettingsPanel({
                         disabled={result === "loading"}
                       >
                         {result === "loading" ? "Đang thử…" : "Kiểm tra"}
+                      </button>
+                      {server.oauth &&
+                        (server.authorized ? (
+                          <button
+                            className="btn btn-sm btn-ghost"
+                            onClick={() => void disconnectOAuth(server.name)}
+                            disabled={oauthBusy === server.name}
+                          >
+                            {oauthBusy === server.name ? "Đang ngắt…" : "Ngắt OAuth"}
+                          </button>
+                        ) : (
+                          <button
+                            className="btn btn-sm btn-primary"
+                            onClick={() => void connectOAuth(server.name)}
+                            disabled={oauthBusy === server.name || !server.enabled}
+                          >
+                            {oauthBusy === server.name ? "Đang chờ…" : "Kết nối OAuth"}
+                          </button>
+                        ))}
+                      <button
+                        className="btn btn-sm btn-ghost"
+                        onClick={() => setExtrasServer(server.name)}
+                        disabled={!server.enabled}
+                      >
+                        Tài nguyên
                       </button>
                       {server.source === "user" && (
                         <>
@@ -1033,6 +1209,23 @@ export function SettingsPanel({
                   />
                 </label>
                 <label className="field field-wide">
+                  <span>Sandbox: thư mục ghi thêm (mỗi dòng một đường dẫn)</span>
+                  <textarea
+                    rows={2}
+                    value={mcpDraft.sandboxWritableText}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous
+                          ? { ...previous, sandboxWritableText: event.target.value }
+                          : previous,
+                      )
+                    }
+                    placeholder="~/.npm"
+                    spellCheck={false}
+                    disabled={!mcpDraft.sandboxEnabled}
+                  />
+                </label>
+                <label className="field field-wide">
                   <span>Env (mỗi dòng KEY=VALUE)</span>
                   <textarea
                     rows={3}
@@ -1078,6 +1271,113 @@ export function SettingsPanel({
                     Đọc từ biến môi trường lúc kết nối; token không được lưu vào mcp.json.
                   </p>
                 </label>
+                <details className="oauth-fields field-wide">
+                  <summary>OAuth 2.1 + PKCE (tùy chọn)</summary>
+                  <p className="field-note">
+                    Cần đăng ký redirect URI với provider. Token lưu trong oauth.json (0600),
+                    không nằm trong mcp.json.
+                  </p>
+                  <div className="field-grid">
+                    <label className="field field-wide">
+                      <span>Authorization URL</span>
+                      <input
+                        value={mcpDraft.oauthAuthorizationUrl}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous
+                              ? { ...previous, oauthAuthorizationUrl: event.target.value }
+                              : previous,
+                          )
+                        }
+                        placeholder="https://auth.example.com/authorize"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field field-wide">
+                      <span>Token URL</span>
+                      <input
+                        value={mcpDraft.oauthTokenUrl}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous ? { ...previous, oauthTokenUrl: event.target.value } : previous,
+                          )
+                        }
+                        placeholder="https://auth.example.com/token"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Client ID</span>
+                      <input
+                        value={mcpDraft.oauthClientId}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous ? { ...previous, oauthClientId: event.target.value } : previous,
+                          )
+                        }
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Client secret env</span>
+                      <input
+                        value={mcpDraft.oauthClientSecretEnv}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous
+                              ? { ...previous, oauthClientSecretEnv: event.target.value }
+                              : previous,
+                          )
+                        }
+                        placeholder="TEZ_MCP_CLIENT_SECRET"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field field-wide">
+                      <span>Scopes</span>
+                      <input
+                        value={mcpDraft.oauthScopesText}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous
+                              ? { ...previous, oauthScopesText: event.target.value }
+                              : previous,
+                          )
+                        }
+                        placeholder="read write"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Redirect URI</span>
+                      <input
+                        value={mcpDraft.oauthRedirectUri}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous
+                              ? { ...previous, oauthRedirectUri: event.target.value }
+                              : previous,
+                          )
+                        }
+                        placeholder="http://127.0.0.1:33418/callback"
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Resource</span>
+                      <input
+                        value={mcpDraft.oauthResource}
+                        onChange={(event) =>
+                          setMcpDraft((previous) =>
+                            previous ? { ...previous, oauthResource: event.target.value } : previous,
+                          )
+                        }
+                        placeholder="https://mcp.example.com"
+                        spellCheck={false}
+                      />
+                    </label>
+                  </div>
+                </details>
               </div>
 
               <div className="form-foot">
@@ -1104,6 +1404,35 @@ export function SettingsPanel({
                     }
                   />
                   <span>Chỉ đọc (cho phép trong Plan)</span>
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={mcpDraft.sandboxEnabled}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous
+                          ? { ...previous, sandboxEnabled: event.target.checked }
+                          : previous,
+                      )
+                    }
+                  />
+                  <span>Sandbox stdio (Linux, bubblewrap)</span>
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={mcpDraft.sandboxAllowNetwork}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous
+                          ? { ...previous, sandboxAllowNetwork: event.target.checked }
+                          : previous,
+                      )
+                    }
+                    disabled={!mcpDraft.sandboxEnabled}
+                  />
+                  <span>Cho phép mạng trong sandbox</span>
                 </label>
                 <div className="form-actions">
                   <button className="btn" onClick={() => setMcpDraft(null)}>
@@ -1222,6 +1551,52 @@ export function SettingsPanel({
           </div>
         </div>
 
+        <div className="data-panel">
+          <div className="kv">
+            <span>Bản sao lưu</span>
+            <span>{backups.length} bản</span>
+          </div>
+          {backups.slice(0, 3).map((backup) => (
+            <div className="kv" key={backup.path}>
+              <code>{backup.path}</code>
+              <span>
+                {backup.files} file · {new Date(backup.created_at_unix * 1000).toLocaleString()}
+              </span>
+            </div>
+          ))}
+          {backups.length === 0 && (
+            <p className="card-copy">Chưa có bản sao lưu. Tạo bản đầu tiên trước khi thử nghiệm.</p>
+          )}
+        </div>
+
+        <div className="button-row">
+          <button className="btn" disabled={backupBusy} onClick={() => void makeBackup()}>
+            <IconDatabase size={15} />
+            {backupBusy ? "Đang xử lý…" : "Sao lưu ngay"}
+          </button>
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="restore-path">
+            Phục hồi từ thư mục bản sao lưu
+          </label>
+          <input
+            id="restore-path"
+            className="input"
+            placeholder="/path/to/tez-backup-…"
+            value={restorePath}
+            onChange={(event) => setRestorePath(event.target.value)}
+          />
+          <button
+            className="btn"
+            disabled={backupBusy}
+            onClick={() => void restoreFromBackup()}
+          >
+            <IconRefresh size={15} />
+            Phục hồi
+          </button>
+        </div>
+
         <div className="button-row">
           <button className="btn" onClick={() => void openPath("data")}>
             <IconFolder size={15} />
@@ -1319,6 +1694,13 @@ export function SettingsPanel({
           await reload();
           await onChanged();
         }}
+        notify={notify}
+      />
+
+      <McpExtrasDialog
+        open={extrasServer !== null}
+        serverName={extrasServer}
+        onClose={() => setExtrasServer(null)}
         notify={notify}
       />
     </div>

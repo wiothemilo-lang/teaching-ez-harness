@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppStatus,
+  BackupInfo,
+  BackupResult,
   ChatPayload,
   ChatReply,
   ConnectionTest,
@@ -8,6 +10,7 @@ import type {
   HarnessConfig,
   HarnessInfo,
   McpTest,
+  OAuthTokenStatus,
   PlanInfo,
   PluginInfo,
   ProviderInfo,
@@ -125,6 +128,34 @@ export function testMcpServer(name: string): Promise<McpTest> {
   return invoke("test_mcp_server", { name });
 }
 
+export function mcpOAuthStatus(name: string): Promise<OAuthTokenStatus> {
+  return invoke("mcp_oauth_status", { name });
+}
+
+export function startMcpOAuth(name: string): Promise<OAuthTokenStatus> {
+  return invoke("start_mcp_oauth", { name });
+}
+
+export function disconnectMcpOAuth(name: string): Promise<boolean> {
+  return invoke("disconnect_mcp_oauth", { name });
+}
+
+export function mcpExtras(
+  name: string,
+  action: string,
+  uri?: string,
+  promptName?: string,
+  args?: Record<string, unknown>,
+): Promise<string> {
+  return invoke("mcp_extras", {
+    name,
+    action,
+    uri: uri ?? null,
+    promptName: promptName ?? null,
+    arguments: args ?? null,
+  });
+}
+
 export function installSamplePlugin(): Promise<PluginInfo> {
   return invoke("install_sample_plugin");
 }
@@ -151,6 +182,18 @@ export function openExternal(url: string): Promise<void> {
 
 export function openWorkspace(path: string | null): Promise<{ path: string; exists: boolean }> {
   return invoke("open_workspace", { path });
+}
+
+export function listBackups(): Promise<BackupInfo[]> {
+  return invoke("list_backups");
+}
+
+export function createBackup(out: string | null): Promise<BackupResult> {
+  return invoke("create_backup", { out });
+}
+
+export function restoreBackup(path: string, yes: boolean): Promise<BackupResult> {
+  return invoke("restore_backup", { path, yes });
 }
 
 export function errorMessage(error: unknown): string {

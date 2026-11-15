@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
-rusqlite = { workspace = true, features = ["functions"] }
+rusqlite = { workspace = true, features = ["functions", "backup"] }
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

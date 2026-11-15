@@ -13,12 +13,14 @@ use serde_json::Value;
 use tez_auth::connection;
 use tez_auth::providers::{self, ProviderBook, ProviderEntry, ProviderInput};
 use tez_auth::Vault;
+use tez_backup::{BackupInfo, BackupReport};
 use tez_core::agent::{Agent, AgentConfig, RunContext};
 use tez_core::compaction::{session_artifact_dir, CompactSettings, Compactor};
 use tez_core::context::{ContextBuilder, ContextInput};
 use tez_core::diff;
 use tez_core::harness;
 use tez_core::hooks::{self, HookRegistry};
+use tez_core::logging;
 use tez_core::mcp;
 use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
 use tez_core::modes::{self, Mode, PLAN_TOOLS};
@@ -43,9 +45,11 @@ use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::skill::SkillTool;
 use tez_core::tools::web::WebFetchTool;
-use tez_core::tools::{code_registry, Tool, ToolError, ToolRegistry};
+use tez_core::tools::{code_registry_with_sandbox, Tool, ToolError, ToolRegistry};
 use tez_llm::{LlmError, LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
+
+mod eval;
 
 #[derive(Parser)]
 #[command(
@@ -60,12 +64,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Sao lưu hoặc liệt kê bản sao lưu dữ liệu local.
+    Backup(BackupArgs),
+    /// Phục hồi dữ liệu từ một bản sao lưu.
+    Restore(RestoreArgs),
+    /// Xem log ứng dụng gần nhất.
+    Logs {
+        /// Số dòng cuối cần hiển thị.
+        #[arg(long, default_value_t = 80)]
+        tail: usize,
+    },
     /// Kiểm tra môi trường, DB, vault, provider.
     Doctor,
     /// Kết nối provider (API key hoặc Ollama local).
     Connect(ConnectArgs),
     /// Kiểm tra provider/model/key đã lưu bằng một prompt ngắn.
     Test,
+    /// Chạy bộ eval hồi quy trên provider đang dùng.
+    Eval(EvalArgs),
     /// Chat hoặc làm việc với code agent.
     Chat(ChatArgs),
     /// Kiểm tra bản cập nhật mới trên GitHub Releases.
@@ -158,6 +174,47 @@ struct ConnectArgs {
     /// API key. Không khuyến khích vì lộ trong shell history; bỏ trống để nhập ẩn.
     #[arg(long)]
     api_key: Option<String>,
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    /// Thư mục đích. Mặc định: <data>/backups/tez-backup-YYYYMMDD-HHMMSS.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Chỉ liệt kê các bản sao lưu đã có, không tạo mới.
+    #[arg(long, conflicts_with = "out")]
+    list: bool,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    /// Đường dẫn thư mục bản sao lưu (chứa manifest.json).
+    path: PathBuf,
+    /// Không hỏi xác nhận.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct EvalArgs {
+    /// File JSON chứa bộ eval.
+    #[arg(long, default_value = "evals/basic.json")]
+    suite: PathBuf,
+    /// Ghi đè provider đã lưu.
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    base_url: Option<String>,
+    #[arg(long)]
+    api_key: Option<String>,
+    /// Xuất báo cáo JSON để CI đọc.
+    #[arg(long)]
+    json: bool,
+    /// Số case tối thiểu phải pass; mặc định phải pass tất cả.
+    #[arg(long)]
+    min_pass: Option<usize>,
 }
 
 #[derive(Args)]
@@ -375,11 +432,16 @@ fn registry_for_mode(
     pack: &SubjectPack,
     mode: Mode,
     workspace: &Path,
+    data_dir: &Path,
+    config: &harness::HarnessConfig,
 ) -> anyhow::Result<ToolRegistry> {
+    let sandbox = tez_core::sandbox::SandboxPolicy::from_settings(&config.sandbox, data_dir);
     match mode {
         Mode::Chat => Ok(registry_for(pack)),
-        Mode::Plan => Ok(code_registry(workspace)?.filtered(PLAN_TOOLS)),
-        Mode::Code => Ok(code_registry(workspace)?),
+        Mode::Plan => {
+            Ok(code_registry_with_sandbox(workspace, Some(sandbox))?.filtered(PLAN_TOOLS))
+        }
+        Mode::Code => Ok(code_registry_with_sandbox(workspace, Some(sandbox))?),
     }
 }
 
@@ -614,6 +676,56 @@ async fn test_connection() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn eval_command(args: EvalArgs) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let book = providers::load(&dir)?;
+    let connection = resolve_connection(
+        &book,
+        &dir,
+        ConnectionOverrides {
+            provider: args.provider.as_deref(),
+            model: args.model.as_deref(),
+            base_url: args.base_url.as_deref(),
+            api_key: args.api_key.as_deref(),
+        },
+    )?;
+    let suite = eval::load(&args.suite)?;
+    logging::info(format!(
+        "eval bắt đầu: suite={} model={} provider={}",
+        suite.name, connection.model, connection.provider_id
+    ));
+    let provider = OpenAiCompatible::new(
+        &connection.provider_id,
+        &connection.base_url,
+        &connection.api_key,
+    );
+    let report = eval::run_suite(&provider, &suite, &connection.model, !args.json).await;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eval::print_report(&report);
+    }
+    logging::info(format!(
+        "eval kết thúc: {}/{} pass",
+        report.passed, report.total
+    ));
+
+    if let Some(min_pass) = args.min_pass {
+        if report.passed < min_pass {
+            anyhow::bail!(
+                "Eval không đạt ngưỡng: {}/{} pass, cần ít nhất {}.",
+                report.passed,
+                report.total,
+                min_pass
+            );
+        }
+    } else if report.failed > 0 {
+        anyhow::bail!("Eval có {} case fail trên {}.", report.failed, report.total);
+    }
+    Ok(())
+}
+
 fn provider_list() -> anyhow::Result<()> {
     let dir = data_dir()?;
     let book = providers::load(&dir)?;
@@ -751,7 +863,7 @@ async fn mcp_test(name: Option<String>) -> anyhow::Result<()> {
     }
     let mut failures = 0usize;
     for entry in selected {
-        match mcp::McpClient::connect(&entry.name, &entry.config).await {
+        match mcp::McpClient::connect(&entry.name, &entry.config, Some(&dir)).await {
             Ok((_client, tools)) => {
                 println!("{}: OK · {} tool", entry.name, tools.len());
                 for tool in tools {
@@ -799,6 +911,13 @@ struct ResolvedConnection {
     base_url: String,
     model: String,
     api_key: String,
+}
+
+struct ConnectionOverrides<'a> {
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+    base_url: Option<&'a str>,
+    api_key: Option<&'a str>,
 }
 
 struct ProviderChoice<'a> {
@@ -900,11 +1019,27 @@ fn resolve_chat_connection(
     book: &ProviderBook,
     dir: &Path,
 ) -> anyhow::Result<ResolvedConnection> {
-    let ProviderChoice { entry, kind } = resolve_provider_choice(book, args.provider.as_deref())?;
+    resolve_connection(
+        book,
+        dir,
+        ConnectionOverrides {
+            provider: args.provider.as_deref(),
+            model: args.model.as_deref(),
+            base_url: args.base_url.as_deref(),
+            api_key: args.api_key.as_deref(),
+        },
+    )
+}
+
+fn resolve_connection(
+    book: &ProviderBook,
+    dir: &Path,
+    overrides: ConnectionOverrides<'_>,
+) -> anyhow::Result<ResolvedConnection> {
+    let ProviderChoice { entry, kind } = resolve_provider_choice(book, overrides.provider)?;
     let provider_id = kind;
-    let base_url_override = args
+    let base_url_override = overrides
         .base_url
-        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if provider_id == "custom" && entry.is_none() && base_url_override.is_none() {
@@ -917,9 +1052,8 @@ fn resolve_chat_connection(
         .or_else(|| entry.map(|entry| entry.base_url.clone()))
         .unwrap_or_else(|| connection::default_base_url(&provider_id).to_string());
     connection::validate_base_url(&base_url)?;
-    let model = args
+    let model = overrides
         .model
-        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
@@ -927,7 +1061,7 @@ fn resolve_chat_connection(
         .unwrap_or_else(|| connection::default_model(&provider_id).to_string());
 
     // Cờ --api-key thay thế hoàn toàn key đã lưu: không cần đọc vault.
-    let stored_key = if args.api_key.is_some() {
+    let stored_key = if overrides.api_key.is_some() {
         None
     } else {
         entry
@@ -935,7 +1069,7 @@ fn resolve_chat_connection(
             .transpose()?
     };
     let api_key = effective_api_key(
-        args.api_key.as_deref(),
+        overrides.api_key,
         stored_key.as_deref(),
         env_api_key(&provider_id),
         &provider_id,
@@ -1496,7 +1630,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
         &connection.api_key,
     ));
 
-    let mut tools = registry_for_mode(pack, mode, &workspace)?;
+    let mut tools = registry_for_mode(pack, mode, &workspace, &dir, &config)?;
     let mut read_only_tools = Vec::new();
     let discovery = mcp::discover_with_project(&dir, Some(&workspace)).await?;
     let mut mcp_count = 0;
@@ -1740,12 +1874,160 @@ fn load_skills_read_only(dir: &Path) -> anyhow::Result<SkillRegistry> {
     Ok(registry)
 }
 
+fn backup(args: BackupArgs) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let backup_root = dir.join("backups");
+
+    if args.list {
+        let backups = tez_backup::list(&backup_root)?;
+        if backups.is_empty() {
+            println!("chưa có bản sao lưu trong {}", backup_root.display());
+        } else {
+            for info in backups {
+                print_backup_info(&info);
+            }
+        }
+        return Ok(());
+    }
+
+    let destination = args
+        .out
+        .unwrap_or_else(|| tez_backup::default_destination(&dir));
+    let report = tez_backup::create(&dir, &destination)?;
+    logging::info(format!(
+        "backup created: {} ({} file, {} byte)",
+        report.path.display(),
+        report.files,
+        report.bytes
+    ));
+    print_backup_report(&report);
+    Ok(())
+}
+
+fn print_backup_info(info: &BackupInfo) {
+    println!(
+        "{} · {} file · {} · {}",
+        info.path.display(),
+        info.files,
+        human_size(info.bytes),
+        format_unix(info.created_at_unix)
+    );
+}
+
+fn print_backup_report(report: &BackupReport) {
+    println!("đã sao lưu: {}", report.path.display());
+    println!(
+        "  {} file · {} · DB: {}",
+        report.files,
+        human_size(report.bytes),
+        report.db_integrity.as_deref().unwrap_or("không có")
+    );
+    if !report.skipped.is_empty() {
+        println!(
+            "  bỏ qua {} mục không an toàn/không phải file thường",
+            report.skipped.len()
+        );
+    }
+    println!("  phục hồi bằng: tez restore \"{}\"", report.path.display());
+}
+
+fn format_unix(seconds: u64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(seconds as i64) {
+        Ok(value) => value
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| seconds.to_string()),
+        Err(_) => seconds.to_string(),
+    }
+}
+
+fn restore(args: RestoreArgs) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    if !args.path.is_dir() {
+        anyhow::bail!("không thấy thư mục bản sao lưu: {}", args.path.display());
+    }
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("cần --yes khi không chạy tương tác");
+        }
+        let confirmed = Confirm::new()
+            .with_prompt(format!(
+                "Phục hồi dữ liệu từ {}? Dữ liệu hiện tại sẽ được sao lưu an toàn trước.",
+                args.path.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !confirmed {
+            println!("đã huỷ");
+            return Ok(());
+        }
+    }
+
+    let report = tez_backup::restore(&args.path, &dir, &dir.join("backups"))?;
+    logging::info(format!(
+        "restore completed: {} ({} file, {} byte)",
+        report.path.display(),
+        report.files,
+        report.bytes
+    ));
+    println!("đã phục hồi: {}", report.path.display());
+    println!("  {} file · {}", report.files, human_size(report.bytes));
+    if let Some(safety) = report.safety_backup {
+        println!(
+            "  bản sao lưu an toàn trước khi phục hồi: {}",
+            safety.display()
+        );
+    }
+    Ok(())
+}
+
+fn logs(tail: usize) -> anyhow::Result<()> {
+    let dir = data_dir()?;
+    let path = logging::log_path(&dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("chưa có log tại {}", path.display());
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let lines = content.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(tail.max(1));
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn doctor() -> anyhow::Result<()> {
     let dir = data_dir_path()?;
     println!("tez {}", env!("CARGO_PKG_VERSION"));
     println!("data dir: {}", dir.display());
     if !dir.exists() {
         println!("data dir: chưa tồn tại (doctor chỉ đọc, không tạo mới)");
+    }
+    let log_path = logging::log_path(&dir);
+    println!(
+        "log: {} ({})",
+        log_path.display(),
+        if log_path.exists() {
+            human_size(std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0))
+        } else {
+            "chưa có".to_string()
+        }
+    );
+    match tez_backup::list(&dir.join("backups")) {
+        Ok(backups) if backups.is_empty() => println!("backups: chưa có"),
+        Ok(backups) => {
+            let latest = &backups[0];
+            println!(
+                "backups: {} bản · mới nhất {} · {} file",
+                backups.len(),
+                format_unix(latest.created_at_unix),
+                latest.files
+            );
+        }
+        Err(error) => println!("backups: không đọc được · {error}"),
     }
 
     let book = providers::load(&dir)?;
@@ -1779,6 +2061,11 @@ fn doctor() -> anyhow::Result<()> {
                     store.document_count()?,
                     human_size(store.document_bytes()? as u64)
                 );
+                match store.quick_check() {
+                    Ok(result) if result == "ok" => println!("db integrity: ok"),
+                    Ok(result) => println!("db integrity: LỖI · {result}"),
+                    Err(error) => println!("db integrity: không kiểm tra được · {error}"),
+                }
             }
             Err(error) => println!("db: {} (không đọc được: {error})", db_path.display()),
         }
@@ -1841,6 +2128,9 @@ fn doctor() -> anyhow::Result<()> {
         harness_config.hooks.len()
     );
     println!("harness config: {}", harness::config_path(&dir).display());
+    let sandbox_policy =
+        tez_core::sandbox::SandboxPolicy::from_settings(&harness_config.sandbox, &dir);
+    println!("sandbox: {}", tez_core::sandbox::status(&sandbox_policy));
     let skills = load_skills_read_only(&dir)?;
     println!(
         "skills: {} (thư mục {})",
@@ -2194,10 +2484,19 @@ async fn main() -> anyhow::Result<()> {
     restore_sigpipe();
     install_signal_handler().await;
     let cli = Cli::parse();
-    match cli.command {
+    if !matches!(&cli.command, Commands::Doctor) {
+        if let Ok(dir) = data_dir() {
+            let _ = logging::init(&dir, "cli");
+        }
+    }
+    let result = match cli.command {
+        Commands::Backup(args) => backup(args),
+        Commands::Restore(args) => restore(args),
+        Commands::Logs { tail } => logs(tail),
         Commands::Doctor => doctor(),
         Commands::Connect(args) => connect(args).await,
         Commands::Test => test_connection().await,
+        Commands::Eval(args) => eval_command(args).await,
         Commands::Chat(args) => chat(args).await,
         Commands::Update(args) => update(args).await,
         Commands::Subject { command } => match command {
@@ -2243,7 +2542,11 @@ async fn main() -> anyhow::Result<()> {
             MemoryCommand::Forget { name } => memory_forget(&name),
         },
         Commands::Harness => harness_show(),
+    };
+    if let Err(error) = &result {
+        logging::error(format!("{error:#}"));
     }
+    result
 }
 
 #[cfg(test)]

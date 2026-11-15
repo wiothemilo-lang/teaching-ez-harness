@@ -52,6 +52,8 @@ impl HookEvent {
 
 const MAX_HOOK_OUTPUT_BYTES: usize = 8 * 1024;
 const AUDIT_PREVIEW_CHARS: usize = 500;
+/// Giới hạn audit.jsonl trước khi xoay sang audit.jsonl.1.
+const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Dữ liệu hook nhận được. Owned để dễ đi qua `.await`.
 #[derive(Debug, Clone, Serialize)]
@@ -289,11 +291,36 @@ impl Hook for CommandHook {
 /// Ghi audit log JSONL: mỗi tool call và lần kết thúc phiên một dòng.
 pub struct AuditHook {
     path: PathBuf,
+    max_bytes: u64,
 }
 
 impl AuditHook {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            max_bytes: AUDIT_MAX_BYTES,
+        }
+    }
+
+    /// Ngưỡng xoay file, hữu ích cho test.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
+    }
+
+    /// Giữ một bản cũ `audit.jsonl.1`; bản trước đó bị thay thế.
+    fn rotate_if_needed(&self) {
+        let Ok(metadata) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        if metadata.len() < self.max_bytes {
+            return;
+        }
+        let backup = self.path.with_extension("jsonl.1");
+        let _ = std::fs::remove_file(&backup);
+        if let Err(error) = std::fs::rename(&self.path, &backup) {
+            eprintln!("[audit] không xoay được '{}': {error}", self.path.display());
+        }
     }
 }
 
@@ -329,6 +356,7 @@ impl Hook for AuditHook {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        self.rotate_if_needed();
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]
@@ -796,6 +824,22 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn audit_log_rotates_when_full() {
+        let dir = temp_hook_dir("rotate");
+        let path = dir.join("audit.jsonl");
+        let hook = AuditHook::new(&path).with_max_bytes(1);
+        let ctx =
+            HookContext::event(HookEvent::PreToolUse).tool("read_file", &json!({"path": "a"}));
+
+        hook.run(&ctx).await;
+        hook.run(&ctx).await;
+
+        assert!(path.exists());
+        assert!(dir.join("audit.jsonl.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

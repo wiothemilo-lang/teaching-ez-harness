@@ -3888,10 +3888,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tez-backup"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tez-store",
+ "thiserror 1.0.69",
+ "time",
+]
+
+[[package]]
 name = "tez-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "evalexpr",
  "glob",
  "libc",
@@ -3899,9 +3912,12 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tez-llm",
  "thiserror 1.0.69",
+ "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3916,6 +3932,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tez-auth",
+ "tez-backup",
  "tez-core",
  "tez-llm",
  "tez-store",

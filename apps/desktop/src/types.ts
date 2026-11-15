@@ -56,6 +56,11 @@ export type PermissionRule = {
   pattern: string;
 };
 
+export type SandboxSettings = {
+  enabled: boolean;
+  allow_network: boolean;
+};
+
 export type HarnessConfig = {
   permission_mode: PermissionMode;
   permission_rules: PermissionRule[];
@@ -73,6 +78,7 @@ export type HarnessConfig = {
   compaction: CompactionSettings;
   memory: MemorySettings;
   hooks: HookConfig[];
+  sandbox: SandboxSettings;
 };
 
 export type MemoryRecord = {
@@ -225,6 +231,33 @@ export type SkillInfo = {
   source: string;
 };
 
+export type McpOAuthConfig = {
+  authorization_url: string;
+  token_url: string;
+  client_id: string;
+  client_secret_env: string | null;
+  client_secret: string | null;
+  scopes: string[];
+  redirect_uri: string | null;
+  resource: string | null;
+};
+
+export type McpOAuthInfo = Omit<McpOAuthConfig, "client_secret"> & {
+  has_secret: boolean;
+};
+
+export type McpSandboxSettings = {
+  enabled: boolean;
+  allow_network: boolean;
+  writable_paths: string[];
+};
+
+export type OAuthTokenStatus = {
+  authorized: boolean;
+  expires_at: number;
+  has_refresh: boolean;
+};
+
 export type McpServerInfo = {
   name: string;
   source: string;
@@ -237,6 +270,9 @@ export type McpServerInfo = {
   url: string | null;
   headers: Record<string, string>;
   bearer_token_env: string | null;
+  oauth: McpOAuthInfo | null;
+  sandbox: McpSandboxSettings;
+  authorized: boolean;
 };
 
 export type PluginInfo = {
@@ -310,6 +346,8 @@ export type SaveMcpPayload = {
   url: string | null;
   headers: Record<string, string>;
   bearer_token_env: string | null;
+  oauth: McpOAuthConfig | null;
+  sandbox: McpSandboxSettings;
 };
 
 export type ChatPayload = {
@@ -319,6 +357,21 @@ export type ChatPayload = {
   provider_id: string | null;
   mode: AppMode;
   workspace: string | null;
+};
+
+export type BackupInfo = {
+  path: string;
+  files: number;
+  bytes: number;
+  created_at_unix: number;
+};
+
+export type BackupResult = {
+  path: string;
+  files: number;
+  bytes: number;
+  db_integrity: string | null;
+  safety_backup: string | null;
 };
 
 export type ToastKind = "success" | "error" | "info";

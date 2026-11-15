@@ -14,7 +14,9 @@ use tez_core::context::{ContextBuilder, ContextInput};
 use tez_core::diff;
 use tez_core::harness::{self, HarnessConfig};
 use tez_core::hooks::{self};
-use tez_core::mcp::{self, McpServerConfig};
+use tez_core::logging;
+use tez_core::mcp::{self, McpSandboxSettings, McpServerConfig};
+use tez_core::oauth::{self, OAuthConfig};
 use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
 use tez_core::modes::{Mode, PLAN_TOOLS};
 use tez_core::permission::{
@@ -38,7 +40,7 @@ use tez_core::tools::skill::SkillTool;
 use tez_core::tools::web::WebFetchTool;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
-use tez_core::tools::{code_registry, Tool, ToolRegistry};
+use tez_core::tools::{code_registry_with_sandbox, Tool, ToolRegistry};
 use tez_llm::{
     ChatRequest as LlmChatRequest, ChatResponse, LlmProvider, Message, OpenAiCompatible,
 };
@@ -106,6 +108,10 @@ struct SaveMcpRequest {
     headers: HashMap<String, String>,
     #[serde(default)]
     bearer_token_env: Option<String>,
+    #[serde(default)]
+    oauth: Option<OAuthConfig>,
+    #[serde(default)]
+    sandbox: McpSandboxSettings,
 }
 
 fn default_true() -> bool {
@@ -735,6 +741,18 @@ struct PlanInfo {
 }
 
 #[derive(Debug, Serialize)]
+struct McpOAuthInfo {
+    authorization_url: String,
+    token_url: String,
+    client_id: String,
+    client_secret_env: Option<String>,
+    has_secret: bool,
+    scopes: Vec<String>,
+    redirect_uri: Option<String>,
+    resource: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct McpServerInfo {
     name: String,
     source: String,
@@ -746,6 +764,10 @@ struct McpServerInfo {
     read_only: bool,
     url: Option<String>,
     headers: HashMap<String, String>,
+    bearer_token_env: Option<String>,
+    oauth: Option<McpOAuthInfo>,
+    sandbox: McpSandboxSettings,
+    authorized: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -965,7 +987,9 @@ fn subject_infos() -> Vec<SubjectInfo> {
 }
 
 fn friendly(error: anyhow::Error) -> String {
-    format!("{error:#}")
+    let message = format!("{error:#}");
+    logging::error(&message);
+    message
 }
 
 fn provider_info(dir: &Path, book: &ProviderBook, entry: &ProviderEntry) -> ProviderInfo {
@@ -1158,17 +1182,38 @@ fn list_extensions() -> Result<ExtensionsInfo, String> {
     let mcp = mcp::load_servers(&dir)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|entry| McpServerInfo {
-            name: entry.name,
-            source: entry.source,
-            command: entry.config.command,
-            args: entry.config.args,
-            cwd: entry.config.cwd,
-            env: entry.config.env,
-            enabled: entry.config.enabled,
-            read_only: entry.config.read_only,
-            url: entry.config.url,
-            headers: entry.config.headers,
+        .map(|entry| {
+            let oauth = entry.config.oauth.as_ref().map(|config| McpOAuthInfo {
+                authorization_url: config.authorization_url.clone(),
+                token_url: config.token_url.clone(),
+                client_id: config.client_id.clone(),
+                client_secret_env: config.client_secret_env.clone(),
+                has_secret: config.client_secret.is_some(),
+                scopes: config.scopes.clone(),
+                redirect_uri: config.redirect_uri.clone(),
+                resource: config.resource.clone(),
+            });
+            let authorized = entry
+                .config
+                .oauth
+                .as_ref()
+                .is_some_and(|config| oauth::status(&dir, &entry.name, config).authorized);
+            McpServerInfo {
+                name: entry.name,
+                source: entry.source,
+                command: entry.config.command,
+                args: entry.config.args,
+                cwd: entry.config.cwd,
+                env: entry.config.env,
+                enabled: entry.config.enabled,
+                read_only: entry.config.read_only,
+                url: entry.config.url,
+                headers: entry.config.headers,
+                bearer_token_env: entry.config.bearer_token_env,
+                oauth,
+                sandbox: entry.config.sandbox,
+                authorized,
+            }
         })
         .collect();
 
@@ -1220,6 +1265,8 @@ fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
             url,
             headers: request.headers,
             bearer_token_env: request.bearer_token_env,
+            oauth: request.oauth,
+            sandbox: request.sandbox,
         },
     );
     mcp::save_config(&dir, &config).map_err(|error| error.to_string())
@@ -1245,7 +1292,7 @@ async fn test_mcp_server(name: String) -> Result<McpTest, String> {
         .find(|entry| entry.name == name)
         .ok_or_else(|| format!("MCP server '{name}' không tồn tại"))?;
 
-    match mcp::McpClient::connect(&entry.name, &entry.config).await {
+    match mcp::McpClient::connect(&entry.name, &entry.config, Some(&dir)).await {
         Ok((_client, tools)) => Ok(McpTest {
             ok: true,
             tools: tools.into_iter().map(|tool| tool.name).collect(),
@@ -1256,6 +1303,100 @@ async fn test_mcp_server(name: String) -> Result<McpTest, String> {
             tools: Vec::new(),
             error: Some(error.to_string()),
         }),
+    }
+}
+
+fn find_mcp_server(dir: &Path, name: &str) -> Result<mcp::ServerEntry, String> {
+    let servers = mcp::load_servers(dir).map_err(|error| error.to_string())?;
+    servers
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| format!("MCP server '{name}' không tồn tại"))
+}
+
+#[tauri::command]
+fn mcp_oauth_status(name: String) -> Result<oauth::OAuthTokenStatus, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = find_mcp_server(&dir, &name)?;
+    let config = entry
+        .config
+        .oauth
+        .as_ref()
+        .ok_or_else(|| format!("MCP server '{name}' chưa cấu hình OAuth"))?;
+    Ok(oauth::status(&dir, &entry.name, config))
+}
+
+#[tauri::command]
+async fn start_mcp_oauth(name: String) -> Result<oauth::OAuthTokenStatus, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = find_mcp_server(&dir, &name)?;
+    let config = entry
+        .config
+        .oauth
+        .clone()
+        .ok_or_else(|| format!("MCP server '{name}' chưa cấu hình OAuth"))?;
+    let (state, verifier) = oauth::new_pkce();
+    let url = oauth::authorize_url(&config, &state, &verifier).map_err(|error| error.to_string())?;
+    open_path_in_os(Path::new(&url))
+        .map_err(|error| format!("không mở được browser cho OAuth: {error}"))?;
+    let redirect = oauth::redirect_uri(&config);
+    let expected_state = state.clone();
+    let code = tokio::task::spawn_blocking(move || {
+        oauth::wait_for_code(&redirect, &expected_state, Duration::from_secs(300))
+    })
+    .await
+    .map_err(|error| format!("không chờ được callback OAuth: {error}"))?
+    .map_err(|error| error.to_string())?;
+    oauth::exchange_code(&dir, &entry.name, &config, &code, &verifier)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(oauth::status(&dir, &entry.name, &config))
+}
+
+#[tauri::command]
+fn disconnect_mcp_oauth(name: String) -> Result<bool, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = find_mcp_server(&dir, &name)?;
+    let config = entry
+        .config
+        .oauth
+        .as_ref()
+        .ok_or_else(|| format!("MCP server '{name}' chưa cấu hình OAuth"))?;
+    oauth::remove_token(&dir, &entry.name, config).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn mcp_extras(
+    name: String,
+    action: String,
+    uri: Option<String>,
+    prompt_name: Option<String>,
+    arguments: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let entry = find_mcp_server(&dir, &name)?;
+    let action_name = action.clone();
+    let mut args = serde_json::json!({ "action": action });
+    if let Some(uri) = uri {
+        args["uri"] = serde_json::Value::String(uri);
+    }
+    if let Some(prompt_name) = prompt_name {
+        args["name"] = serde_json::Value::String(prompt_name);
+    }
+    if let Some(arguments) = arguments {
+        args["arguments"] = arguments;
+    }
+    let (client, _) = mcp::McpClient::connect(&entry.name, &entry.config, Some(&dir))
+        .await
+        .map_err(|error| error.to_string())?;
+    let output = client
+        .extras(&action_name, &args)
+        .await
+        .map_err(|error| error.to_string())?;
+    if output.is_error {
+        Err(output.content)
+    } else {
+        Ok(output.content)
     }
 }
 
@@ -1474,6 +1615,10 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
             headers: HashMap<String, String>,
             #[serde(default)]
             bearer_token_env: Option<String>,
+            #[serde(default)]
+            oauth: Option<OAuthConfig>,
+            #[serde(default)]
+            sandbox: McpSandboxSettings,
         }
 
         let file = request
@@ -1506,6 +1651,8 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
                 url,
                 headers: draft.headers,
                 bearer_token_env: draft.bearer_token_env,
+                oauth: draft.oauth,
+                sandbox: draft.sandbox,
             },
         );
         mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;
@@ -1895,9 +2042,12 @@ async fn chat_inner(
     ));
 
     let plan_mode = mode == Mode::Plan;
+    let sandbox = tez_core::sandbox::SandboxPolicy::from_settings(&config.sandbox, &dir);
     let mut tools = match (&mode, workspace.as_deref()) {
-        (Mode::Code, Some(root)) => code_registry(root)?,
-        (Mode::Plan, Some(root)) => code_registry(root)?.filtered(PLAN_TOOLS),
+        (Mode::Code, Some(root)) => code_registry_with_sandbox(root, Some(sandbox))?,
+        (Mode::Plan, Some(root)) => {
+            code_registry_with_sandbox(root, Some(sandbox))?.filtered(PLAN_TOOLS)
+        }
         _ => full_registry(),
     };
     if !plan_mode {
@@ -2220,6 +2370,98 @@ fn open_external(url: String) -> Result<(), String> {
     open_path_in_os(Path::new(url.trim())).map_err(|error| format!("không mở được liên kết: {error}"))
 }
 
+#[derive(Debug, Serialize)]
+struct BackupInfoDto {
+    path: String,
+    files: usize,
+    bytes: u64,
+    created_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BackupResultDto {
+    path: String,
+    files: usize,
+    bytes: u64,
+    db_integrity: Option<String>,
+    safety_backup: Option<String>,
+}
+
+#[tauri::command]
+fn list_backups() -> Result<Vec<BackupInfoDto>, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let backups = tez_backup::list(&dir.join("backups")).map_err(|error| {
+        logging::error(format!("list_backups: {error}"));
+        error.to_string()
+    })?;
+    Ok(backups
+        .into_iter()
+        .map(|info| BackupInfoDto {
+            path: info.path.display().to_string(),
+            files: info.files,
+            bytes: info.bytes,
+            created_at_unix: info.created_at_unix,
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn create_backup(out: Option<String>) -> Result<BackupResultDto, String> {
+    let dir = data_dir().map_err(friendly)?;
+    let destination = out
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tez_backup::default_destination(&dir));
+    let report = tez_backup::create(&dir, &destination).map_err(|error| {
+        logging::error(format!("create_backup: {error}"));
+        error.to_string()
+    })?;
+    logging::info(format!(
+        "desktop backup created: {} ({} file, {} byte)",
+        report.path.display(),
+        report.files,
+        report.bytes
+    ));
+    Ok(BackupResultDto {
+        path: report.path.display().to_string(),
+        files: report.files,
+        bytes: report.bytes,
+        db_integrity: report.db_integrity,
+        safety_backup: None,
+    })
+}
+
+#[tauri::command]
+fn restore_backup(path: String, yes: bool) -> Result<BackupResultDto, String> {
+    if !yes {
+        return Err("cần xác nhận trước khi phục hồi dữ liệu".to_string());
+    }
+    let dir = data_dir().map_err(friendly)?;
+    let backup = PathBuf::from(&path);
+    if !backup.is_dir() {
+        return Err(format!("không thấy thư mục bản sao lưu: {path}"));
+    }
+    let report = tez_backup::restore(&backup, &dir, &dir.join("backups")).map_err(|error| {
+        logging::error(format!("restore_backup: {error}"));
+        error.to_string()
+    })?;
+    logging::info(format!(
+        "desktop restore completed: {} ({} file, {} byte)",
+        report.path.display(),
+        report.files,
+        report.bytes
+    ));
+    Ok(BackupResultDto {
+        path: report.path.display().to_string(),
+        files: report.files,
+        bytes: report.bytes,
+        db_integrity: None,
+        safety_backup: report
+            .safety_backup
+            .map(|path| path.display().to_string()),
+    })
+}
+
 #[tauri::command]
 fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
     let resolved = resolve_workspace(path.as_deref()).map_err(friendly)?;
@@ -2232,6 +2474,13 @@ fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Ok(dir) = data_dir() {
+        let _ = logging::init(&dir, "desktop");
+        logging::info(format!(
+            "desktop starting v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
     let approvals = data_dir().ok().map(|dir| dir.join(APPROVAL_FILE));
     tauri::Builder::default()
         .manage(Arc::new(ApprovalBroker::load(approvals)))
@@ -2259,6 +2508,10 @@ pub fn run() {
             save_mcp_server,
             delete_mcp_server,
             test_mcp_server,
+            mcp_oauth_status,
+            start_mcp_oauth,
+            disconnect_mcp_oauth,
+            mcp_extras,
             install_sample_plugin,
             draft_extension,
             save_extension,
@@ -2267,7 +2520,10 @@ pub fn run() {
             download_update,
             launch_update,
             open_external,
-            open_workspace
+            open_workspace,
+            list_backups,
+            create_backup,
+            restore_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

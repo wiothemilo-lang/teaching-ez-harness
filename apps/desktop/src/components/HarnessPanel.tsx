@@ -146,6 +146,12 @@ export function HarnessPanel({ notify, onChanged }: Props) {
     );
   };
 
+  const patchSandbox = (changes: Partial<HarnessConfig["sandbox"]>) => {
+    setDraft((current) =>
+      current ? { ...current, sandbox: { ...current.sandbox, ...changes } } : current,
+    );
+  };
+
   const save = async () => {
     if (!draft) return;
     if (ruleErrors.length > 0) {
@@ -382,6 +388,33 @@ export function HarnessPanel({ notify, onChanged }: Props) {
 
           <div className="harness-block">
             <div className="harness-block-head">
+              <h4>Sandbox lệnh</h4>
+              <p>
+                Chạy <code>run_command</code> trong bubblewrap trên Linux: ẩn data dir và
+                credential, chặn mạng trừ khi bạn cho phép. Cần cài gói <code>bubblewrap</code>;
+                nếu thiếu, lệnh sẽ bị từ chối thay vì chạy không sandbox.
+              </p>
+            </div>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={draft.sandbox.enabled}
+                onChange={(event) => patchSandbox({ enabled: event.target.checked })}
+              />
+              Bật sandbox cho lệnh
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={draft.sandbox.allow_network}
+                onChange={(event) => patchSandbox({ allow_network: event.target.checked })}
+              />
+              Cho phép lệnh dùng mạng
+            </label>
+          </div>
+
+          <div className="harness-block">
+            <div className="harness-block-head">
               <h4>Approval đã nhớ</h4>
               <p>
                 Quyết định “cho phép trong phiên” được lưu vào <code>approvals.json</code>. TTL và
@@ -498,8 +531,9 @@ export function HarnessPanel({ notify, onChanged }: Props) {
             <div className="harness-block-head">
               <h4>Nén context</h4>
               <p>
-                Bốn bước từ rẻ tới đắt: lưu kết quả lớn, cắt lịch sử cũ, micro-compact, rồi mới
-                tóm tắt bằng model.
+                Bốn bước từ rẻ tới đắt: lưu kết quả lớn, cắt lịch sử cũ, micro-compact ở 80%
+                giới hạn, rồi mới tóm tắt bằng model ở 90%. Mặc định 24.000 ký tự để an toàn với
+                model context nhỏ.
               </p>
             </div>
             <label className="checkbox harness-toggle">

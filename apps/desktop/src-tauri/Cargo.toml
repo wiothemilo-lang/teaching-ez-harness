@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tez-auth = { path = "../../../crates/tez-auth" }
+tez-backup = { path = "../../../crates/tez-backup" }
 tez-core = { path = "../../../crates/tez-core" }
 tez-llm = { path = "../../../crates/tez-llm" }
 tez-store = { path = "../../../crates/tez-store" }

@@ -1,0 +1,81 @@
+{
+  "name": "basic",
+  "cases": [
+    {
+      "id": "math-arithmetic",
+      "subject": "math",
+      "prompt": "Tính 17 x 23. Chỉ trả lời một số.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["391"],
+      "not_contains": ["392"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "math-linear",
+      "subject": "math",
+      "prompt": "Giải phương trình 2x + 6 = 18. Chỉ trả lời giá trị của x.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["6"],
+      "not_contains": ["5"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "math-prime",
+      "subject": "math",
+      "prompt": "Số nguyên tố nhỏ nhất là số nào? Chỉ trả lời một số.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["2"],
+      "not_contains": ["1"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "physics-speed",
+      "subject": "physics",
+      "prompt": "Một vật đi 120 m trong 20 s. Tốc độ trung bình là bao nhiêu? Trả lời kèm đơn vị m/s.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["6", "m/s"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "physics-force-unit",
+      "subject": "physics",
+      "prompt": "Đơn vị SI của lực là gì? Trả lời một từ.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["newton"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "chemistry-molar",
+      "subject": "chemistry",
+      "prompt": "Số mol của 18 g nước (M = 18 g/mol) là bao nhiêu? Chỉ trả lời số.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["1"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "english-past",
+      "subject": "english",
+      "prompt": "Viết dạng quá khứ đơn của động từ 'go'. Chỉ trả lời một từ.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["went"],
+      "max_tokens": 64,
+      "temperature": 0
+    },
+    {
+      "id": "english-quantifier",
+      "subject": "english",
+      "prompt": "Điền 'much' hoặc 'many': How ___ books do you have? Chỉ trả lời một từ.",
+      "system": "Trả lời ngắn gọn, đúng trọng tâm.",
+      "contains": ["many"],
+      "not_contains": ["much"],
+      "max_tokens": 64,
+      "temperature": 0
+    }
+  ]
+}

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+use crate::oauth::{self, OAuthConfig};
 use crate::tools::{Tool, ToolError, ToolOutput};
 
 const MCP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -42,6 +43,8 @@ pub enum McpError {
     Timeout,
     #[error("MCP HTTP: {0}")]
     Http(String),
+    #[error("MCP OAuth: {0}")]
+    Auth(String),
     #[error("MCP error: {0}")]
     Rpc(String),
 }
@@ -73,6 +76,25 @@ pub struct McpServerConfig {
     /// trong `mcp.json`.
     #[serde(default, alias = "bearerTokenEnv")]
     pub bearer_token_env: Option<String>,
+    /// OAuth 2.1 + PKCE cho MCP HTTP. Token lưu ngoài `mcp.json`.
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
+    /// Sandbox cho MCP stdio trên Linux. Mặc định tắt để tương thích với
+    /// server cần cache/network; bật trong `mcp.json` hoặc Settings.
+    #[serde(default)]
+    pub sandbox: McpSandboxSettings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpSandboxSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// MCP server thường cần mạng để tải package; mặc định chặn.
+    #[serde(default)]
+    pub allow_network: bool,
+    /// Các thư mục bind read-write thêm, ví dụ `~/.npm`.
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -115,6 +137,8 @@ pub struct McpServerStatus {
     pub ok: bool,
     pub tools: Vec<String>,
     pub error: Option<String>,
+    pub oauth: bool,
+    pub authorized: bool,
 }
 
 pub struct McpDiscovery {
@@ -153,16 +177,17 @@ pub fn load_project_config(root: impl AsRef<Path>) -> Result<McpConfig, McpError
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// Nạp cấu hình dự án nhưng không bao giờ làm hỏng phiên chat.
+/// Nạp cấu hình nhưng không bao giờ làm hỏng phiên chat.
 ///
-/// `.tez/mcp.json` do repo kiểm soát nên có thể hỏng, quá lớn hoặc bị sửa bởi
-/// người khác. Khi đó chỉ cảnh báo và bỏ qua file, không trả lỗi cho caller.
-fn load_project_config_lenient(root: impl AsRef<Path>) -> McpConfig {
-    let path = project_config_path(root);
+/// `mcp.json` toàn cục và `.tez/mcp.json` của dự án đều có thể hỏng, quá lớn
+/// hoặc bị sửa bởi người khác. Khi đó chỉ cảnh báo và bỏ qua file, không trả
+/// lỗi cho caller. Cấu hình sai vẫn hiện lỗi rõ trong màn hình Settings vì
+/// phần đó dùng [`load_config`] nghiêm ngặt.
+fn read_config_lenient(path: &Path) -> McpConfig {
     if !path.exists() {
         return McpConfig::default();
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!(
@@ -182,6 +207,14 @@ fn load_project_config_lenient(root: impl AsRef<Path>) -> McpConfig {
             McpConfig::default()
         }
     }
+}
+
+fn load_config_lenient(dir: impl AsRef<Path>) -> McpConfig {
+    read_config_lenient(&config_path(dir))
+}
+
+fn load_project_config_lenient(root: impl AsRef<Path>) -> McpConfig {
+    read_config_lenient(&project_config_path(root))
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -206,11 +239,68 @@ fn trusted_read_only(source: &str, config: &McpServerConfig) -> bool {
     source == "user" && config.read_only
 }
 
+/// Ghi `mcp.json` atomically.
+///
+/// Ghi ra file tạm cùng thư mục rồi rename để lần đọc đồng thời không thấy
+/// file dở dang. Nếu file cũ không parse được, giữ một bản backup trước khi
+/// ghi đè để người dùng còn dữ liệu khôi phục.
 pub fn save_config(dir: impl AsRef<Path>, config: &McpConfig) -> Result<(), McpError> {
     let path = config_path(dir);
-    std::fs::write(&path, serde_json::to_vec_pretty(config)?)?;
-    restrict_permissions(&path)?;
-    Ok(())
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    backup_if_corrupt(&path);
+
+    let bytes = serde_json::to_vec_pretty(config)?;
+    let temp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let result = (|| -> Result<(), McpError> {
+        {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            use std::io::Write;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        restrict_permissions(&temp)?;
+        std::fs::rename(&temp, &path)?;
+        restrict_permissions(&path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Đổi tên file hỏng thành `mcp.json.corrupt-<timestamp>-<pid>`.
+fn backup_if_corrupt(path: &Path) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    if serde_json::from_slice::<McpConfig>(&bytes).is_ok() {
+        return;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("json.corrupt-{timestamp}-{}", std::process::id()));
+    match std::fs::rename(path, &backup) {
+        Ok(()) => eprintln!(
+            "[mcp] file cấu hình hỏng đã được sao lưu tại '{}'",
+            backup.display()
+        ),
+        Err(error) => eprintln!(
+            "[mcp] không sao lưu được file cấu hình hỏng '{}': {error}",
+            path.display()
+        ),
+    }
 }
 
 /// Gộp server từ `mcp.json` toàn cục và từ plugin. Server user định nghĩa được ưu tiên.
@@ -226,7 +316,7 @@ pub fn load_servers_with_project(
     project_root: Option<&Path>,
 ) -> Result<Vec<ServerEntry>, McpError> {
     let dir = dir.as_ref();
-    let config = load_config(dir)?;
+    let config = load_config_lenient(dir);
     let mut entries: Vec<ServerEntry> = config
         .servers
         .into_iter()
@@ -295,13 +385,20 @@ pub async fn discover_with_project(
     dir: impl AsRef<Path>,
     project_root: Option<&Path>,
 ) -> Result<McpDiscovery, McpError> {
-    let entries = load_servers_with_project(dir, project_root)?;
+    let dir = dir.as_ref().to_path_buf();
+    let entries = load_servers_with_project(&dir, project_root)?;
     let mut tools = Vec::new();
     let mut extras = Vec::new();
     let mut servers = Vec::new();
     let mut read_only_tools = Vec::new();
 
     for entry in entries {
+        let has_oauth = entry.config.oauth.is_some();
+        let authorized = entry
+            .config
+            .oauth
+            .as_ref()
+            .is_some_and(|config| oauth::status(&dir, &entry.name, config).authorized);
         if !entry.config.enabled {
             servers.push(McpServerStatus {
                 name: entry.name,
@@ -309,12 +406,14 @@ pub async fn discover_with_project(
                 ok: false,
                 tools: Vec::new(),
                 error: Some("đang tắt".to_string()),
+                oauth: has_oauth,
+                authorized,
             });
             continue;
         }
 
         let read_only = trusted_read_only(&entry.source, &entry.config);
-        match McpClient::connect(&entry.name, &entry.config).await {
+        match McpClient::connect(&entry.name, &entry.config, Some(&dir)).await {
             Ok((client, infos)) => {
                 let tool_names = infos.iter().map(|info| info.name.clone()).collect();
                 for info in infos {
@@ -336,6 +435,8 @@ pub async fn discover_with_project(
                     ok: true,
                     tools: tool_names,
                     error: None,
+                    oauth: has_oauth,
+                    authorized,
                 });
             }
             Err(error) => servers.push(McpServerStatus {
@@ -344,6 +445,8 @@ pub async fn discover_with_project(
                 ok: false,
                 tools: Vec::new(),
                 error: Some(error.to_string()),
+                oauth: has_oauth,
+                authorized,
             }),
         }
     }
@@ -506,8 +609,9 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn connect(
-        _server: &str,
+        server: &str,
         config: &McpServerConfig,
+        token_dir: Option<&Path>,
     ) -> Result<(Arc<Self>, Vec<McpToolInfo>), McpError> {
         let use_http = config
             .url
@@ -515,9 +619,9 @@ impl McpClient {
             .map(str::trim)
             .is_some_and(|url| !url.is_empty());
         let mut transport: Box<dyn McpTransport> = if use_http {
-            Box::new(HttpConnection::connect(config).await?)
+            Box::new(HttpConnection::connect(config, server, token_dir).await?)
         } else {
-            Box::new(StdioConnection::connect(config)?)
+            Box::new(StdioConnection::connect(config, token_dir)?)
         };
 
         let protocol = transport.protocol_version();
@@ -619,6 +723,55 @@ impl McpClient {
     }
 }
 
+/// Chỉ chuyển các biến môi trường cần thiết sang MCP server stdio.
+fn inherit_safe_env(command: &mut Command) {
+    command.env_clear();
+    #[cfg(windows)]
+    let keys = [
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERNAME",
+        "LANG",
+    ];
+    #[cfg(not(windows))]
+    let keys = [
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR",
+    ];
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+}
+
+/// Mở rộng `~` và đường dẫn tương đối cho `writable_paths` của sandbox MCP.
+fn expand_user_path(value: &str, cwd: &Path) -> PathBuf {
+    if value == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf());
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 struct StdioConnection {
     child: Child,
     stdin: ChildStdin,
@@ -627,23 +780,69 @@ struct StdioConnection {
 }
 
 impl StdioConnection {
-    fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+    fn connect(config: &McpServerConfig, data_dir: Option<&Path>) -> Result<Self, McpError> {
         if config.command.trim().is_empty() {
             return Err(McpError::Spawn(
                 "thiếu command và url cho MCP server".into(),
             ));
         }
-        let mut command = Command::new(&config.command);
+        let mut command = if config.sandbox.enabled {
+            let data_dir = data_dir.ok_or_else(|| {
+                McpError::Spawn("sandbox MCP cần data dir của app để ẩn secret".into())
+            })?;
+            let cwd = config.cwd.as_deref().map(PathBuf::from).unwrap_or(
+                std::env::current_dir().map_err(|error| {
+                    McpError::Spawn(format!("không lấy được cwd hiện tại: {error}"))
+                })?,
+            );
+            let cwd = if cwd.is_absolute() {
+                cwd
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| {
+                        McpError::Spawn(format!("không lấy được cwd hiện tại: {error}"))
+                    })?
+                    .join(cwd)
+            };
+            let writable: Vec<PathBuf> = config
+                .sandbox
+                .writable_paths
+                .iter()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| expand_user_path(value.trim(), &cwd))
+                .collect();
+            let policy = crate::sandbox::SandboxPolicy {
+                enabled: true,
+                allow_network: config.sandbox.allow_network,
+                data_dir: data_dir.to_path_buf(),
+            };
+            let mut command = crate::sandbox::build_mcp_command(
+                &policy,
+                &cwd,
+                &writable,
+                &config.command,
+                &config.args,
+            )
+            .map_err(McpError::Spawn)?;
+            command.envs(&config.env);
+            command
+        } else {
+            let mut command = Command::new(&config.command);
+            // Không để server kế thừa toàn bộ env của app (API key, token...).
+            // Chỉ giữ các biến cần để chạy process; server cần gì thêm thì khai
+            // báo trong `env` của `mcp.json`.
+            inherit_safe_env(&mut command);
+            command.args(&config.args).envs(&config.env);
+            if let Some(cwd) = &config.cwd {
+                command.current_dir(cwd);
+            }
+            command
+        };
         command
-            .args(&config.args)
-            .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if let Some(cwd) = &config.cwd {
-            command.current_dir(cwd);
-        }
 
         let mut child = command
             .spawn()
@@ -854,10 +1053,17 @@ struct HttpConnection {
     headers: HashMap<String, String>,
     session_id: Option<String>,
     next_id: u64,
+    oauth: Option<OAuthConfig>,
+    server: String,
+    token_dir: Option<PathBuf>,
 }
 
 impl HttpConnection {
-    async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+    async fn connect(
+        config: &McpServerConfig,
+        server: &str,
+        token_dir: Option<&Path>,
+    ) -> Result<Self, McpError> {
         let raw = config
             .url
             .as_deref()
@@ -877,16 +1083,34 @@ impl HttpConnection {
             .user_agent("tez/0.1 (+local)")
             .build()
             .map_err(|error| McpError::Http(format!("không tạo được HTTP client: {error}")))?;
+        let mut headers = resolve_http_headers(config)?;
+        if let Some(oauth_config) = &config.oauth {
+            let dir = token_dir.ok_or_else(|| {
+                McpError::Auth(format!(
+                    "server '{server}' dùng OAuth nhưng thiếu thư mục token"
+                ))
+            })?;
+            let token = oauth::access_token(dir, server, oauth_config)
+                .await
+                .map_err(|error| McpError::Auth(error.to_string()))?;
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", token.trim()),
+            );
+        }
         Ok(Self {
             client,
             url: raw.to_string(),
-            headers: resolve_http_headers(config)?,
+            headers,
             session_id: None,
             next_id: 1,
+            oauth: config.oauth.clone(),
+            server: server.to_string(),
+            token_dir: token_dir.map(Path::to_path_buf),
         })
     }
 
-    async fn post(&mut self, payload: &Value) -> Result<reqwest::Response, McpError> {
+    async fn send(&mut self, payload: &Value) -> Result<reqwest::Response, McpError> {
         let mut request = self
             .client
             .post(&self.url)
@@ -912,6 +1136,25 @@ impl HttpConnection {
             .and_then(|value| value.to_str().ok())
         {
             self.session_id = Some(session.to_string());
+        }
+        Ok(response)
+    }
+
+    async fn post(&mut self, payload: &Value) -> Result<reqwest::Response, McpError> {
+        let mut response = self.send(payload).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let (Some(config), Some(dir)) = (self.oauth.clone(), self.token_dir.clone()) {
+                if let Some(previous) = oauth::load_token(&dir, &self.server, &config) {
+                    let refreshed = oauth::refresh_token(&dir, &self.server, &config, &previous)
+                        .await
+                        .map_err(|error| McpError::Auth(error.to_string()))?;
+                    self.headers.insert(
+                        "Authorization".to_string(),
+                        format!("Bearer {}", refreshed.access_token.trim()),
+                    );
+                    response = self.send(payload).await?;
+                }
+            }
         }
         let status = response.status();
         if !status.is_success() {
@@ -1311,11 +1554,40 @@ mod tests {
                 url: None,
                 headers: HashMap::new(),
                 bearer_token_env: None,
+                oauth: None,
+                sandbox: McpSandboxSettings::default(),
             },
         );
         save_config(dir.path(), &config).unwrap();
         let loaded = load_config(dir.path()).unwrap();
         assert_eq!(loaded.servers["demo"].command, "python3");
+    }
+
+    #[test]
+    fn malformed_global_config_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(config_path(dir.path()), "{not json").unwrap();
+
+        let entries = load_servers_with_project(dir.path(), None).unwrap();
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn save_config_backs_up_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path(dir.path());
+        std::fs::write(&path, "{not json").unwrap();
+
+        save_config(dir.path(), &McpConfig::default()).unwrap();
+
+        assert!(load_config(dir.path()).is_ok());
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(backups, 1);
     }
 
     #[test]
@@ -1336,6 +1608,8 @@ mod tests {
                 url: None,
                 headers: HashMap::new(),
                 bearer_token_env: None,
+                oauth: None,
+                sandbox: McpSandboxSettings::default(),
             },
         );
         save_config(data.path(), &config).unwrap();
@@ -1372,6 +1646,8 @@ mod tests {
                 url: None,
                 headers: HashMap::new(),
                 bearer_token_env: None,
+                oauth: None,
+                sandbox: McpSandboxSettings::default(),
             },
         );
         save_config(data.path(), &config).unwrap();
@@ -1546,8 +1822,10 @@ mod tests {
             url: Some(format!("http://{address}/mcp")),
             headers: HashMap::new(),
             bearer_token_env: None,
+            oauth: None,
+            sandbox: McpSandboxSettings::default(),
         };
-        let (client, tools) = McpClient::connect("http", &config).await.unwrap();
+        let (client, tools) = McpClient::connect("http", &config, None).await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
 
@@ -1697,8 +1975,10 @@ mod tests {
             url: Some(format!("http://{address}/mcp")),
             headers: HashMap::new(),
             bearer_token_env: None,
+            oauth: None,
+            sandbox: McpSandboxSettings::default(),
         };
-        let (client, tools) = McpClient::connect("http", &config).await.unwrap();
+        let (client, tools) = McpClient::connect("http", &config, None).await.unwrap();
         assert!(tools.is_empty());
         assert!(client.supports("resources"));
         assert!(client.supports("prompts"));
@@ -1768,6 +2048,8 @@ mod tests {
             url: None,
             headers: HashMap::new(),
             bearer_token_env: None,
+            oauth: None,
+            sandbox: McpSandboxSettings::default(),
         };
         assert!(trusted_read_only("user", &user_read_only));
         assert!(!trusted_read_only("project", &user_read_only));
@@ -1785,6 +2067,8 @@ mod tests {
             url: Some("https://example.com/mcp".into()),
             headers,
             bearer_token_env: bearer.map(str::to_string),
+            oauth: None,
+            sandbox: McpSandboxSettings::default(),
         }
     }
 

@@ -11,7 +11,7 @@
 | Lợi ích | Ý nghĩa |
 |---|---|
 | **0 đồng hosting** | Không server, không DB cloud. Chỉ GitHub Releases. |
-| **Key không rời máy** | API key/OAuth token trong OS keychain + SQLite mã hóa. |
+| **Key không rời máy** | API key/OAuth token mã hóa AES-256-GCM bằng `master.key` quyền `0600` trong data dir; OS keychain là kế hoạch. |
 | **Offline** | Ollama/LM Studio khi không có mạng; tài liệu local. |
 | **Phù hợp học sinh/phụ huynh** | Không thu thập dữ liệu trẻ em trên cloud. |
 | **Desktop + CLI share core** | Cùng Rust core, cùng DB, cùng connection. |
@@ -102,10 +102,10 @@ subjects/
 | DB | **SQLite + rusqlite (bundled)** | Local, zero cost; migration SQL idempotent trong `tez-store`. |
 | Vector | **FTS5 + embedding BLOB + cosine** (sqlite-vec sau) | Đơn giản cho <10k chunk. |
 | Serialize | **serde + serde_json** | Tool schema/JSON; chưa dùng schemars/jsonschema. |
-| Credential | **keyring + aes-gcm + argon2** | OS keychain + mã hóa. |
+| Credential | **aes-gcm + master.key 0600** | Mã hóa local; keychain/argon2 là kế hoạch. |
 | CLI | **clap + dialoguer** | Nhanh; ratatui TUI sau. |
 | Tokenizer | **chưa dùng** | Ước lượng context bằng độ dài JSON; thêm `tiktoken-rs` khi cần. |
-| Logging | **tracing + tracing-subscriber** | Debug có cấu trúc. |
+| Logging | **file logger + panic hook** | `logs/tez.log` xoay 5 MB; tracing có cấu trúc là kế hoạch. |
 | Errors | **thiserror (lib) + anyhow (CLI)** | Rõ ràng. |
 | Config | **directories + serde_json** | Chuẩn OS; `harness.json`, `providers.json`. |
 | Test | **cargo test + mock provider** | Unit/integration; `assert_cmd` cho CLI e2e sau. |
@@ -150,6 +150,8 @@ GET  /v1/usage
 tez connect --provider groq
 tez connect --provider ollama
 tez connect --provider custom --base-url <url>
+tez test
+tez eval --suite evals/basic.json
 tez chat "Giải thích borrow checker"
 tez chat --subject math "Giải phương trình 2x + 3 = 7"
 tez chat --mode code --workspace ~/du-an "Sửa lỗi build"
@@ -176,6 +178,10 @@ tez memory forget "Build command"
 tez harness
 tez usage
 tez doctor
+tez backup
+tez backup --list
+tez restore <path> --yes
+tez logs --tail 100
 ```
 
 - `tez chat` không có prompt và không có stdin pipe thì vào chế độ chat
@@ -194,7 +200,15 @@ tez doctor
   thống kê nén đi ra stderr. Desktop stream qua `tez://chat-delta`, CLI qua channel
   `with_stream` và printer stdout riêng.
 - Lỗi trả exit code 1 kèm thông báo. `tez doctor` kiểm tra data dir, provider,
-  DB, skill, MCP, plugin, harness và dung lượng.
+  DB, log, bản sao lưu, skill, MCP, plugin, harness và dung lượng.
+- `tez backup` snapshot DB bằng SQLite backup API + config + skill/plugin/memory
+  vào `backups/tez-backup-*`; manifest có kích thước + SHA-256. `tez restore`
+  kiểm tra manifest, tạo bản an toàn `pre-restore-*` rồi mới ghi đè.
+- `tez logs` đọc `logs/tez.log`; desktop ghi cùng file nên lỗi khi mở từ GUI
+  vẫn xem được.
+- `tez eval` chạy bộ case JSON qua provider, kiểm tra `contains`/`not_contains`,
+  xuất text hoặc `--json`; trả mã thoát khác 0 khi có case fail. Bộ mẫu:
+  `evals/basic.json`.
 
 ---
 
@@ -209,11 +223,11 @@ tez doctor
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
-| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)** |
+| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)**; sandbox stdio tùy chọn (Linux, bubblewrap) với mạng chặn mặc định và `writable_paths` |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
 | **Settings → Harness** | Permission mode, permission rule dạng `allow\|ask\|deny <tool> <pattern>` (bỏ qua `#` comment/dòng trống, lỗi hiện inline và tắt **Lưu**), giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
 | Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
-| Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục |
+| Settings → Data | Đường dẫn dữ liệu, số session, mở thư mục, tạo bản sao lưu và phục hồi từ backup có `manifest.json` |
 | Usage | Token/latency/chi phí ước tính *(kế hoạch)* |
 | About/Doctor | Version, log, health *(kế hoạch)* |
 
@@ -231,11 +245,13 @@ hoạch; bản hiện tại tập trung vào Chat/Plan/Code, extension và harne
 
 ## 8. Credential vault (Rust)
 
-1. Master key 32 byte ngẫu nhiên lưu trong **OS keychain** qua crate `keyring`.
-   - macOS Keychain, Windows Credential Manager, Linux secret-service.
+1. Master key 32 byte ngẫu nhiên lưu trong `master.key` với quyền `0600`.
+   - Hiện tại: file cạnh dữ liệu, có cảnh báo trong README.
+   - Kế hoạch: OS keychain (macOS Keychain, Windows Credential Manager, Linux
+     secret-service) qua crate `keyring`; fallback passphrase → `argon2`.
 2. SQLite lưu ciphertext AES-256-GCM (`aes-gcm` crate).
 3. Chỉ local server decrypt; desktop/CLI không nhận lại secret.
-4. Fallback nếu keychain không có: passphrase → `argon2` → key; hoặc file `0600` + cảnh báo.
+4. Bản sao lưu chứa cả `master.key`; phải bảo vệ thư mục backup như dữ liệu gốc.
 
 ```rust
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::{Aead, OsRng, rand_core::RngCore}};
@@ -308,9 +324,9 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 | Rủi ro | Biện pháp |
 |---|---|
 | Local server (tương lai) | Nếu bật `tez-server`: 127.0.0.1 + bearer token + Origin check; file token `0600`. Hiện desktop gọi Tauri command in-process. |
-| Key rò rỉ | keychain + AES-GCM; redaction; không log header. |
+| Key rò rỉ | AES-GCM với `master.key` quyền `0600` trong data dir (chưa dùng OS keychain); redaction; không log header. Bản backup có chứa `master.key` nên phải bảo vệ. |
 | Key lộ qua renderer | Renderer không nhận secret. |
-| Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; không phải sandbox OS. |
+| Tool nguy hiểm | Trên Linux, `run_command` chạy trong bubblewrap: workspace read-write, data dir/credential bị ẩn, network bị tách mặc định; vẫn qua permission pipeline (deny → ask → allow) và audit/redaction. MCP stdio có sandbox bubblewrap tùy chọn theo server. macOS/Windows chưa có sandbox OS. |
 | MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. |
 | Prompt injection | Tài liệu/tool result là data; delimiter; không thực thi chỉ dẫn; tool allowlist. |
 | Ghi dữ liệu sai | Write/edit tool qua permission; audit JSONL; todo/plan hiển thị để người dùng theo dõi. |
@@ -322,8 +338,9 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 ## 13. Testing
 
 - Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode, MCP read-only), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, plan save/load + schema 6 mục + cap + sanitize tên file, approval fingerprint/TTL, image file storage + `tez-image:` refs, web browser resolver/fallback, MCP HTTP JSON/SSE + session header + resources/prompts formatting + env header expansion/bearer env, store migration v5 và `session_todos`.
-- Integration: mock provider + agent loop; permission denial; subagent; MCP stdio + HTTP JSON/SSE + env headers/bearer + resources/prompts; artifact compaction (`sessions/<id>/tool-results|transcripts`).
+- Integration: mock provider + agent loop; permission denial; subagent; MCP stdio + HTTP JSON/SSE + env headers/bearer + resources/prompts; MCP stdio sandbox bằng bubblewrap (Linux); artifact compaction (`sessions/<id>/tool-results|transcripts`).
 - CLI e2e: `assert_cmd`; connect/chat/tools/context; `--yes`/`--permission`/`--max-steps`; `memory`, `harness`.
+- Eval: parse suite, scoring `contains`/`not_contains`, chạy suite với fake provider; mock HTTP 8/8 case pass.
 - Desktop smoke: Tauri driver/Playwright (sau); preview mock hiện kiểm tra approval modal, Harness dock và Settings → Harness.
 - Frontend: `tsc --noEmit` + Vite build sạch.
 - Migration: schema cũ → v5, không mất dữ liệu; todo của phiên cũ được giữ.

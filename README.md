@@ -36,7 +36,7 @@ Script build bản release rồi cài:
 | Desktop entry | `~/.local/share/applications/tez.desktop` |
 | Icon | `~/.local/share/icons/hicolor/512x512/apps/tez.png` |
 
-Yêu cầu build: Rust stable, Node + pnpm, WebKitGTK/GTK3 dev packages.
+Yêu cầu build: Rust stable, Node + pnpm, WebKitGTK/GTK3 dev packages. Cần thêm gói `bubblewrap` cho sandbox `run_command`/MCP stdio trên Linux (ví dụ `sudo apt install bubblewrap`).
 
 Chạy trực tiếp AppImage vừa build (không cần cài):
 
@@ -83,7 +83,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
 | Harness: permission pipeline 4 mức + rule theo tool/path, approval kèm diff, ghi nhớ approval theo phiên (TTL/số mục tùy chỉnh), hook audit + che bí mật | ✅ |
 | Harness: todo plan, subagent `task`, compaction 4 bước, memory dài hạn | ✅ |
-| `harness.json` + tab **Cài đặt → Agent** (quyền, model, system prompt, ngôn ngữ, nén, memory, hook) | ✅ |
+| `harness.json` + tab **Cài đặt → Agent** (quyền, model, system prompt, ngôn ngữ, nén, memory, hook, sandbox lệnh) | ✅ |
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
 | SQLite: session (kèm mode), message, tool call, todo, token usage | ✅ |
 | Nhiều provider đã lưu, key riêng từng provider, chuyển active | ✅ |
@@ -93,10 +93,11 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Ảnh: đính kèm PNG/JPEG/WebP/GIF (tối đa 4 ảnh, 5 MB/ảnh, tổng 8 MB/lượt), ghi file trong `images/<session>/`; SQLite giữ ref `tez-image:`; gửi lại tối đa 2 lượt user gần nhất | ✅ |
 | MCP client: stdio hoặc Streamable HTTP (`url` + headers; header hỗ trợ `${VAR}` và `bearer_token_env`), `initialize`, `tools/list`, `tools/call`, resources/prompts qua tool `mcp__<server>__extras`, tool trace; server/tool read-only dùng được trong Plan | ✅ |
 | Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
+| Eval hồi quy provider: bộ JSON `evals/*.json`, `tez eval`, CI nightly tùy chọn | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
 | Vault AES-256-GCM cho API key | ✅ |
-| `tez connect`, `test`, `chat`, `update`, `doctor`, `subject`, `sessions`, `usage`, `doc`, `tools`, `provider`, `skills`, `mcp`, `plugins`, `memory`, `harness` | ✅ |
+| `tez connect`, `test`, `eval`, `chat`, `update`, `doctor`, `backup`, `restore`, `logs`, `subject`, `sessions`, `usage`, `doc`, `tools`, `provider`, `skills`, `mcp`, `plugins`, `memory`, `harness` | ✅ |
 | Disk quota + cleanup (`scripts/disk-guard.sh`) | ✅ |
 | RAG PDF/DOCX, context inspector | ⏳ |
 | Tauri desktop: ba chế độ Chat/Plan/Code, tool trace, lịch sử phiên, todo/context dock | ✅ |
@@ -129,6 +130,10 @@ Binary: `target/debug/tez`
 
 # Kiểm tra provider/model/key đã lưu
 ./target/debug/tez test
+
+# Chạy bộ eval hồi quy (mặc định evals/basic.json)
+./target/debug/tez eval
+./target/debug/tez eval --json --min-pass 8
 
 # Chat tổng quát — không cần chọn môn
 ./target/debug/tez chat "Giải thích vì sao bầu trời màu xanh"
@@ -163,6 +168,14 @@ Binary: `target/debug/tez`
 # Kiểm tra / tải cập nhật
 ./target/debug/tez update
 ./target/debug/tez update --download
+
+# Sao lưu / phục hồi dữ liệu local
+./target/debug/tez backup
+./target/debug/tez backup --list
+./target/debug/tez restore ~/.local/share/teaching-ez/backups/tez-backup-... --yes
+
+# Xem log gần nhất (desktop ghi cùng file)
+./target/debug/tez logs --tail 100
 
 # Xem lại
 ./target/debug/tez sessions
@@ -257,10 +270,12 @@ crates/
   tez-core/     agent loop, context builder, subject packs, tools, skills, MCP, plugin
   tez-store/    SQLite schema + session/usage/document repositories
   tez-auth/     AES-256-GCM vault + sổ nhiều provider
+  tez-backup/   snapshot DB + manifest SHA-256, phục hồi có kiểm tra
   tez-update/   kiểm tra/tải bản phát hành từ GitHub Releases
   tez-cli/      binary `tez`
 apps/
   desktop/      React + Vite + Tauri 2
+evals/          bộ eval hồi quy provider (JSON)
 examples/
   plugins/      plugin mẫu (skills + MCP server)
 docs/           kế hoạch, kiến trúc, provider auth, extensions, disk policy
@@ -275,9 +290,11 @@ Dữ liệu người dùng nằm ở `~/.local/share/teaching-ez/`:
 - `mcp.json` — cấu hình MCP server
 - `skills/` — skill Markdown của user
 - `plugins/` — plugin local
-- `harness.json` — permission mode, giới hạn agent, compaction, memory, hook
+- `harness.json` — permission mode, giới hạn agent, compaction, memory, hook, sandbox lệnh
 - `memory/` — bộ nhớ dài hạn (mỗi bản ghi một file Markdown + `MEMORY.md`)
-- `audit.jsonl` — audit log tool call và lần kết thúc phiên
+- `audit.jsonl` — audit log tool call và lần kết thúc phiên (xoay sang `audit.jsonl.1` khi vượt 5 MB)
+- `logs/tez.log` — log ứng dụng/panic của CLI và desktop (xoay sang `tez.log.1` khi vượt 5 MB)
+- `backups/` — bản sao lưu do `tez backup` tạo; chứa cả `master.key` nên phải bảo vệ như dữ liệu gốc
 - `sessions/<id>/` — artifact của compaction (tool result lớn, transcript)
 - `plans/<session>.md` — kế hoạch cuối của phiên Plan (tối đa 200.000 ký tự)
 - `master.key` — khóa vault (quyền 0600)
@@ -326,10 +343,10 @@ Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền m
 - **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), viết **permission rule** dạng `allow|ask|deny <tool> <pattern>` (dòng trống và `#` comment được bỏ qua; lỗi hiện ngay và nút **Lưu** bị tắt khi rule chưa hợp lệ), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, TTL và số mục approval đã nhớ (kèm nút xoá), system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
 - **Cài đặt → Model:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
 - **Cài đặt → Kỹ năng:** xem skill, ngữ cảnh, từ khóa, nội dung Markdown, mở thư mục, hoặc **Tạo với AI** (mô tả → xem trước `SKILL.md` → lưu).
-- **Cài đặt → MCP:** thêm/sửa/xóa server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; **Tạo với AI** sinh cấu hình stdio.
+- **Cài đặt → MCP:** thêm/sửa/xóa server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; bật **Sandbox stdio** (Linux, bubblewrap) với mạng chặn mặc định và danh sách thư mục ghi được; **Tạo với AI** sinh cấu hình stdio.
 - **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục; **Tạo với AI** sinh `plugin.json` + skill.
 - **Cài đặt → Cập nhật:** kiểm tra GitHub Releases, xem ghi chú, tải installer phù hợp, mở file đã tải.
-- **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình.
+- **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình, tạo bản sao lưu và phục hồi từ thư mục backup có `manifest.json`.
 
 AppImage release được build bởi `scripts/install-local.sh` tại:
 
@@ -345,19 +362,20 @@ Chạy không cần FUSE:
 
 ## Giới hạn hiện tại
 
-- Streaming phát text theo từng đoạn; tool call vẫn được gom đủ trong một lượt. Nút dừng có hiệu lực giữa các bước, lệnh đang chạy chưa bị kill.
+- Streaming phát text theo từng đoạn; tool call vẫn được gom đủ trong một lượt. Nút dừng có hiệu lực giữa các bước; khi huỷ, `run_command` dừng cả process group nên process con không tiếp tục chạy.
+- Gọi model tự thử lại tối đa 2 lần với backoff cho HTTP 429/5xx và lỗi kết nối/timeout; tôn trọng `Retry-After` (tối đa 10 giây). Stream chỉ thử lại trước khi server gửi byte đầu tiên.
 - RAG chỉ nhận `.txt`/`.md`; PDF/DOCX/OCR chưa có.
 - `web_fetch` mặc định tải HTML tĩnh, không đảm bảo render đủ JavaScript. `render: "browser"` dùng Chromium/Chrome/Edge headless nếu có (`TEZ_CHROMIUM`, hoặc `chromium`/`chrome`/`msedge` trên `PATH`), timeout 25 s; nếu thiếu browser hoặc browser lỗi, tool tự fallback sang static và ghi rõ lý do. `--no-sandbox` chỉ bật khi `TEZ_BROWSER_NO_SANDBOX=1`. HTML parser vẫn đơn giản (comment/entity số/script tự đóng đã xử lý nhưng thẻ lỗi có thể còn sót); DNS được resolve và pin toàn bộ địa chỉ ở static; browser map toàn bộ địa chỉ qua `--host-resolver-rules` nhưng không revalidate từng redirect; charset UTF-8/Latin-1/Windows-1252; body static cap 512 KB; PDF/audio/video bị từ chối ở static và chưa được trích xuất.
 - Ảnh được ghi thành file trong `images/<session>/<message>-<index>.<ext>`; SQLite chỉ giữ ref `tez-image:` và `load_messages` giải mã lại thành data URL khi resume. DB nhỏ hơn nhiều so với lưu data URL, nhưng thư mục ảnh vẫn lớn dần. UI và backend giới hạn 4 ảnh mới/lượt; UI giới hạn 5 MB/ảnh, backend giới hạn tổng 8 MB/request. Khi gửi lại lịch sử, chỉ ảnh của tối đa 2 lượt user gần nhất được gửi, trong ngân sách 6 ảnh của cả request (ảnh hiện tại được ưu tiên). Ảnh cũ vẫn hiện trong UI/resume nhưng không được gửi lại toàn bộ; chưa hỗ trợ PDF/audio/video.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
-- MCP hỗ trợ stdio và Streamable HTTP; server stdio spawn mỗi lượt chat, timeout 20 giây, chưa sandbox. HTTP dùng POST JSON-RPC + response JSON/SSE; resources/prompts đọc qua tool `mcp__<server>__extras`; chưa hỗ trợ GET stream server-initiated hay OAuth flow đầy đủ; header hỗ trợ `${VAR}` và `bearer_token_env`. Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
+- MCP hỗ trợ stdio và Streamable HTTP; server stdio spawn mỗi lượt chat, timeout 20 giây, có thể bật sandbox bubblewrap theo từng server (`sandbox.enabled`): mặc định chặn mạng, ẩn secret trong data dir, chỉ bind thêm các đường dẫn trong `writable_paths`; process chỉ kế thừa env cơ bản, không kế thừa API key/token của app. HTTP dùng POST JSON-RPC + response JSON/SSE; hỗ trợ OAuth 2.1 + PKCE với redirect loopback, token lưu ngoài `mcp.json`; chưa hỗ trợ GET stream server-initiated. Header hỗ trợ `${VAR}` và `bearer_token_env`. `mcp.json` hỏng được bỏ qua kèm cảnh báo thay vì chặn phiên chat; file hỏng được sao lưu trước khi ghi đè. Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
 - Plan lưu nguyên văn câu trả lời cuối vào `plans/<session>.md` (tối đa 200.000 ký tự); desktop chỉ nạp lại khi chuyển trực tiếp Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn). Kế hoạch có schema Markdown 6 mục (`Mục tiêu`, `Phạm vi`, `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`); desktop PlanDialog có form nhập từng mục bên cạnh Markdown đầy đủ, cảnh báo mục thiếu; **Lưu kế hoạch** chặn nếu chưa đủ, **Lưu nháp** cho phép giữ bản chưa hoàn chỉnh, CLI in cảnh báo ra stderr. Form giữ nguyên các mục Markdown khác ngoài 6 mục bắt buộc.
 - **Cho phép thao tác này trong phiên hiện tại** được lưu vào `approvals.json` trong data dir; TTL và số mục tối đa chỉnh trong **Cài đặt → Agent** (mặc định 7 ngày / 200 mục), có nút xoá toàn bộ approval đã nhớ. Khóa theo `session_id|tool|path/command|fingerprint(args)`, nên cùng đường dẫn nhưng nội dung hoặc tham số khác sẽ hỏi lại. File corrupt bị bỏ qua và ghi log.
 - Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.
 - Skill dùng hai tầng: catalog rút gọn theo nguồn trong system prompt và tool `skill` (không tên = danh mục đầy đủ, có tên = body tối đa 12.000 ký tự). Skill vẫn là prompt pack, không chạy code; bốn skill seed nằm trong `skills/` nên hiện nguồn `user`.
-- Code mode giới hạn đường dẫn ở tầng ứng dụng, chưa phải sandbox OS; `run_command` chạy bằng quyền của user.
+- Code mode giới hạn đường dẫn ở tầng ứng dụng. Trên Linux, `run_command` mặc định chạy trong bubblewrap: workspace được bind read-write, data dir và credential trong HOME bị ẩn, network namespace bị tách (chặn egress) trừ khi bật `sandbox.allow_network`. Cần gói `bubblewrap`; nếu thiếu `bwrap`, lệnh bị từ chối thay vì chạy không sandbox. Trên macOS/Windows sandbox OS chưa có, nên chỉ mở workspace tin cậy.
 - Permission pipeline và hook là lớp kiểm soát của app, không thay thế sandbox hệ điều hành; deny-list chỉ chặn các mẫu phá hủy rõ ràng.
-- Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu).
+- Memory dùng chấm điểm từ khoá, chưa có embedding; compaction có thể mất chi tiết nếu phải tóm tắt bằng model (transcript vẫn được lưu). Mặc định nén sớm ở 24.000 ký tự JSON: micro-compact ở 80%, summary ở 90%, và tự thử summary khi provider trả `400 Invalid request`/`413` lúc context đã chịu áp lực.
 - Cập nhật không tự động cài: người dùng bấm tải rồi chạy installer.
 - Installer Windows có trong workflow release nhưng chưa được ký số (SmartScreen có thể cảnh báo).
 - Chưa có sync đa máy; dữ liệu nằm trên máy bạn.
@@ -370,6 +388,7 @@ Chạy không cần FUSE:
 - [Kết nối AI (BYOK)](docs/PROVIDER-AUTH.md)
 - [Skills, MCP và plugin](docs/EXTENSIONS.md)
 - [Chính sách dung lượng](docs/DISK-POLICY.md)
+- [Đánh giá mức sẵn sàng production](docs/PRODUCTION-READINESS.md)
 - [Windows: cài đặt, build, cập nhật](docs/WINDOWS.md)
 - [Kiểm tra và cập nhật phiên bản](docs/UPDATING.md)
 
@@ -378,5 +397,5 @@ Chạy không cần FUSE:
 1. RAG PDF/DOCX + OCR, `context inspect` để xem token từng phần.
 2. Lưu connection vào SQLite + OS keychain (thay master key file).
 3. Thêm tool Anh (`vocabulary_lookup`) và eval 8 case/môn.
-4. MCP HTTP GET stream + OAuth, multimodal đầy đủ (PDF/audio) và hoàn thiện render JavaScript cho `web_fetch` (sandbox, độ ổn định).
+4. MCP HTTP GET stream, multimodal đầy đủ (PDF/audio) và hoàn thiện render JavaScript cho `web_fetch` (sandbox, độ ổn định).
 5. Ký số installer Windows và bật auto-update có xác minh chữ ký.

@@ -88,7 +88,12 @@ Có hai transport:
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/ban/notes"],
       "env": {},
       "cwd": null,
-      "enabled": true
+      "enabled": true,
+      "sandbox": {
+        "enabled": true,
+        "allow_network": false,
+        "writable_paths": ["/home/ban/notes", "~/.npm"]
+      }
     },
     "remote-docs": {
       "url": "https://mcp.example.com/mcp",
@@ -109,6 +114,7 @@ Có hai transport:
 | `env` | Biến môi trường bổ sung cho stdio. |
 | `cwd` | Thư mục làm việc cho stdio; plugin mặc định dùng thư mục plugin. |
 | `enabled` | `false` để tạm tắt mà không xóa cấu hình. |
+| `sandbox` | Tùy chọn sandbox stdio trên Linux: `{ "enabled": true, "allow_network": false, "writable_paths": [...] }`. Bật thì cần `bubblewrap`; thiếu `bwrap` server bị từ chối, không chạy không sandbox. Mặc định chặn mạng, ẩn secret trong data dir và credential trong HOME; `writable_paths` được bind read-write (không được trỏ vào data dir). |
 | `read_only` | `true` để ép mọi tool của server được coi là chỉ đọc. Alias khi đọc file: `readOnly`. |
 
 Đường dẫn: `~/.local/share/teaching-ez/mcp.json`. Desktop ghi khóa này dưới dạng `read_only`; `readOnly` được chấp nhận khi bạn sửa file bằng tay.
@@ -120,7 +126,7 @@ Ngoài `read_only` ở cấp server, tool có thể tự khai báo chỉ đọc 
 - **Plan** chỉ đăng ký các tool MCP được đánh dấu chỉ đọc; tool MCP thay đổi trạng thái không vào Plan.
 - Permission policy cho qua tool read-only sau deny-list và rule `deny`, kể cả khi mode là `read_only`. Rule `ask`/`strict` không hỏi lại các tool này.
 - App **tin vào khai báo của server**, không kiểm chứng hành vi thực tế. Một server khai báo sai vẫn có thể thay đổi dữ liệu; chỉ cài server bạn tin tưởng.
-- Tool read-only có thể đọc tài nguyên ngoài workspace tùy server; Plan không sandbox MCP.
+- Tool read-only có thể đọc tài nguyên ngoài workspace tùy server; Plan không sandbox MCP. Kể cả khi bật `sandbox`, server vẫn thấy filesystem gốc ở chế độ chỉ đọc (trừ data dir và credential đã ẩn), nên chỉ cài server bạn tin tưởng.
 
 Desktop có checkbox **Chỉ đọc (cho phép trong Plan)** trong form MCP.
 
@@ -141,11 +147,34 @@ Tool extras luôn được coi là chỉ đọc, nên dùng được trong Plan 
 
 Tool được đặt tên `mcp__<server>__<tool>` và làm sạch ký tự để tương thích OpenAI function calling, tối đa 64 ký tự. Ví dụ server `study`, tool `echo` → `mcp__study__echo`.
 
+### OAuth cho MCP HTTP
+
+Server Streamable HTTP có thể dùng OAuth 2.1 + PKCE. Khai báo trong `mcp.json`:
+
+```json
+{
+  "servers": {
+    "remote": {
+      "url": "https://mcp.example.com/mcp",
+      "oauth": {
+        "authorization_url": "https://auth.example.com/authorize",
+        "token_url": "https://auth.example.com/token",
+        "client_id": "tez",
+        "scopes": ["mcp:read", "mcp:write"]
+      }
+    }
+  }
+}
+```
+
+`client_secret` chỉ nên đặt qua biến môi trường và trỏ bằng `client_secret_env`. Luồng uỷ quyền dùng redirect loopback, kiểm tra `state`, lưu token tại `oauth.json` với quyền 0600 và tự refresh trước khi hết hạn. Trong **Cài đặt → MCP**, nút uỷ quyền hiện trạng thái và mở trình duyệt; token không được ghi vào `mcp.json` hay audit log.
+
 ### Giới hạn hiện tại
 
-- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated hay OAuth flow đầy đủ; header hỗ trợ `${VAR}` và `bearer_token_env`. Resources/prompts chỉ đọc qua tool extras, không có UI riêng.
+- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated; header hỗ trợ `${VAR}` và `bearer_token_env`. Resources/prompts chỉ đọc qua tool extras, không có UI riêng.
+- `mcp.json` hỏng không chặn phiên chat: server từ file đó bị bỏ qua kèm cảnh báo. Khi lưu từ Settings, file hỏng cũ được đổi tên thành `mcp.json.corrupt-<timestamp>-<pid>` trước khi ghi file mới atomically.
 - Timeout khởi động/gọi: 20 giây; stderr của server stdio bị bỏ qua.
-- Server stdio chạy dưới quyền user hiện tại, **chưa có sandbox**. Chỉ cài server bạn tin tưởng.
+- Server stdio mặc định chạy dưới quyền user hiện tại; có thể bật sandbox bubblewrap theo từng server trên Linux. Khi bật: mạng bị chặn trừ khi `allow_network`, data dir và credential trong HOME bị ẩn, chỉ các đường dẫn trong `writable_paths` được ghi; thiếu `bwrap` thì server bị từ chối thay vì chạy không sandbox. macOS/Windows chưa có sandbox OS cho MCP. Chỉ cài server bạn tin tưởng. Process chỉ kế thừa các biến môi trường cơ bản (`PATH`, `HOME`, `LANG`, ...), không kế thừa API key/token của app; biến bổ sung phải khai báo trong `env`.
 - Server stdio được spawn lại mỗi lượt chat; chưa giữ process dài hạn. HTTP dùng client mới mỗi lượt.
 
 ### CLI

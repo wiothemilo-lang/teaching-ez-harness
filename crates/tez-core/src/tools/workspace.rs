@@ -919,11 +919,23 @@ fn append_walk_truncation(text: &mut String, truncated: bool) {
 /// Chạy một lệnh shell trong workspace.
 pub struct RunCommand {
     workspace: Workspace,
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
 }
 
 impl RunCommand {
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            sandbox: None,
+        }
+    }
+
+    /// Chạy lệnh trong sandbox OS (bubblewrap trên Linux).
+    pub fn with_sandbox(workspace: Workspace, policy: crate::sandbox::SandboxPolicy) -> Self {
+        Self {
+            workspace,
+            sandbox: Some(policy),
+        }
     }
 }
 
@@ -976,9 +988,14 @@ impl Tool for RunCommand {
         };
         #[cfg(not(windows))]
         let mut process = {
-            let mut process = tokio::process::Command::new("sh");
-            process.args(["-c", command]);
-            process
+            if let Some(policy) = self.sandbox.as_ref().filter(|policy| policy.enabled) {
+                crate::sandbox::build_command(policy, self.workspace.root(), &cwd, command)
+                    .map_err(ToolError::Execution)?
+            } else {
+                let mut process = tokio::process::Command::new("sh");
+                process.args(["-c", command]);
+                process
+            }
         };
 
         process
@@ -996,6 +1013,9 @@ impl Tool for RunCommand {
             .spawn()
             .map_err(|error| ToolError::Execution(format!("không chạy được lệnh: {error}")))?;
         let pid = child.id();
+        // Nếu agent huỷ giữa chừng, future bị drop và `kill_on_drop` chỉ dừng
+        // process trực tiếp. Guard này dừng cả process group (process cháu).
+        let mut tree_guard = ProcessTreeGuard::new(pid);
         let stdout = child
             .stdout
             .take()
@@ -1012,6 +1032,9 @@ impl Tool for RunCommand {
 
         match result {
             Ok(Ok(status)) => {
+                // Process đã được reap; không giữ pid nữa để tránh kill nhầm
+                // process khác nếu pid được tái sử dụng.
+                tree_guard.disarm();
                 // Đọc stdout/stderr song song. Process cháu có thể giữ một
                 // trong hai pipe mở; nếu một reader timeout thì phải dừng cả
                 // cây lệnh, không chỉ bỏ qua reader đó.
@@ -1058,15 +1081,11 @@ impl Tool for RunCommand {
                 }
             }
             Ok(Err(error)) => {
-                if let Some(pid) = pid {
-                    kill_process_tree(pid);
-                }
+                tree_guard.kill();
                 Ok(ToolOutput::error(format!("lỗi khi chờ lệnh: {error}")))
             }
             Err(_) => {
-                if let Some(pid) = pid {
-                    kill_process_tree(pid);
-                }
+                tree_guard.kill();
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                     let _ = stdout_task.await;
@@ -1109,6 +1128,34 @@ async fn join_reader(handle: tokio::task::JoinHandle<(String, usize)>) -> Option
     match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
         Ok(Ok(value)) => Some(value),
         _ => None,
+    }
+}
+
+/// Dừng cả process group khi future bị huỷ (agent cancel hoặc timeout ngoài).
+struct ProcessTreeGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    /// Process đã được reap: không kill nữa để tránh pid được tái sử dụng.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    fn kill(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            kill_process_tree(pid);
+        }
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -1187,6 +1234,70 @@ mod tests {
         let output = tool.execute(json!({"command": command})).await.unwrap();
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("hello"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_hides_app_data_dir() {
+        if crate::sandbox::probe().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let root = data.join("workspaces/default");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(data.join("master.key"), "SUPER_SECRET").unwrap();
+        std::fs::write(root.join("visible.txt"), "VISIBLE").unwrap();
+
+        let workspace = Workspace::new(&root).unwrap();
+        let policy = crate::sandbox::SandboxPolicy {
+            enabled: true,
+            allow_network: false,
+            data_dir: data.clone(),
+        };
+        let tool = RunCommand::with_sandbox(workspace, policy);
+        let output = tool
+            .execute(json!({
+                "command": format!(
+                    "cat '{}' 2>&1; cat '{}'",
+                    data.join("master.key").display(),
+                    root.join("visible.txt").display()
+                )
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !output.content.contains("SUPER_SECRET"),
+            "{}",
+            output.content
+        );
+        assert!(output.content.contains("VISIBLE"), "{}", output.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_command_kills_child_processes() {
+        let (dir, workspace) = workspace();
+        let marker = dir.path().join("child-survived");
+        // Subshell giữ một process cháu sống lâu hơn shell trực tiếp. Nếu chỉ
+        // shell bị kill, subshell vẫn tạo marker sau khi sleep kết thúc.
+        let command = format!("(sleep 1; touch '{}') & wait", marker.display());
+        let tool = RunCommand::new(workspace);
+        let handle = tokio::spawn(async move {
+            let _ = tool
+                .execute(json!({"command": command, "timeout_secs": 30}))
+                .await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "process cháu vẫn chạy sau khi lệnh bị huỷ"
+        );
     }
 
     #[cfg(unix)]
