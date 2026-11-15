@@ -69,9 +69,14 @@ tez skills show step-by-step
 
 ---
 
-## 2. MCP — công cụ ngoài qua stdio
+## 2. MCP — công cụ ngoài qua stdio hoặc HTTP
 
-tez là MCP client tối giản: spawn server, gọi `initialize`, `tools/list`, `tools/call`, rồi tắt server khi lượt chat kết thúc. Tool MCP được đăng ký cùng registry với tool built-in và xuất hiện trong trace của desktop/CLI.
+tez là MCP client tối giản: gọi `initialize`, `tools/list`, `tools/call`, rồi đóng kết nối khi lượt chat kết thúc. Tool MCP được đăng ký cùng registry với tool built-in và xuất hiện trong trace của desktop/CLI.
+
+Có hai transport:
+
+- **stdio**: spawn `command` + `args`, JSON-RPC theo dòng, protocol `2024-11-05`.
+- **Streamable HTTP**: POST JSON-RPC tới `url`, nhận response JSON hoặc SSE, giữ `Mcp-Session-Id` do server trả về, protocol `2025-03-26`.
 
 ### Cấu hình `mcp.json`
 
@@ -84,6 +89,11 @@ tez là MCP client tối giản: spawn server, gọi `initialize`, `tools/list`,
       "env": {},
       "cwd": null,
       "enabled": true
+    },
+    "remote-docs": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer <token>" },
+      "enabled": true
     }
   }
 }
@@ -91,10 +101,12 @@ tez là MCP client tối giản: spawn server, gọi `initialize`, `tools/list`,
 
 | Trường | Ý nghĩa |
 |---|---|
-| `command` | Chương trình chạy server, phải có trên `PATH`. |
-| `args` | Mảng tham số. |
-| `env` | Biến môi trường bổ sung. |
-| `cwd` | Thư mục làm việc; plugin mặc định dùng thư mục plugin. |
+| `command` | Chương trình chạy server stdio, phải có trên `PATH`. Bỏ trống nếu dùng `url`. |
+| `args` | Mảng tham số cho stdio. |
+| `url` | Endpoint Streamable HTTP. Có `url` thì tez dùng HTTP thay vì spawn process. |
+| `headers` | Header gửi kèm mỗi request HTTP, ví dụ `Authorization`. Không nên đặt secret trực tiếp nếu file bị chia sẻ. |
+| `env` | Biến môi trường bổ sung cho stdio. |
+| `cwd` | Thư mục làm việc cho stdio; plugin mặc định dùng thư mục plugin. |
 | `enabled` | `false` để tạm tắt mà không xóa cấu hình. |
 | `read_only` | `true` để ép mọi tool của server được coi là chỉ đọc. Alias khi đọc file: `readOnly`. |
 
@@ -117,10 +129,10 @@ Tool được đặt tên `mcp__<server>__<tool>` và làm sạch ký tự để
 
 ### Giới hạn hiện tại
 
-- Chỉ transport **stdio**. HTTP/SSE chưa hỗ trợ.
-- Timeout khởi động/gọi: 20 giây; stderr của server bị bỏ qua.
-- Server chạy dưới quyền user hiện tại, **chưa có sandbox**. Chỉ cài server bạn tin tưởng.
-- Server được spawn lại mỗi lượt chat; chưa giữ process dài hạn.
+- HTTP chỉ dùng POST JSON-RPC + response JSON/SSE; chưa hỗ trợ GET stream server-initiated, resources/prompts hay OAuth. Header auth phải cấu hình tĩnh trong `headers`.
+- Timeout khởi động/gọi: 20 giây; stderr của server stdio bị bỏ qua.
+- Server stdio chạy dưới quyền user hiện tại, **chưa có sandbox**. Chỉ cài server bạn tin tưởng.
+- Server stdio được spawn lại mỗi lượt chat; chưa giữ process dài hạn. HTTP dùng client mới mỗi lượt.
 
 ### CLI
 

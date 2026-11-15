@@ -3407,3 +3407,16 @@ kbd {
   line-height: 1.6;
   resize: vertical;
 }
+
+.plan-warning {
+  padding: 9px 12px;
+  border: 1px solid rgba(217, 160, 87, 0.35);
+  border-radius: 7px;
+  background: rgba(217, 160, 87, 0.1);
+  color: #d9a057;
+  font-size: 12px;
+}
+
+.plan-warning strong {
+  font-weight: 600;
+}

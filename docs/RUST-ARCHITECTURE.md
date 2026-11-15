@@ -273,6 +273,14 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
   `<skill>` (cap 12.000 ký tự). System prompt chỉ nhận `catalog_overview`:
   mỗi nguồn một dòng, tối đa 12 id tiêu biểu. Skill dự án đứng trước
   user/plugin/built-in; đây là progressive disclosure hai tầng.
+- **MCP** (`mcp.rs`): `McpTransport` trừu tượng hóa stdio và Streamable HTTP.
+  Stdio spawn process, giao tiếp JSON-RPC theo dòng, protocol `2024-11-05`.
+  HTTP dùng POST JSON-RPC tới `url`, gửi `Accept: application/json,
+  text/event-stream`, lưu `Mcp-Session-Id` từ response và gửi lại ở các request
+  sau, đọc response JSON hoặc SSE (`data:` event), protocol `2025-03-26`;
+  `headers` cấu hình được dùng cho auth tĩnh. Cả hai đều gọi `initialize`,
+  `notifications/initialized`, `tools/list`; `tools/call` đi qua cùng trait.
+  Chưa hỗ trợ GET stream server-initiated, resources/prompts hay OAuth.
 - **Web fetch** (`tools/web.rs`): chỉ http/https, chặn userinfo, localhost và IP
   nội bộ (kể cả CGNAT, dải tài liệu IPv6, 6to4). Ở chế độ static, mỗi redirect
   được resolve DNS lại, kiểm tra toàn bộ địa chỉ rồi pin bằng
@@ -301,9 +309,11 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
   `tez://approval-request` + command `respond_approval({ id, approved, remember })`;
   với `write_file` và `edit_file`, desktop đọc file cũ trong
   workspace và gửi kèm unified diff ở `preview` để người dùng duyệt trước khi
-  ghi. Checkbox **Cho phép thao tác này trong phiên hiện tại** khiến broker nhớ
-  khóa `session_id|tool|path` (hoặc command với `run_command`) và tự duyệt các
-  request khớp sau đó; bộ nhớ này chỉ nằm trong tiến trình app. CLI dùng
+  ghi. Checkbox **Cho phép thao tác này trong phiên hiện tại** khiến broker ghi
+  khóa `session_id|tool|path` (hoặc command với `run_command`) vào
+  `approvals.json` trong data dir (giữ 7 ngày, tối đa 200 mục, file 0600, ghi
+  atomic qua file tạm rồi rename) và tự duyệt các request khớp sau đó, kể cả sau
+  khi khởi động lại; file corrupt bị bỏ qua và ghi log. CLI dùng
   `dialoguer::Confirm`, in unified diff trước prompt cho `write_file`/
   `edit_file` (cap 24.000 ký tự), có `--yes` để tự duyệt và `--permission` để
   ghi đè mode.
@@ -420,9 +430,12 @@ tool MCP được khai báo read-only. Tool ghi, chạy lệnh, `task`, `compact
 `memory_save`/`memory_forget` và MCP thay đổi trạng thái không vào Plan. Policy
 bị ép về `read_only` bất kể cấu hình, nên kể cả rule `allow` cũng không mở được
 thao tác thay đổi; riêng tool MCP read-only được policy cho qua sau deny-list và
-rule `deny`. Prompt `plan_system_prompt` yêu cầu agent khảo sát, nêu mục
-tiêu/phạm vi, file sẽ sửa, các bước, rủi ro và cách kiểm chứng, rồi dừng để
-người dùng chuyển sang Code.
+rule `deny`. Prompt `plan_system_prompt` yêu cầu agent khảo sát rồi trình kế
+hoạch đúng schema Markdown 6 mục cấp 2: `Mục tiêu`, `Phạm vi`,
+`File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`, rồi dừng để người dùng
+chuyển sang Code. `plan.rs` parse heading cấp 2 (heading cấp 3 vẫn thuộc mục
+cha), coi mục thiếu hoặc rỗng là chưa hoàn chỉnh; desktop hiện cảnh báo trong
+PlanDialog, CLI in cảnh báo ra stderr nhưng vẫn lưu để người dùng bổ sung.
 
 Mỗi lượt Plan, văn bản cuối được lưu vào `plans/<session>.md` qua
 `crates/tez-core/src/plan.rs`; file bị cap 200.000 ký tự và tên session được làm
@@ -618,7 +631,8 @@ GET  /v1/usage
 - **Không có local HTTP server trong bản hiện tại.** Frontend gọi trực tiếp
   Tauri commands (in-process), không qua axum/SSE.
 - Commands chính:
-  - `app_status`, `list_sessions`, `load_session`, `chat`;
+  - `app_status`, `list_sessions`, `load_session`, `chat`, `stop_chat`;
+  - `load_session_plan`, `save_session_plan`;
   - `respond_approval`, `get_harness`, `save_harness`, `delete_memory`;
   - `list_providers`, `save_provider`, `delete_provider`, `activate_provider`,
     `test_provider`, `test_connection`;
@@ -629,9 +643,10 @@ GET  /v1/usage
 - **Approval flow:** agent gặp call cần duyệt → `DesktopApprover` emit event
   `tez://approval-request` kèm `ApprovalRequest { id, tool, args, reason,
   session_id }` → React mở modal → `respond_approval({ id, approved, remember })`
-  → oneshot trả kết quả cho agent. Nếu `remember` và được duyệt, broker nhớ
-  `session_id|tool|path` (hoặc command) trong bộ nhớ tiến trình và tự duyệt các
-  request khớp sau đó. Timeout 180 s thì từ chối.
+  → oneshot trả kết quả cho agent. Nếu `remember` và được duyệt, broker ghi
+  `session_id|tool|path` (hoặc command) vào `approvals.json` (TTL 7 ngày, tối đa
+  200 mục) và tự duyệt các request khớp sau đó, kể cả sau khi khởi động lại.
+  Timeout 180 s thì từ chối.
 - `ChatReply` trả thêm `todos`, `compactions`, `permission_denials`,
   `stop_reason`; `SessionDetail` trả `todos` đã lưu.
 - Màn hình hiện tại:
@@ -714,7 +729,7 @@ tez update --check-only
 | Rủi ro | Biện pháp |
 |---|---|
 | Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; đây không phải sandbox OS |
-| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; app tin khai báo, không xác minh hành vi |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; app tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers tĩnh) |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
 | Key rò rỉ | Keychain + AES-GCM; redaction; không trả secret |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
@@ -729,13 +744,17 @@ tez update --check-only
 
 - **Unit:** tool math/chemistry/workspace; permission (deny/ask/allow, trust,
   read-only, MCP read-only); compaction 4 bước; memory lưu/tìm/xoá; todo; plan
-  save/load + cap + sanitize tên file; hook block + redaction; harness config
-  sanitize; store migration v5, `session_todos`, image file refs; web_fetch
-  parser, DNS pinning, browser resolver/fallback.
+  save/load + schema 6 mục + cap + sanitize tên file; hook block + redaction;
+  harness config sanitize; approval persistence TTL/corrupt file; store
+  migration v5, `session_todos`, image file refs; web_fetch parser, DNS
+  pinning, browser resolver/fallback; MCP HTTP config, JSON/SSE parsing and
+  session header.
 - **Integration:** mock provider + agent loop; tool call → result → final;
-  permission denial; subagent trả text cuối; MCP stdio.
-- **Số test hiện tại:** `tez-core` 183 + 1 MCP stdio, `tez-auth` 20,
-  `tez-llm` 14, `tez-store` 27, `tez-update` 3; tổng 248. `cargo test
+  permission denial; subagent trả text cuối; MCP stdio; MCP HTTP JSON/SSE +
+  session header.
+- **Số test hiện tại:** `tez-core` 229 + 1 MCP stdio, `tez-auth` 32,
+  `tez-cli` 18, `tez-llm` 14, `tez-store` 28, `tez-update` 16; tổng 338.
+  Desktop `cargo test` trong `apps/desktop/src-tauri` có 8 test. `cargo test
   --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và
   `cargo fmt --all -- --check` sạch.

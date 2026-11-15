@@ -1182,6 +1182,13 @@ impl TurnContext<'_> {
             if let Err(error) = plan::save_plan_if_completed(self.dir, self.session_id, &outcome) {
                 eprintln!("[plan] không lưu được kế hoạch: {error}");
             }
+            let validation = plan::validate(&outcome.text);
+            if !validation.valid {
+                eprintln!(
+                    "[plan] thiếu mục: {} — vẫn lưu để bạn bổ sung",
+                    validation.missing.join(", ")
+                );
+            }
         }
 
         if !streamed.load(Ordering::Relaxed) {

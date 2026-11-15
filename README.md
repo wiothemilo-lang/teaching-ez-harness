@@ -3,7 +3,7 @@
 [![CodeRabbit Reviews](https://img.shields.io/badge/CodeRabbit-reviewed-FF570A?logo=coderabbit&logoColor=white)](https://coderabbit.ai)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Tests](https://img.shields.io/badge/tests-248%20passing-brightgreen)](#build--test)
+[![Tests](https://img.shields.io/badge/tests-338%20passing-brightgreen)](#build--test)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
 [![Local-first](https://img.shields.io/badge/local--first-BYOK-2F7D5B)](docs/DESKTOP-CLI.md)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20Windows-lightgrey?logo=linux&logoColor=black)](#desktop-tauri)
@@ -79,9 +79,9 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Rust workspace (`tez-llm`, `tez-core`, `tez-store`, `tez-auth`, `tez-update`, `tez-cli`) | ✅ |
 | Agent loop: tool call, timeout 60s, cap output 8KB, tối đa 12 bước (chỉnh được) | ✅ |
 | Chat tổng quát (không giới hạn môn) + 4 preset Toán/Lý/Hóa/Anh; gửi kèm ảnh | ✅ |
-| Plan mode: chỉ đọc workspace, khảo sát và trình kế hoạch trước khi sửa; lưu plan vào `plans/<session>.md`; desktop có nút Kế hoạch mở editor | ✅ |
+| Plan mode: chỉ đọc workspace, khảo sát và trình kế hoạch theo 6 mục bắt buộc; lưu plan vào `plans/<session>.md`; desktop có nút Kế hoạch mở editor và cảnh báo mục thiếu | ✅ |
 | Chế độ Code: `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `run_command` trong workspace | ✅ |
-| Harness: permission pipeline 4 mức + rule theo tool/path, approval kèm diff (desktop có nhớ trong phiên), hook audit + che bí mật | ✅ |
+| Harness: permission pipeline 4 mức + rule theo tool/path, approval kèm diff, ghi nhớ approval theo phiên (lưu 7 ngày), hook audit + che bí mật | ✅ |
 | Harness: todo plan, subagent `task`, compaction 4 bước, memory dài hạn | ✅ |
 | `harness.json` + tab **Cài đặt → Agent** (quyền, model, system prompt, ngôn ngữ, nén, memory, hook) | ✅ |
 | 9 tool học tập: tính toán, kiểm tra bước, đổi đơn vị, đọc hiểu, khối lượng mol, cân bằng phương trình, vẽ đồ thị, công thức lý, ngữ pháp | ✅ |
@@ -91,7 +91,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Ngữ cảnh dự án: `AGENTS.md`/`CLAUDE.md`, `.tez/skills`, `.tez/mcp.json` | ✅ |
 | Web: tool `web_fetch` tải http/https, chặn host nội bộ/DNS rebinding, pin toàn bộ địa chỉ DNS, redirect kiểm tra lại (static), lọc HTML, cap 512 KB (static); `render: "browser"` tự fallback static khi thiếu/lỗi, resolver map toàn bộ địa chỉ, `--no-sandbox` chỉ khi `TEZ_BROWSER_NO_SANDBOX=1` | ✅ |
 | Ảnh: đính kèm PNG/JPEG/WebP/GIF (tối đa 4 ảnh, 5 MB/ảnh, tổng 8 MB/lượt), ghi file trong `images/<session>/`; SQLite giữ ref `tez-image:`; gửi lại tối đa 2 lượt user gần nhất | ✅ |
-| MCP stdio client: `initialize`, `tools/list`, `tools/call`, tool trace; server/tool read-only dùng được trong Plan | ✅ |
+| MCP client: stdio hoặc Streamable HTTP (`url` + headers), `initialize`, `tools/list`, `tools/call`, tool trace; server/tool read-only dùng được trong Plan | ✅ |
 | Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
@@ -224,7 +224,7 @@ Hiện hỗ trợ UTF-8 `.txt`/`.md`. PDF/DOCX sẽ thêm ở bước sau (cần
 ./target/debug/tez skills list
 ./target/debug/tez skills show step-by-step
 
-# MCP server stdio trong mcp.json hoặc từ plugin
+# MCP server (stdio hoặc HTTP) trong mcp.json hoặc từ plugin
 ./target/debug/tez mcp list
 ./target/debug/tez mcp test study
 
@@ -233,7 +233,7 @@ Hiện hỗ trợ UTF-8 `.txt`/`.md`. PDF/DOCX sẽ thêm ở bước sau (cần
 ```
 
 - **Skill** là prompt pack Markdown. System prompt chỉ nhận catalog rút gọn theo nguồn (tối đa 12 id/nguồn); model gọi `skill` không kèm `name` để xem danh mục đầy đủ, hoặc kèm `name` để nạp toàn bộ nội dung (tối đa 12.000 ký tự). Môn học chỉ còn là bộ lọc tùy chọn cho RAG và preset CLI.
-- **MCP** là tool ngoài qua stdio JSON-RPC; tên tool có dạng `mcp__<server>__<tool>`. Server có thể đặt `read_only` (alias `readOnly`) hoặc tool khai báo `annotations.readOnlyHint`; chỉ các tool này được đăng ký trong Plan.
+- **MCP** là tool ngoài qua stdio JSON-RPC hoặc Streamable HTTP (`url`, `headers`, session `Mcp-Session-Id`, nhận JSON/SSE); tên tool có dạng `mcp__<server>__<tool>`. Server có thể đặt `read_only` (alias `readOnly`) hoặc tool khai báo `annotations.readOnlyHint`; chỉ các tool này được đăng ký trong Plan.
 - **Plugin** là gói `plugin.json` chứa skills + MCP server, không chạy code tùy ý.
 
 Plugin mẫu nằm ở `examples/plugins/study-toolkit/` (skill phòng thi + MCP `echo`/`add`). Trong desktop bấm **Cài đặt → Plugin → Cài plugin mẫu**.
@@ -326,7 +326,7 @@ Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền m
 - **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), viết **permission rule** dạng `allow|ask|deny <tool> <pattern>` (dòng trống và `#` comment được bỏ qua; lỗi hiện ngay và nút **Lưu** bị tắt khi rule chưa hợp lệ), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
 - **Cài đặt → Model:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
 - **Cài đặt → Kỹ năng:** xem skill, ngữ cảnh, từ khóa, nội dung Markdown, mở thư mục, hoặc **Tạo với AI** (mô tả → xem trước `SKILL.md` → lưu).
-- **Cài đặt → MCP:** thêm/sửa/xóa server, env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; **Tạo với AI** sinh cấu hình stdio.
+- **Cài đặt → MCP:** thêm/sửa/xóa server stdio hoặc Streamable HTTP (`URL`, `headers`), env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; **Tạo với AI** sinh cấu hình stdio.
 - **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục; **Tạo với AI** sinh `plugin.json` + skill.
 - **Cài đặt → Cập nhật:** kiểm tra GitHub Releases, xem ghi chú, tải installer phù hợp, mở file đã tải.
 - **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình.
@@ -350,9 +350,9 @@ Chạy không cần FUSE:
 - `web_fetch` mặc định tải HTML tĩnh, không đảm bảo render đủ JavaScript. `render: "browser"` dùng Chromium/Chrome/Edge headless nếu có (`TEZ_CHROMIUM`, hoặc `chromium`/`chrome`/`msedge` trên `PATH`), timeout 25 s; nếu thiếu browser hoặc browser lỗi, tool tự fallback sang static và ghi rõ lý do. `--no-sandbox` chỉ bật khi `TEZ_BROWSER_NO_SANDBOX=1`. HTML parser vẫn đơn giản (comment/entity số/script tự đóng đã xử lý nhưng thẻ lỗi có thể còn sót); DNS được resolve và pin toàn bộ địa chỉ ở static; browser map toàn bộ địa chỉ qua `--host-resolver-rules` nhưng không revalidate từng redirect; charset UTF-8/Latin-1/Windows-1252; body static cap 512 KB; PDF/audio/video bị từ chối ở static và chưa được trích xuất.
 - Ảnh được ghi thành file trong `images/<session>/<message>-<index>.<ext>`; SQLite chỉ giữ ref `tez-image:` và `load_messages` giải mã lại thành data URL khi resume. DB nhỏ hơn nhiều so với lưu data URL, nhưng thư mục ảnh vẫn lớn dần. UI và backend giới hạn 4 ảnh mới/lượt; UI giới hạn 5 MB/ảnh, backend giới hạn tổng 8 MB/request. Khi gửi lại lịch sử, chỉ ảnh của tối đa 2 lượt user gần nhất được gửi, trong ngân sách 6 ảnh của cả request (ảnh hiện tại được ưu tiên). Ảnh cũ vẫn hiện trong UI/resume nhưng không được gửi lại toàn bộ; chưa hỗ trợ PDF/audio/video.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
-- MCP chỉ hỗ trợ stdio; server spawn mỗi lượt chat, timeout 20 giây, chưa sandbox. Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
-- Plan lưu nguyên văn câu trả lời cuối vào `plans/<session>.md` (tối đa 200.000 ký tự); desktop chỉ nạp lại khi chuyển trực tiếp Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn). Desktop có PlanDialog (nút Kế hoạch trên header) để xem/sửa/lưu; CLI vẫn chỉ đọc file. Không có schema plan.
-- **Cho phép thao tác này trong phiên hiện tại** chỉ nhớ trong bộ nhớ app (mất khi khởi động lại), khóa theo `session_id|tool|path` (hoặc command với `run_command`); không so khớp toàn bộ args/nội dung.
+- MCP hỗ trợ stdio và Streamable HTTP; server stdio spawn mỗi lượt chat, timeout 20 giây, chưa sandbox. HTTP chỉ dùng POST JSON-RPC + SSE cho response, chưa hỗ trợ GET stream server-initiated, resources/prompts hay OAuth. Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
+- Plan lưu nguyên văn câu trả lời cuối vào `plans/<session>.md` (tối đa 200.000 ký tự); desktop chỉ nạp lại khi chuyển trực tiếp Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn). Kế hoạch có schema Markdown 6 mục (`Mục tiêu`, `Phạm vi`, `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`); desktop PlanDialog cảnh báo mục thiếu nhưng vẫn cho lưu, CLI in cảnh báo ra stderr. Chưa có form nhập từng mục.
+- **Cho phép thao tác này trong phiên hiện tại** được lưu vào `approvals.json` trong data dir, giữ 7 ngày, tối đa 200 mục; khóa theo `session_id|tool|path` (hoặc command với `run_command`); không so khớp toàn bộ args/nội dung. File corrupt bị bỏ qua và ghi log.
 - Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.
 - Skill dùng hai tầng: catalog rút gọn theo nguồn trong system prompt và tool `skill` (không tên = danh mục đầy đủ, có tên = body tối đa 12.000 ký tự). Skill vẫn là prompt pack, không chạy code; bốn skill seed nằm trong `skills/` nên hiện nguồn `user`.
 - Code mode giới hạn đường dẫn ở tầng ứng dụng, chưa phải sandbox OS; `run_command` chạy bằng quyền của user.

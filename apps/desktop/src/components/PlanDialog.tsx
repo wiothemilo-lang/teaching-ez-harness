@@ -14,6 +14,8 @@ type Props = {
 export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
   const [text, setText] = useState("");
   const [path, setPath] = useState("");
+  const [valid, setValid] = useState(true);
+  const [missing, setMissing] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -24,6 +26,8 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
     if (!sessionId) {
       setText("");
       setPath("");
+      setValid(true);
+      setMissing([]);
       return;
     }
     let alive = true;
@@ -34,6 +38,8 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
         if (!alive) return;
         setText(info.text);
         setPath(info.path);
+        setValid(info.valid);
+        setMissing(info.missing);
       })
       .catch((loadError) => {
         if (alive) setError(api.errorMessage(loadError));
@@ -64,6 +70,8 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
     try {
       const info = await api.saveSessionPlan(sessionId, text);
       setPath(info.path);
+      setValid(info.valid);
+      setMissing(info.missing);
       notify("success", "Đã lưu kế hoạch", info.path);
     } catch (saveError) {
       setError(api.errorMessage(saveError));
@@ -110,10 +118,16 @@ export function PlanDialog({ open, sessionId, onClose, notify }: Props) {
                   value={text}
                   onChange={(event) => setText(event.target.value)}
                   rows={16}
-                  placeholder="Kế hoạch sẽ được lưu sau khi agent hoàn tất một lượt Plan. Bạn có thể sửa lại trước khi chuyển sang Code."
+                  placeholder="## Mục tiêu&#10;## Phạm vi&#10;## File và thay đổi&#10;## Các bước&#10;## Rủi ro&#10;## Kiểm chứng"
                   disabled={saving}
                 />
               </label>
+
+              {text.trim() && !valid && (
+                <div className="plan-warning" role="status">
+                  <strong>Kế hoạch thiếu mục:</strong> {missing.join(", ")}
+                </div>
+              )}
 
               {error && (
                 <div className="create-error" role="alert">

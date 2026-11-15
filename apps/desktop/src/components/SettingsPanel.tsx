@@ -77,6 +77,8 @@ type McpDraft = {
   envText: string;
   enabled: boolean;
   read_only: boolean;
+  url: string;
+  headersText: string;
 };
 
 const PRESETS: Preset[] = [
@@ -365,6 +367,8 @@ export function SettingsPanel({
       envText: "",
       enabled: true,
       read_only: false,
+      url: "",
+      headersText: "",
     });
   };
 
@@ -381,6 +385,10 @@ export function SettingsPanel({
         .join("\n"),
       enabled: server.enabled,
       read_only: server.read_only,
+      url: server.url ?? "",
+      headersText: Object.entries(server.headers)
+        .map(([key, value]) => `${key}=${value}`)
+        .join("\n"),
     });
   };
 
@@ -388,20 +396,23 @@ export function SettingsPanel({
     if (!mcpDraft) return;
     const name = (mcpDraft.originalName ?? mcpDraft.name).trim();
     const command = mcpDraft.command.trim();
+    const url = mcpDraft.url.trim();
     if (!name) {
       notify("error", "Thiếu tên MCP server");
       return;
     }
-    if (!command) {
-      notify("error", "Thiếu command", "Ví dụ: python3, npx hoặc uvx.");
+    if (!command && !url) {
+      notify("error", "Thiếu command hoặc URL", "stdio dùng command; HTTP dùng URL.");
       return;
     }
 
     let env: Record<string, string>;
+    let headers: Record<string, string>;
     try {
       env = parseEnv(mcpDraft.envText);
+      headers = parseEnv(mcpDraft.headersText);
     } catch (error) {
-      notify("error", "Env không hợp lệ", api.errorMessage(error));
+      notify("error", "Env/header không hợp lệ", api.errorMessage(error));
       return;
     }
 
@@ -415,6 +426,8 @@ export function SettingsPanel({
         cwd: mcpDraft.cwd.trim() || null,
         enabled: mcpDraft.enabled,
         read_only: mcpDraft.read_only,
+        url: url || null,
+        headers,
       });
       setMcpDraft(null);
       await reload();
@@ -860,11 +873,12 @@ export function SettingsPanel({
                         <Tag tone={server.source === "user" ? "forest" : "clay"}>
                           {server.source === "user" ? "Tự thêm" : `Plugin · ${server.source}`}
                         </Tag>
+                        {server.url && <Tag tone="neutral">HTTP</Tag>}
                         {!server.enabled && <Tag tone="neutral">Đang tắt</Tag>}
                         {server.read_only && <Tag tone="forest">Chỉ đọc</Tag>}
                       </div>
                       <code className="server-command">
-                        {server.command} {server.args.join(" ")}
+                        {server.url ?? `${server.command} ${server.args.join(" ")}`}
                       </code>
                       {result === "loading" && (
                         <div className="test-result">Đang khởi động server…</div>
@@ -963,7 +977,7 @@ export function SettingsPanel({
                   />
                 </label>
                 <label className="field">
-                  <span>Command</span>
+                  <span>Command (stdio)</span>
                   <input
                     value={mcpDraft.command}
                     onChange={(event) =>
@@ -972,6 +986,19 @@ export function SettingsPanel({
                       )
                     }
                     placeholder="python3 / npx / uvx"
+                    spellCheck={false}
+                  />
+                </label>
+                <label className="field field-wide">
+                  <span>URL (Streamable HTTP, tùy chọn)</span>
+                  <input
+                    value={mcpDraft.url}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous ? { ...previous, url: event.target.value } : previous,
+                      )
+                    }
+                    placeholder="https://mcp.example.com/mcp"
                     spellCheck={false}
                   />
                 </label>
@@ -1012,6 +1039,20 @@ export function SettingsPanel({
                       )
                     }
                     placeholder="API_TOKEN=…"
+                    spellCheck={false}
+                  />
+                </label>
+                <label className="field field-wide">
+                  <span>HTTP headers (mỗi dòng KEY=VALUE)</span>
+                  <textarea
+                    rows={2}
+                    value={mcpDraft.headersText}
+                    onChange={(event) =>
+                      setMcpDraft((previous) =>
+                        previous ? { ...previous, headersText: event.target.value } : previous,
+                      )
+                    }
+                    placeholder="Authorization=Bearer …"
                     spellCheck={false}
                   />
                 </label>
