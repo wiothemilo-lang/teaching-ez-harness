@@ -80,15 +80,17 @@ pub struct McpServerConfig {
     /// OAuth 2.1 + PKCE cho MCP HTTP. Token lưu ngoài `mcp.json`.
     #[serde(default)]
     pub oauth: Option<OAuthConfig>,
-    /// Sandbox cho MCP stdio trên Linux. Mặc định tắt để tương thích với
-    /// server cần cache/network; bật trong `mcp.json` hoặc Settings.
+    /// Sandbox cho MCP stdio trên Linux. Mặc định bật trên Linux để server
+    /// không đọc được secret trong data dir; server cần cache/network thì khai
+    /// báo `writable_paths`/`allow_network`, hoặc tắt rõ ràng bằng
+    /// `"enabled": false`. Trên macOS/Windows chưa có sandbox OS nên mặc định tắt.
     #[serde(default)]
     pub sandbox: McpSandboxSettings,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSandboxSettings {
-    #[serde(default)]
+    #[serde(default = "default_sandbox_enabled")]
     pub enabled: bool,
     /// MCP server thường cần mạng để tải package; mặc định chặn.
     #[serde(default)]
@@ -96,6 +98,20 @@ pub struct McpSandboxSettings {
     /// Các thư mục bind read-write thêm, ví dụ `~/.npm`.
     #[serde(default)]
     pub writable_paths: Vec<String>,
+}
+
+fn default_sandbox_enabled() -> bool {
+    cfg!(target_os = "linux")
+}
+
+impl Default for McpSandboxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_sandbox_enabled(),
+            allow_network: false,
+            writable_paths: Vec::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1704,6 +1720,30 @@ mod tests {
         save_config(dir.path(), &config).unwrap();
         let loaded = load_config(dir.path()).unwrap();
         assert_eq!(loaded.servers["demo"].command, "python3");
+    }
+
+    #[test]
+    fn default_mcp_sandbox_follows_platform() {
+        let settings = McpSandboxSettings::default();
+        assert_eq!(settings.enabled, cfg!(target_os = "linux"));
+        assert!(!settings.allow_network);
+        assert!(settings.writable_paths.is_empty());
+    }
+
+    #[test]
+    fn missing_sandbox_field_uses_secure_default() {
+        let config: McpServerConfig = serde_json::from_str(r#"{"command":"python3"}"#).unwrap();
+        assert_eq!(config.sandbox.enabled, cfg!(target_os = "linux"));
+        assert!(!config.sandbox.allow_network);
+    }
+
+    #[test]
+    fn partial_sandbox_keeps_secure_enabled_default() {
+        let config: McpServerConfig =
+            serde_json::from_str(r#"{"command":"python3","sandbox":{"allow_network":true}}"#)
+                .unwrap();
+        assert_eq!(config.sandbox.enabled, cfg!(target_os = "linux"));
+        assert!(config.sandbox.allow_network);
     }
 
     #[test]

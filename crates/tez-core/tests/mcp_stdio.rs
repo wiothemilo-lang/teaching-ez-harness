@@ -29,7 +29,10 @@ async fn discovers_and_calls_demo_server() {
         headers: HashMap::new(),
         bearer_token_env: None,
         oauth: None,
-        sandbox: tez_core::mcp::McpSandboxSettings::default(),
+        sandbox: tez_core::mcp::McpSandboxSettings {
+            enabled: false,
+            ..Default::default()
+        },
     };
 
     let (client, tools) = McpClient::connect("demo", &config, None).await.unwrap();

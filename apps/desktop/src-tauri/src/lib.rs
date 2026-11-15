@@ -188,6 +188,12 @@ struct ExtensionSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct SandboxInfo {
+    available: bool,
+    default_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct AppStatus {
     connection: Option<ConnectionInfo>,
     providers: Vec<ProviderInfo>,
@@ -197,6 +203,7 @@ struct AppStatus {
     default_workspace: String,
     version: &'static str,
     extensions: ExtensionSummary,
+    sandbox: SandboxInfo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1065,6 +1072,10 @@ fn app_status() -> Result<AppStatus, String> {
             skills,
             mcp_servers,
             plugins,
+        },
+        sandbox: SandboxInfo {
+            available: tez_core::sandbox::probe().is_ok(),
+            default_enabled: tez_core::mcp::McpSandboxSettings::default().enabled,
         },
     })
 }
