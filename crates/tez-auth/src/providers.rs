@@ -217,6 +217,21 @@ pub fn upsert(
     } else {
         trimmed_name.to_string()
     };
+    // Không tái sử dụng key đã lưu khi base_url đổi: nếu không, một endpoint
+    // mới (hoặc renderer bị chiếm quyền) có thể nhận được key cũ.
+    let base_url_changed = existing
+        .as_ref()
+        .is_some_and(|entry| entry.base_url != base_url);
+    let has_stored_key = existing.as_ref().is_some_and(|entry| {
+        !entry.encrypted_key.is_empty()
+            && decrypt_key(dir, entry)
+                .map(|key| !key.trim().is_empty())
+                .unwrap_or(true)
+    });
+    if !kind_changed && base_url_changed && has_stored_key && input.api_key.is_none() {
+        return Err(ConnectionError::BaseUrlChanged(provider));
+    }
+
     let encrypted_key = match input.api_key {
         Some(key) => Vault::load_or_create(dir)?.encrypt(key.trim().as_bytes())?,
         // Đổi loại provider mà không nhập key mới: không tái sử dụng key của
@@ -512,5 +527,82 @@ mod tests {
         remove(dir.path(), &first.id).unwrap();
         let book = load(dir.path()).unwrap();
         assert_eq!(book.active.as_deref(), Some(second.id.as_str()));
+    }
+
+    #[test]
+    fn requires_new_key_when_base_url_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "groq",
+                api_key: Some("old-key"),
+                set_active: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let error = upsert(
+            dir.path(),
+            ProviderInput {
+                id: Some(&first.id),
+                name: "",
+                provider: "groq",
+                base_url: Some("https://proxy.example/v1"),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            connection::ConnectionError::BaseUrlChanged(_)
+        ));
+
+        let updated = upsert(
+            dir.path(),
+            ProviderInput {
+                id: Some(&first.id),
+                name: "",
+                provider: "groq",
+                base_url: Some("https://proxy.example/v1"),
+                api_key: Some("new-key"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.base_url, "https://proxy.example/v1");
+        assert_eq!(decrypt_key(dir.path(), &updated).unwrap(), "new-key");
+    }
+
+    #[test]
+    fn allows_base_url_change_without_stored_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = upsert(
+            dir.path(),
+            ProviderInput {
+                name: "",
+                provider: "custom",
+                base_url: Some("https://a.example/v1"),
+                api_key: Some(""),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let updated = upsert(
+            dir.path(),
+            ProviderInput {
+                id: Some(&first.id),
+                name: "",
+                provider: "custom",
+                base_url: Some("https://b.example/v1"),
+                api_key: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.base_url, "https://b.example/v1");
     }
 }
