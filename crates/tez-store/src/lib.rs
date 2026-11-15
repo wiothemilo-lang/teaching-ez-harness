@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use thiserror::Error;
@@ -91,6 +93,8 @@ pub struct StoredMessage {
     /// Data URL ảnh đính kèm (tối đa do client giới hạn).
     pub images: Vec<String>,
 }
+
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -245,58 +249,171 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     })
 }
 
+fn create_private_file(path: &Path) -> Result<(), StoreError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    drop(file);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(()),
+        // -wal/-shm là file tạm, có thể biến mất giữa lúc kiểm tra và chmod.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<(), StoreError> {
+    Ok(())
+}
+
+fn ensure_wal_mode(conn: &Connection) -> Result<(), StoreError> {
+    // Serialize trong process để nhiều thread mở DB lần đầu không tranh nhau
+    // đổi journal_mode; process khác vẫn được xử lý bằng retry bên dưới.
+    static JOURNAL_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = JOURNAL_MODE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let current: String =
+        retry_busy(|| Ok(conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?))?;
+    if current.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+
+    retry_busy(|| {
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidInput(format!(
+                "không bật được WAL (journal_mode={mode})"
+            )))
+        }
+    })
+}
+
+fn is_busy_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// SQLite có thể trả SQLITE_BUSY ngay cả khi đã có busy_timeout (đặc biệt lúc
+/// đổi journal_mode hoặc BEGIN IMMEDIATE); thử lại vài lần trước khi bỏ cuộc.
+fn retry_busy<T>(mut operation: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    const ATTEMPTS: usize = 50;
+    for attempt in 0..ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt + 1 < ATTEMPTS && is_busy_error(&error) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("retry_busy luôn trả về trong vòng lặp")
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let in_memory = path == Path::new(":memory:");
+        if !in_memory {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Tạo file với mode 0600 trước khi SQLite mở: SQLite sao chép mode này
+            // cho -wal/-shm, nên không còn file DB lộ quyền 0644.
+            create_private_file(&path)?;
         }
 
         let conn = Connection::open(&path)?;
         // busy_timeout phải có hiệu lực trước khi đổi journal_mode.
-        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;",
-        )?;
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
+        if !in_memory {
+            ensure_wal_mode(&conn)?;
+        }
 
         let store = Self { conn, path };
+        store.harden_permissions()?;
         store.migrate()?;
+        // DDL có thể vừa tạo -wal/-shm; siết quyền lần cuối.
+        store.harden_permissions()?;
         Ok(store)
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        // BEGIN IMMEDIATE: hai process mở DB cùng lúc không thể cùng ALTER/CREATE.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<(), StoreError> {
-            self.conn.execute_batch(SCHEMA)?;
-            Self::add_column_if_missing(&self.conn, "sessions", "subject", "TEXT")?;
-            Self::add_column_if_missing(
-                &self.conn,
-                "sessions",
-                "mode",
-                "TEXT NOT NULL DEFAULT 'chat'",
-            )?;
-            Self::add_column_if_missing(&self.conn, "documents", "subject", "TEXT")?;
-            Self::add_column_if_missing(
-                &self.conn,
-                "messages",
-                "images",
-                "TEXT NOT NULL DEFAULT '[]'",
-            )?;
-            Self::ensure_fts_schema(&self.conn)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+        // DB đã migrate thì chỉ đọc user_version, không lấy khóa ghi.
+        if Self::user_version(&self.conn)? >= SCHEMA_VERSION {
+            return Ok(());
         }
+
+        retry_busy(|| {
+            // BEGIN IMMEDIATE: hai process mở DB cùng lúc không thể cùng ALTER/CREATE.
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            match self.apply_migrations() {
+                Ok(()) => match self.conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        Err(error.into())
+                    }
+                },
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    fn apply_migrations(&self) -> Result<(), StoreError> {
+        // Process khác có thể đã migrate xong trong lúc ta chờ khóa.
+        if Self::user_version(&self.conn)? >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(SCHEMA)?;
+        Self::add_column_if_missing(&self.conn, "sessions", "subject", "TEXT")?;
+        Self::add_column_if_missing(
+            &self.conn,
+            "sessions",
+            "mode",
+            "TEXT NOT NULL DEFAULT 'chat'",
+        )?;
+        Self::add_column_if_missing(&self.conn, "documents", "subject", "TEXT")?;
+        Self::add_column_if_missing(
+            &self.conn,
+            "messages",
+            "images",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        Self::ensure_fts_schema(&self.conn)?;
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    }
+
+    fn user_version(conn: &Connection) -> Result<i64, StoreError> {
+        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
     /// FTS5 không hỗ trợ ALTER; nếu bảng cũ thiếu `search_text` thì tạo lại + reindex.
@@ -304,8 +421,7 @@ impl Store {
         let mut statement = conn.prepare("PRAGMA table_info(document_chunks_fts)")?;
         let columns: Vec<String> = statement
             .query_map([], |row| row.get(1))?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<_>>()?;
         drop(statement);
 
         if columns.iter().any(|column| column == "search_text") {
@@ -323,26 +439,32 @@ impl Store {
              );",
         )?;
 
-        let chunks: Vec<(String, String, String)> = {
-            let mut statement =
-                conn.prepare("SELECT id, document_id, content FROM document_chunks")?;
-            let rows =
-                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-            rows.filter_map(Result::ok).collect()
-        };
+        // Một INSERT...SELECT thay vì từng dòng; lỗi được trả về thay vì bỏ qua.
+        conn.create_scalar_function(
+            "tez_normalize_search",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let content: String = context.get(0)?;
+                Ok(normalize_for_search(&content))
+            },
+        )?;
+        conn.execute(
+            "INSERT INTO document_chunks_fts (content, search_text, chunk_id, document_id)
+             SELECT content, tez_normalize_search(content), id, document_id
+             FROM document_chunks",
+            [],
+        )?;
+        Ok(())
+    }
 
-        for (chunk_id, document_id, content) in chunks {
-            conn.execute(
-                "INSERT INTO document_chunks_fts (content, search_text, chunk_id, document_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    content,
-                    normalize_for_search(&content),
-                    chunk_id,
-                    document_id
-                ],
-            )?;
+    fn harden_permissions(&self) -> Result<(), StoreError> {
+        if self.path == Path::new(":memory:") {
+            return Ok(());
         }
+        set_private_permissions(&self.path)?;
+        set_private_permissions(&self.wal_path())?;
+        set_private_permissions(&self.shm_path())?;
         Ok(())
     }
 
@@ -376,19 +498,35 @@ impl Store {
         &self.conn
     }
 
-    /// Dung lượng file DB (gồm cả WAL nếu có).
-    pub fn size_bytes(&self) -> u64 {
-        let main = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        let wal = std::fs::metadata(self.wal_path())
-            .map(|m| m.len())
-            .unwrap_or(0);
-        main + wal
+    /// Dung lượng file DB (gồm cả WAL và SHM nếu có).
+    pub fn size_bytes(&self) -> Result<u64, StoreError> {
+        if self.path == Path::new(":memory:") {
+            return Ok(0);
+        }
+        let mut total = std::fs::metadata(&self.path)?.len();
+        for path in [self.wal_path(), self.shm_path()] {
+            match std::fs::metadata(&path) {
+                Ok(metadata) => total += metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(total)
     }
 
     /// `tez.sqlite` -> `tez.sqlite-wal` (không thay phần mở rộng).
     fn wal_path(&self) -> PathBuf {
+        self.sidecar_path("-wal")
+    }
+
+    /// `tez.sqlite` -> `tez.sqlite-shm`.
+    fn shm_path(&self) -> PathBuf {
+        self.sidecar_path("-shm")
+    }
+
+    fn sidecar_path(&self, suffix: &str) -> PathBuf {
         let mut name = self.path.as_os_str().to_os_string();
-        name.push("-wal");
+        name.push(suffix);
         PathBuf::from(name)
     }
 
@@ -579,18 +717,36 @@ impl Store {
     /// Dọn session khi một lượt chat thất bại: xoá nếu chưa có message nào,
     /// ngược lại đánh dấu `failed` để không kẹt ở trạng thái `active`.
     pub fn abandon_session(&self, session_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        let removed = transaction.execute(
             "DELETE FROM sessions
              WHERE id = ?1
                AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = ?1)",
             params![session_id],
         )?;
-        self.conn.execute(
-            "UPDATE sessions
-             SET state = 'failed', ended_at = datetime('now')
-             WHERE id = ?1 AND state IN ('intake', 'active')",
-            params![session_id],
-        )?;
+        if removed > 0 {
+            // Không để lại dữ liệu mồ côi của session vừa xoá.
+            transaction.execute(
+                "DELETE FROM session_todos WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM tool_calls WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM context_snapshots WHERE session_id = ?1",
+                params![session_id],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE sessions
+                 SET state = 'failed', ended_at = datetime('now')
+                 WHERE id = ?1 AND state IN ('intake', 'active')",
+                params![session_id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -620,10 +776,19 @@ impl Store {
         )?;
         let rows = statement.query_map(params![session_id, limit as i64], |row| {
             let images_json: String = row.get(2)?;
+            let images = match serde_json::from_str::<Vec<String>>(&images_json) {
+                Ok(images) => images,
+                Err(error) => {
+                    eprintln!(
+                        "[tez-store] images JSON hỏng, giữ message với danh sách ảnh rỗng: {error}"
+                    );
+                    Vec::new()
+                }
+            };
             Ok(StoredMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
-                images: serde_json::from_str(&images_json).unwrap_or_default(),
+                images,
             })
         })?;
 
@@ -725,7 +890,7 @@ impl Store {
 
         let mut statement = self.conn.prepare(
             "SELECT c.id, c.document_id, d.title, d.subject,
-                    snippet(document_chunks_fts, 0, '[', ']', '…', 16)
+                    snippet(document_chunks_fts, 1, '[', ']', '…', 16)
              FROM document_chunks_fts
              JOIN document_chunks c ON c.id = document_chunks_fts.chunk_id
              JOIN documents d ON d.id = c.document_id
@@ -754,8 +919,7 @@ impl Store {
     pub fn delete_document(&self, document_id: &str) -> Result<bool, StoreError> {
         let transaction = self.conn.unchecked_transaction()?;
         transaction.execute(
-            "DELETE FROM document_chunks_fts
-             WHERE chunk_id IN (SELECT id FROM document_chunks WHERE document_id = ?1)",
+            "DELETE FROM document_chunks_fts WHERE document_id = ?1",
             params![document_id],
         )?;
         transaction.execute(
@@ -833,9 +997,9 @@ fn flush_chunk(current: &mut String, chunks: &mut Vec<String>) {
     current.clear();
 }
 
-/// Chia văn bản theo đoạn, mỗi chunk khoảng 1200 byte.
+/// Chia văn bản theo đoạn, mỗi chunk tối đa 1200 ký tự (không phải byte).
 fn chunk_text(content: &str) -> Vec<String> {
-    const TARGET_BYTES: usize = 1200;
+    const TARGET_CHARS: usize = 1200;
     let normalized = content.replace("\r\n", "\n");
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -845,13 +1009,14 @@ fn chunk_text(content: &str) -> Vec<String> {
         if paragraph.is_empty() {
             continue;
         }
-        if !current.is_empty() && current.len() + paragraph.len() + 2 > TARGET_BYTES {
+        let paragraph_chars = paragraph.chars().count();
+        if !current.is_empty() && current.chars().count() + paragraph_chars + 2 > TARGET_CHARS {
             flush_chunk(&mut current, &mut chunks);
         }
-        if paragraph.len() > TARGET_BYTES {
+        if paragraph_chars > TARGET_CHARS {
             flush_chunk(&mut current, &mut chunks);
             let chars: Vec<char> = paragraph.chars().collect();
-            for slice in chars.chunks(TARGET_BYTES) {
+            for slice in chars.chunks(TARGET_CHARS) {
                 chunks.push(slice.iter().collect());
             }
         } else {
@@ -922,6 +1087,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 5);
+
+        let version: i64 = store
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
 
         store.ensure_profile("p1", "Học sinh").unwrap();
 
@@ -1115,6 +1286,46 @@ mod tests {
     }
 
     #[test]
+    fn abandon_session_removes_related_rows_of_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session_mode("default", None, Some("general"), "chat")
+            .unwrap();
+
+        store
+            .save_todos(&id, r#"[{"content":"đọc file","status":"pending"}]"#)
+            .unwrap();
+        store
+            .record_tool_call(&id, "read_file", &serde_json::json!({}), "ok", true, 1)
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO context_snapshots (id, session_id, step_no, sections_json, tokens_json)
+                 VALUES ('snap-1', ?1, 1, '[]', '{}')",
+                params![id],
+            )
+            .unwrap();
+
+        store.abandon_session(&id).unwrap();
+        assert!(store.get_session(&id).unwrap().is_none());
+
+        for table in ["session_todos", "tool_calls", "context_snapshots"] {
+            let count: i64 = store
+                .connection()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} còn dữ liệu mồ côi");
+        }
+    }
+
+    #[test]
     fn append_message_activates_session() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("tez.db")).unwrap();
@@ -1168,6 +1379,38 @@ mod tests {
     }
 
     #[test]
+    fn malformed_images_json_keeps_message_with_empty_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Người dùng").unwrap();
+        let id = store
+            .create_session_mode("default", None, None, "chat")
+            .unwrap();
+        store
+            .append_message(NewMessage {
+                session_id: &id,
+                role: "user",
+                content: "vẫn giữ message",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE messages SET images = 'không-phải-json' WHERE session_id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        let loaded = store.load_messages(&id, 10).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "vẫn giữ message");
+        assert!(loaded[0].images.is_empty());
+    }
+
+    #[test]
     fn wal_path_keeps_original_extension() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tez.sqlite");
@@ -1176,20 +1419,47 @@ mod tests {
     }
 
     #[test]
+    fn supports_in_memory_database() {
+        let store = Store::open(":memory:").unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session_mode("default", None, Some("math"), "chat")
+            .unwrap();
+        store
+            .append_message(NewMessage {
+                session_id: &id,
+                role: "user",
+                content: "trong bộ nhớ",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+
+        assert_eq!(store.load_messages(&id, 10).unwrap().len(), 1);
+        assert_eq!(store.size_bytes().unwrap(), 0);
+    }
+
+    #[test]
     fn concurrent_open_migrates_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tez.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let path = path.clone();
-                std::thread::spawn(move || Store::open(path).map(|_| ()))
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // 8 thread x 25 lần mở = 200 lần, đủ để tái hiện race cũ.
+                    for _ in 0..25 {
+                        Store::open(&path).expect("mở DB đồng thời phải thành công");
+                    }
+                })
             })
             .collect();
         for handle in handles {
-            handle
-                .join()
-                .unwrap()
-                .expect("mở DB đồng thời phải thành công");
+            handle.join().unwrap();
         }
 
         let store = Store::open(&path).unwrap();
@@ -1202,6 +1472,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_migrated_db_does_not_take_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let store = Store::open(&path).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        // Giữ khóa ghi trên connection hiện tại: open() của DB đã migrate
+        // không được chờ khóa này.
+        store.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let open_path = path.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = sender.send(Store::open(open_path).map(|_| ()));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+
+        store.connection().execute_batch("ROLLBACK").unwrap();
+        handle.join().unwrap();
+
+        result
+            .expect("open() không được chờ khóa ghi của DB đã migrate")
+            .expect("open() phải thành công");
     }
 
     #[test]
@@ -1215,8 +1515,11 @@ mod tests {
         {
             // Mô phỏng DB cũ trước khi có cột documents.subject.
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch("ALTER TABLE documents DROP COLUMN subject")
-                .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE documents DROP COLUMN subject;
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
         }
 
         let store = Store::open(&path).unwrap();
@@ -1226,6 +1529,95 @@ mod tests {
         let documents = store.list_documents(10).unwrap();
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].subject.as_deref(), Some("math"));
+        let version: i64 = store
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rebuilds_legacy_fts_with_search_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let content = "Định lý Pythagore: trong tam giác vuông, a² + b² = c².";
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .add_document("default", Some("math"), "Định lý", None, None, content)
+                .unwrap();
+        }
+        {
+            // Mô phỏng FTS cũ chỉ có cột content.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE document_chunks_fts;
+                 CREATE VIRTUAL TABLE document_chunks_fts USING fts5(
+                    content,
+                    chunk_id UNINDEXED,
+                    document_id UNINDEXED,
+                    tokenize = 'unicode61 remove_diacritics 2'
+                 );
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let search_text_columns: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('document_chunks_fts')
+                 WHERE name = 'search_text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(search_text_columns, 1);
+
+        let hits = store.search_chunks("định", Some("math"), 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("[dinh]"),
+            "snippet = {}",
+            hits[0].snippet
+        );
+    }
+
+    #[test]
+    fn fts_rebuild_propagates_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        {
+            let store = Store::open(&path).unwrap();
+            // BLOB trong cột TEXT khiến normalize_search không đọc được thành String.
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO document_chunks (id, document_id, chunk_no, content)
+                     VALUES ('chunk-1', 'doc-1', 0, X'00')",
+                    [],
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE document_chunks_fts;
+                 CREATE VIRTUAL TABLE document_chunks_fts USING fts5(
+                    content,
+                    chunk_id UNINDEXED,
+                    document_id UNINDEXED
+                 );
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        }
+
+        match Store::open(&path) {
+            Ok(_) => panic!("rebuild FTS phải trả lỗi thay vì bỏ qua dòng hỏng"),
+            Err(error) => assert!(matches!(error, StoreError::Sqlite(_))),
+        }
     }
 
     #[test]
@@ -1252,13 +1644,26 @@ mod tests {
         let hits = store.search_chunks("Pythagore", Some("math"), 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document_id, document_id);
-        assert!(hits[0].snippet.contains("Pythagore"));
+        assert!(
+            hits[0].snippet.contains("[pythagore]"),
+            "snippet = {}",
+            hits[0].snippet
+        );
 
         let hits = store.search_chunks("tam giac", Some("math"), 5).unwrap();
         assert_eq!(hits.len(), 1);
 
         let hits = store.search_chunks("dinh ly", Some("math"), 5).unwrap();
         assert_eq!(hits.len(), 1);
+
+        // Query có dấu phải highlight trên cột search_text (đã bỏ dấu).
+        let hits = store.search_chunks("định", Some("math"), 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].snippet.contains("[dinh]"),
+            "snippet = {}",
+            hits[0].snippet
+        );
 
         let other = store
             .search_chunks("Pythagore", Some("chemistry"), 5)
@@ -1271,6 +1676,24 @@ mod tests {
 
         assert!(store.delete_document(&document_id).unwrap());
         assert_eq!(store.document_count().unwrap(), 0);
+        let chunk_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?1",
+                params![document_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_count, 0);
+        let fts_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM document_chunks_fts WHERE document_id = ?1",
+                params![document_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 0);
         assert!(store
             .search_chunks("Pythagore", None, 5)
             .unwrap()
@@ -1288,5 +1711,119 @@ mod tests {
             .add_document("default", None, "Tài liệu dài", None, None, &content)
             .unwrap();
         assert!(chunks >= 3, "chunks = {chunks}");
+    }
+
+    #[test]
+    fn chunks_vietnamese_text_by_characters_not_bytes() {
+        // 1300 ký tự 'đ' = 2600 byte; nếu giới hạn là byte thì chỉ cần 1 chunk.
+        let content = "đ".repeat(1300);
+        let chunks = chunk_text(&content);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.chars().count())
+                .sum::<usize>(),
+            1300
+        );
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1200));
+    }
+
+    #[test]
+    fn combines_vietnamese_paragraphs_by_char_count() {
+        // Mỗi đoạn 500 ký tự nhưng 1000 byte; 500 + 2 + 500 = 1002 ký tự
+        // nên phải gộp thành một chunk (cách tính byte cũ sẽ tách đôi).
+        let paragraph = "đ".repeat(500);
+        let content = format!("{paragraph}\n\n{paragraph}");
+        let chunks = chunk_text(&content);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chars().count(), 1002);
+    }
+
+    #[test]
+    fn chunks_vietnamese_paragraphs_within_char_limit() {
+        let paragraph = "Định lý Pythagore: a² + b² = c². ".repeat(60);
+        let content = format!("{paragraph}\n\n{paragraph}\n\n{paragraph}");
+        let chunks = chunk_text(&content);
+        assert!(chunks.len() >= 6, "chunks = {}", chunks.len());
+        for chunk in &chunks {
+            let chars = chunk.chars().count();
+            assert!(chars <= 1200, "chunk có {chars} ký tự");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_database_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let store = Store::open(&path).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session_mode("default", None, None, "chat")
+            .unwrap();
+        store
+            .append_message(NewMessage {
+                session_id: &id,
+                role: "user",
+                content: "ghi để tạo WAL",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+
+        for file in [&path, &store.wal_path(), &store.shm_path()] {
+            let mode = std::fs::metadata(file)
+                .unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{} có mode {mode:o}", file.display());
+        }
+    }
+
+    #[test]
+    fn size_bytes_includes_wal_and_shm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let store = Store::open(&path).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session_mode("default", None, None, "chat")
+            .unwrap();
+        store
+            .append_message(NewMessage {
+                session_id: &id,
+                role: "user",
+                content: "dữ liệu để WAL có nội dung",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+
+        let expected: u64 = [&path, &store.wal_path(), &store.shm_path()]
+            .into_iter()
+            .map(|file| {
+                std::fs::metadata(file)
+                    .unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+                    .len()
+            })
+            .sum();
+        assert_eq!(store.size_bytes().unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn size_bytes_reports_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let store = Store::open(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("moved.db")).unwrap();
+
+        assert!(matches!(store.size_bytes(), Err(StoreError::Io(_))));
     }
 }

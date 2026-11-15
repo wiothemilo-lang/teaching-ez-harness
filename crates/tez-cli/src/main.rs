@@ -1284,7 +1284,7 @@ fn doctor() -> anyhow::Result<()> {
     println!(
         "db: {} ({}, {} session, {} request, {} in / {} out token)",
         store.path().display(),
-        human_size(store.size_bytes()),
+        human_size(store.size_bytes()?),
         store.session_count()?,
         usage.requests,
         usage.tokens_in,
