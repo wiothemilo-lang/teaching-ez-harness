@@ -115,6 +115,8 @@ pub struct McpServerStatus {
 
 pub struct McpDiscovery {
     pub tools: Vec<McpTool>,
+    /// Tool đọc resources/prompts của server (một tool/server, luôn read-only).
+    pub extras: Vec<McpExtrasTool>,
     pub servers: Vec<McpServerStatus>,
     /// Tên tool MCP được user cấu hình `read_only`; dùng để miễn hỏi duyệt.
     pub read_only_tools: Vec<String>,
@@ -291,6 +293,7 @@ pub async fn discover_with_project(
 ) -> Result<McpDiscovery, McpError> {
     let entries = load_servers_with_project(dir, project_root)?;
     let mut tools = Vec::new();
+    let mut extras = Vec::new();
     let mut servers = Vec::new();
     let mut read_only_tools = Vec::new();
 
@@ -318,6 +321,11 @@ pub async fn discover_with_project(
                     }
                     tools.push(tool);
                 }
+                if client.supports("resources") || client.supports("prompts") {
+                    let extra = McpExtrasTool::new(entry.name.clone(), Arc::clone(&client));
+                    read_only_tools.push(extra.spec().name);
+                    extras.push(extra);
+                }
                 servers.push(McpServerStatus {
                     name: entry.name,
                     source: entry.source,
@@ -338,6 +346,7 @@ pub async fn discover_with_project(
 
     Ok(McpDiscovery {
         tools,
+        extras,
         servers,
         read_only_tools,
     })
@@ -400,6 +409,85 @@ impl Tool for McpTool {
     }
 }
 
+/// Tool tổng hợp để đọc resources/prompts của một MCP server.
+pub struct McpExtrasTool {
+    server: String,
+    tool_name: String,
+    description: String,
+    client: Arc<McpClient>,
+}
+
+impl McpExtrasTool {
+    fn new(server: String, client: Arc<McpClient>) -> Self {
+        let tool_name = sanitize_tool_name(&server, "extras");
+        let description = format!(
+            "[MCP: {server}] Đọc resources và prompts của server. \
+             Dùng action=list_resources để liệt kê resource, read_resource với uri để đọc, \
+             list_prompts để liệt kê prompt, get_prompt với name/arguments để lấy nội dung."
+        );
+        Self {
+            server,
+            tool_name,
+            description,
+            client,
+        }
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl Tool for McpExtrasTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.tool_name.clone(),
+            description: self.description.clone(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list_resources", "read_resource", "list_prompts", "get_prompt"],
+                        "description": "Hành động cần thực hiện"
+                    },
+                    "uri": {
+                        "type": "string",
+                        "description": "URI resource cho read_resource"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Tên prompt cho get_prompt"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Tham số prompt cho get_prompt",
+                        "additionalProperties": true
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("thiếu trường 'action'".into()))?;
+        self.client
+            .extras(action, &args)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+}
+
 #[async_trait]
 trait McpTransport: Send {
     fn protocol_version(&self) -> &'static str;
@@ -409,6 +497,7 @@ trait McpTransport: Send {
 
 pub struct McpClient {
     inner: Mutex<Box<dyn McpTransport>>,
+    capabilities: Value,
 }
 
 impl McpClient {
@@ -428,7 +517,7 @@ impl McpClient {
         };
 
         let protocol = transport.protocol_version();
-        transport
+        let initialize = transport
             .request(
                 "initialize",
                 json!({
@@ -441,6 +530,10 @@ impl McpClient {
                 }),
             )
             .await?;
+        let capabilities = initialize
+            .get("capabilities")
+            .cloned()
+            .unwrap_or(Value::Null);
         transport
             .notify("notifications/initialized", json!({}))
             .await?;
@@ -450,14 +543,24 @@ impl McpClient {
         Ok((
             Arc::new(Self {
                 inner: Mutex::new(transport),
+                capabilities,
             }),
             tools,
         ))
     }
 
-    pub async fn call(&self, tool: &str, args: Value) -> Result<ToolOutput, McpError> {
+    /// Server khai báo capability, ví dụ `resources` hoặc `prompts`.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.get(capability).is_some()
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let mut connection = self.inner.lock().await;
-        let result = connection
+        connection.request(method, params).await
+    }
+
+    pub async fn call(&self, tool: &str, args: Value) -> Result<ToolOutput, McpError> {
+        let result = self
             .request(
                 "tools/call",
                 json!({
@@ -467,6 +570,48 @@ impl McpClient {
             )
             .await?;
         Ok(parse_call_result(&result))
+    }
+
+    /// Đọc resources/prompts qua một tool tổng hợp. Luôn chỉ đọc.
+    pub async fn extras(&self, action: &str, args: &Value) -> Result<ToolOutput, McpError> {
+        let result = match action {
+            "list_resources" => self.request("resources/list", json!({})).await?,
+            "read_resource" => {
+                let uri = args
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| McpError::Rpc("thiếu 'uri' cho read_resource".into()))?;
+                self.request("resources/read", json!({ "uri": uri }))
+                    .await?
+            }
+            "list_prompts" => self.request("prompts/list", json!({})).await?,
+            "get_prompt" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| McpError::Rpc("thiếu 'name' cho get_prompt".into()))?;
+                let arguments = args
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                self.request(
+                    "prompts/get",
+                    json!({ "name": name, "arguments": arguments }),
+                )
+                .await?
+            }
+            other => {
+                return Err(McpError::Rpc(format!(
+                    "action không hỗ trợ: {other} (dùng list_resources, read_resource, list_prompts, get_prompt)"
+                )))
+            }
+        };
+
+        Ok(format_extra_result(action, &result))
     }
 }
 
@@ -848,6 +993,102 @@ fn parse_tools(result: &Value) -> Vec<McpToolInfo> {
         .unwrap_or_default()
 }
 
+fn cap_output(mut content: String) -> String {
+    if content.len() > MAX_MCP_OUTPUT_BYTES {
+        let mut end = MAX_MCP_OUTPUT_BYTES;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n… (output MCP đã bị cắt bớt)");
+    }
+    content
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn format_extra_result(action: &str, result: &Value) -> ToolOutput {
+    let content = match action {
+        "read_resource" => format_resource_contents(result),
+        "get_prompt" => format_prompt_messages(result),
+        _ => pretty_json(result),
+    };
+    ToolOutput::ok(cap_output(content))
+}
+
+fn format_resource_contents(result: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(contents) = result.get("contents").and_then(Value::as_array) {
+        for item in contents {
+            let uri = item.get("uri").and_then(Value::as_str).unwrap_or("");
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(format!("{uri}\n{text}"));
+            } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+                let mime = item
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                parts.push(format!("{uri}\n[blob {mime}, {} ký tự base64]", blob.len()));
+            } else {
+                parts.push(item.to_string());
+            }
+        }
+    }
+    if parts.is_empty() {
+        pretty_json(result)
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+fn format_prompt_messages(result: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("message");
+            let content = message
+                .get("content")
+                .map(prompt_content_text)
+                .unwrap_or_default();
+            parts.push(format!("{role}: {content}"));
+        }
+    }
+    if parts.is_empty() {
+        pretty_json(result)
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+fn prompt_content_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(text) = content.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    if let Some(items) = content.as_array() {
+        let texts: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| item.as_str().map(str::to_string))
+            })
+            .collect();
+        if !texts.is_empty() {
+            return texts.join("\n");
+        }
+    }
+    content.to_string()
+}
+
 fn parse_call_result(result: &Value) -> ToolOutput {
     let is_error = result
         .get("isError")
@@ -891,15 +1132,7 @@ fn parse_call_result(result: &Value) -> ToolOutput {
     if parts.is_empty() {
         parts.push(result.to_string());
     }
-    let mut content = parts.join("\n");
-    if content.len() > MAX_MCP_OUTPUT_BYTES {
-        let mut end = MAX_MCP_OUTPUT_BYTES;
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        content.truncate(end);
-        content.push_str("\n… (output MCP đã bị cắt bớt)");
-    }
+    let content = cap_output(parts.join("\n"));
     if is_error {
         ToolOutput::error(content)
     } else {
@@ -1253,6 +1486,183 @@ mod tests {
         let output = client.call("echo", json!({"text": "ping"})).await.unwrap();
         assert_eq!(output.content, "pong");
         assert!(!output.is_error);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn extras_format_resources_and_prompts() {
+        let resource = json!({
+            "contents": [
+                {"uri": "file://a", "text": "hello"},
+                {"uri": "file://b", "blob": "AAAA", "mimeType": "image/png"}
+            ]
+        });
+        let output = format_extra_result("read_resource", &resource);
+        assert!(output.content.contains("file://a\nhello"));
+        assert!(output.content.contains("[blob image/png, 4 ký tự base64]"));
+
+        let prompt = json!({
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": "hi"}},
+                {"role": "assistant", "content": [{"type": "text", "text": "there"}]}
+            ]
+        });
+        let output = format_extra_result("get_prompt", &prompt);
+        assert_eq!(output.content, "user: hi\n\nassistant: there");
+    }
+
+    #[tokio::test]
+    async fn http_transport_reads_resources_and_prompts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + content_length {
+                    let body = &buffer[header_end + 4..header_end + 4 + content_length];
+                    return serde_json::from_slice(body).unwrap();
+                }
+            }
+            panic!("HTTP request không có body JSON");
+        }
+
+        async fn write_response(
+            stream: &mut tokio::net::TcpStream,
+            status: &str,
+            extra_headers: &str,
+            body: &str,
+        ) {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let method = request["method"].as_str().unwrap_or_default();
+                let result = match method {
+                    "initialize" => {
+                        let body = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                                "protocolVersion": "2025-03-26",
+                                "capabilities": {"resources": {}, "prompts": {}},
+                                "serverInfo": {"name": "test", "version": "0"}
+                            }
+                        })
+                        .to_string();
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            "Mcp-Session-Id: test-session\r\n",
+                            &body,
+                        )
+                        .await;
+                        continue;
+                    }
+                    "notifications/initialized" => {
+                        write_response(&mut stream, "202 Accepted", "", "").await;
+                        continue;
+                    }
+                    "tools/list" => json!({"tools": []}),
+                    "resources/list" => json!({
+                        "resources": [{"uri": "file://a", "name": "A"}]
+                    }),
+                    "resources/read" => json!({
+                        "contents": [{"uri": "file://a", "text": "hello"}]
+                    }),
+                    "prompts/list" => json!({
+                        "prompts": [{"name": "greet"}]
+                    }),
+                    "prompts/get" => json!({
+                        "messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]
+                    }),
+                    _ => json!({}),
+                };
+                let body = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result
+                })
+                .to_string();
+                write_response(&mut stream, "200 OK", "", &body).await;
+            }
+        });
+
+        let config = McpServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            read_only: false,
+            url: Some(format!("http://{address}/mcp")),
+            headers: HashMap::new(),
+        };
+        let (client, tools) = McpClient::connect("http", &config).await.unwrap();
+        assert!(tools.is_empty());
+        assert!(client.supports("resources"));
+        assert!(client.supports("prompts"));
+        assert!(!client.supports("sampling"));
+
+        let extras = McpExtrasTool::new("http".into(), Arc::clone(&client));
+        assert!(extras.is_read_only());
+        assert_eq!(extras.spec().name, "mcp__http__extras");
+
+        let output = extras
+            .execute(json!({"action": "list_resources"}))
+            .await
+            .unwrap();
+        assert!(output.content.contains("file://a"));
+
+        let output = extras
+            .execute(json!({"action": "read_resource", "uri": "file://a"}))
+            .await
+            .unwrap();
+        assert!(output.content.contains("hello"));
+
+        let output = extras
+            .execute(json!({"action": "list_prompts"}))
+            .await
+            .unwrap();
+        assert!(output.content.contains("greet"));
+
+        let output = extras
+            .execute(json!({"action": "get_prompt", "name": "greet"}))
+            .await
+            .unwrap();
+        assert!(output.content.contains("user: hi"));
+
         server.await.unwrap();
     }
 

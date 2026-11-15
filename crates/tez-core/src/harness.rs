@@ -60,6 +60,10 @@ pub struct HarnessConfig {
     pub max_tool_output: usize,
     #[serde(default = "default_subagent_max_steps")]
     pub subagent_max_steps: usize,
+    #[serde(default = "default_approval_ttl_hours")]
+    pub approval_ttl_hours: u64,
+    #[serde(default = "default_approval_max_entries")]
+    pub approval_max_entries: usize,
     #[serde(default)]
     pub system_prompt: String,
     #[serde(default = "default_language")]
@@ -92,6 +96,12 @@ fn default_max_tool_output() -> usize {
 fn default_subagent_max_steps() -> usize {
     6
 }
+fn default_approval_ttl_hours() -> u64 {
+    168
+}
+fn default_approval_max_entries() -> usize {
+    200
+}
 fn default_language() -> String {
     "vi".to_string()
 }
@@ -107,6 +117,8 @@ impl Default for HarnessConfig {
             top_p: default_top_p(),
             max_tool_output: default_max_tool_output(),
             subagent_max_steps: default_subagent_max_steps(),
+            approval_ttl_hours: default_approval_ttl_hours(),
+            approval_max_entries: default_approval_max_entries(),
             system_prompt: String::new(),
             language: default_language(),
             disabled_tools: Vec::new(),
@@ -126,6 +138,8 @@ impl HarnessConfig {
         config.top_p = config.top_p.clamp(0.0, 1.0);
         config.max_tool_output = config.max_tool_output.clamp(1_024, 65_536);
         config.subagent_max_steps = config.subagent_max_steps.clamp(1, 50);
+        config.approval_ttl_hours = config.approval_ttl_hours.clamp(1, 8_760);
+        config.approval_max_entries = config.approval_max_entries.clamp(10, 2_000);
         if config.language != "en" {
             config.language = "vi".to_string();
         }
@@ -226,6 +240,12 @@ pub fn load(data_dir: impl AsRef<Path>) -> HarnessConfig {
         top_p: field(object, "top_p", defaults.top_p),
         max_tool_output: field(object, "max_tool_output", defaults.max_tool_output),
         subagent_max_steps: field(object, "subagent_max_steps", defaults.subagent_max_steps),
+        approval_ttl_hours: field(object, "approval_ttl_hours", defaults.approval_ttl_hours),
+        approval_max_entries: field(
+            object,
+            "approval_max_entries",
+            defaults.approval_max_entries,
+        ),
         system_prompt: field(object, "system_prompt", defaults.system_prompt),
         language: field(object, "language", defaults.language),
         disabled_tools: field(object, "disabled_tools", defaults.disabled_tools),
@@ -306,6 +326,8 @@ mod tests {
         assert_eq!(config.permission_mode, PermissionMode::Standard);
         assert!(config.compaction.enabled);
         assert!(config.memory.auto_recall);
+        assert_eq!(config.approval_ttl_hours, 168);
+        assert_eq!(config.approval_max_entries, 200);
     }
 
     #[test]
@@ -314,6 +336,8 @@ mod tests {
         let config = HarnessConfig {
             permission_mode: PermissionMode::Strict,
             max_steps: 999,
+            approval_ttl_hours: 0,
+            approval_max_entries: 99_999,
             memory: MemorySettings {
                 recall_limit: 99,
                 ..MemorySettings::default()
@@ -324,6 +348,8 @@ mod tests {
         let loaded = load(dir.path());
         assert_eq!(loaded.permission_mode, PermissionMode::Strict);
         assert_eq!(loaded.max_steps, 100);
+        assert_eq!(loaded.approval_ttl_hours, 1);
+        assert_eq!(loaded.approval_max_entries, 2_000);
         assert_eq!(loaded.memory.recall_limit, 10);
     }
 

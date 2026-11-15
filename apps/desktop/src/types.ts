@@ -65,6 +65,8 @@ export type HarnessConfig = {
   top_p: number;
   max_tool_output: number;
   subagent_max_steps: number;
+  approval_ttl_hours: number;
+  approval_max_entries: number;
   system_prompt: string;
   language: string;
   disabled_tools: string[];
