@@ -22,6 +22,10 @@ use tokio::sync::Mutex;
 use crate::tools::{Tool, ToolError, ToolOutput};
 
 const MCP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Một dòng JSON-RPC quá lớn có thể làm cạn RAM; chặn trước khi cấp phát.
+const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Kết quả tool MCP đưa vào context cũng cần có trần.
+const MAX_MCP_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum McpError {
@@ -417,6 +421,34 @@ impl McpConnection {
         Ok(())
     }
 
+    /// Đọc một dòng có giới hạn, không dùng `read_line` vô hạn.
+    async fn read_line_capped(&mut self, max: usize) -> Result<Option<String>, McpError> {
+        let mut bytes = Vec::new();
+        loop {
+            let available = self.stdout.fill_buf().await?;
+            if available.is_empty() {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            if let Some(position) = available.iter().position(|&byte| byte == b'\n') {
+                bytes.extend_from_slice(&available[..=position]);
+                self.stdout.consume(position + 1);
+                return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            bytes.extend_from_slice(available);
+            let consumed = available.len();
+            self.stdout.consume(consumed);
+            if bytes.len() > max {
+                return Err(McpError::Rpc(format!(
+                    "dòng JSON từ MCP server vượt quá {} KB",
+                    max / 1024
+                )));
+            }
+        }
+    }
+
     async fn read_result(&mut self, id: u64) -> Result<Value, McpError> {
         let deadline = Instant::now() + MCP_TIMEOUT;
         loop {
@@ -425,15 +457,16 @@ impl McpConnection {
                 return Err(McpError::Timeout);
             }
 
-            let mut line = String::new();
-            let read = tokio::time::timeout(remaining, self.stdout.read_line(&mut line)).await;
-            let read = match read {
-                Ok(result) => result?,
-                Err(_) => return Err(McpError::Timeout),
-            };
-            if read == 0 {
+            let line =
+                match tokio::time::timeout(remaining, self.read_line_capped(MAX_MCP_LINE_BYTES))
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => return Err(McpError::Timeout),
+                };
+            let Some(line) = line else {
                 return Err(McpError::Closed);
-            }
+            };
 
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -530,7 +563,15 @@ fn parse_call_result(result: &Value) -> ToolOutput {
     if parts.is_empty() {
         parts.push(result.to_string());
     }
-    let content = parts.join("\n");
+    let mut content = parts.join("\n");
+    if content.len() > MAX_MCP_OUTPUT_BYTES {
+        let mut end = MAX_MCP_OUTPUT_BYTES;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str("\n… (output MCP đã bị cắt bớt)");
+    }
     if is_error {
         ToolOutput::error(content)
     } else {
@@ -599,6 +640,17 @@ mod tests {
             "isError": true
         }));
         assert!(error.is_error);
+    }
+
+    #[test]
+    fn caps_large_tool_output() {
+        let big = "x".repeat(100 * 1024);
+        let output = parse_call_result(&json!({
+            "content": [{"type": "text", "text": big}],
+            "isError": false
+        }));
+        assert!(output.content.len() < 70 * 1024);
+        assert!(output.content.contains("output MCP đã bị cắt bớt"));
     }
 
     #[test]

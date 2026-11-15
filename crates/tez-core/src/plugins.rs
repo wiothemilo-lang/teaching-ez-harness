@@ -45,17 +45,25 @@ pub struct Plugin {
 
 impl Plugin {
     /// Đường dẫn tuyệt đối của các skill được khai báo trong manifest.
+    ///
+    /// Chỉ giữ các đường dẫn thật sự nằm trong thư mục plugin: chặn `..`,
+    /// đường dẫn tuyệt đối và symlink trỏ ra ngoài.
     pub fn skill_paths(&self) -> Vec<PathBuf> {
+        let Ok(root) = std::fs::canonicalize(&self.dir) else {
+            return Vec::new();
+        };
         self.manifest
             .skills
             .iter()
-            .map(|relative| {
+            .filter_map(|relative| {
                 let path = Path::new(relative);
-                if path.is_absolute() {
+                let candidate = if path.is_absolute() {
                     path.to_path_buf()
                 } else {
                     self.dir.join(path)
-                }
+                };
+                let canonical = std::fs::canonicalize(candidate).ok()?;
+                canonical.starts_with(&root).then_some(canonical)
             })
             .collect()
     }
@@ -111,7 +119,7 @@ mod tests {
     fn loads_plugin_manifest_and_skill_paths() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("plugins").join("demo");
-        std::fs::create_dir_all(plugin_dir.join("skills")).unwrap();
+        std::fs::create_dir_all(plugin_dir.join("skills").join("demo")).unwrap();
         std::fs::write(
             plugin_dir.join("plugin.json"),
             r#"{
@@ -143,5 +151,42 @@ mod tests {
 
         let plugins = load_all(dir.path()).unwrap();
         assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn skill_paths_stay_inside_plugin_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("demo");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"demo","name":"Demo","skills":["../outside","/etc"]}"#,
+        )
+        .unwrap();
+
+        let plugins = load_all(dir.path()).unwrap();
+        assert!(plugins[0].skill_paths().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_paths_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("demo");
+        std::fs::create_dir_all(plugin_dir.join("skills")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, plugin_dir.join("skills").join("escape")).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"demo","name":"Demo","skills":["skills/escape"]}"#,
+        )
+        .unwrap();
+
+        let plugins = load_all(dir.path()).unwrap();
+        assert!(plugins[0].skill_paths().is_empty());
     }
 }
