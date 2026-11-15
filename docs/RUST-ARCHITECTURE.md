@@ -575,8 +575,8 @@ Chi tiết đóng gói: [DESKTOP-CLI.md](DESKTOP-CLI.md).
 ## 11. CLI `tez`
 
 ```bash
-tez connect groq --method key
-tez connect ollama
+tez connect --provider groq
+tez connect --provider ollama
 tez chat "Giải thích borrow checker"
 tez chat --mode code --workspace ~/projects/app "Sửa lỗi build"
 tez chat --session <id> --history 20 "Tiếp tục việc còn dở"

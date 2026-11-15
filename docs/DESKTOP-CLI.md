@@ -145,9 +145,9 @@ GET  /v1/usage
 ## 6. CLI `tez`
 
 ```bash
-tez connect groq --method key
-tez connect ollama
-tez connect custom
+tez connect --provider groq
+tez connect --provider ollama
+tez connect --provider custom --base-url <url>
 tez chat "Giải thích borrow checker"
 tez chat --subject math "Giải phương trình 2x + 3 = 7"
 tez chat --mode code --workspace ~/du-an "Sửa lỗi build"

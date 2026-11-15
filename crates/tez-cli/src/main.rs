@@ -38,7 +38,7 @@ use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::{code_registry, ToolError, ToolRegistry};
-use tez_llm::{LlmProvider, Message, OpenAiCompatible};
+use tez_llm::{LlmError, LlmProvider, Message, OpenAiCompatible};
 use tez_store::{NewMessage, Store, UsageRecord};
 
 #[derive(Parser)]
@@ -307,7 +307,40 @@ fn env_api_key(provider: &str) -> Option<String> {
     };
     std::env::var(name)
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Gợi ý hành động cho các lỗi LLM hay gặp, thay vì để lộ body 401/403 thô.
+fn llm_error_hint(error: &LlmError) -> Option<String> {
+    match error {
+        LlmError::Api { status, .. } if *status == 401 || *status == 403 => Some(format!(
+            "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key bằng \
+             `tez connect --provider <loại>` hoặc biến môi trường tương ứng."
+        )),
+        LlmError::Api { status, .. } if *status == 429 => Some(
+            "Provider đang giới hạn tốc độ (HTTP 429). Chờ vài giây rồi thử lại, \
+             hoặc đổi model/provider."
+                .to_string(),
+        ),
+        LlmError::MissingKey => Some(
+            "Chưa có API key cho provider này. Chạy `tez connect --provider <loại>` \
+             hoặc dùng --provider ollama/custom nếu endpoint không cần key."
+                .to_string(),
+        ),
+        LlmError::Http(err) if err.is_timeout() => Some(
+            "Provider không phản hồi kịp (timeout). Kiểm tra mạng/base_url rồi thử lại."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn with_llm_hint(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<LlmError>().and_then(llm_error_hint) {
+        Some(hint) => error.context(hint),
+        None => error,
+    }
 }
 
 fn full_registry() -> ToolRegistry {
@@ -352,20 +385,64 @@ fn resolve_subject(input: &str) -> anyhow::Result<&'static SubjectPack> {
 
 async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
     let dir = data_dir()?;
+    let provider = args.provider.trim().to_lowercase();
+    connection::validate_provider(&provider)?;
     let api_key = match args.api_key {
         Some(key) => key,
-        None if args.provider == "ollama" => String::new(),
-        None => Password::new()
-            .with_prompt(format!("API key cho {}", args.provider))
-            .interact()?,
+        None if !connection::requires_api_key(&provider) => String::new(),
+        None => {
+            if let Some(key) = env_api_key(&provider) {
+                key
+            } else if std::io::stdin().is_terminal() {
+                Password::new()
+                    .with_prompt(format!("API key cho {provider}"))
+                    .interact()?
+            } else {
+                anyhow::bail!(
+                    "Thiếu API key cho {provider} và không có terminal để nhập ẩn. \
+                     Dùng --api-key hoặc đặt biến môi trường (vd GROQ_API_KEY)."
+                )
+            }
+        }
     };
+    let api_key = api_key.trim().to_string();
+    if let Some(url) = args.base_url.as_deref() {
+        let url = url.trim();
+        if url.starts_with("http://") {
+            let host = url
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("");
+            if !(host.starts_with("127.0.0.1")
+                || host.starts_with("localhost")
+                || host.starts_with("[::1]"))
+            {
+                eprintln!(
+                    "[cảnh báo] base_url dùng HTTP không mã hóa: API key sẽ gửi dạng cleartext."
+                );
+            }
+        }
+    }
+    if connection::requires_api_key(&provider) && api_key.is_empty() {
+        anyhow::bail!(
+            "API key rỗng cho {provider}. Nhập key thật, hoặc dùng --provider ollama/custom \
+             nếu endpoint không cần key."
+        );
+    }
 
+    // Cùng một loại provider thì cập nhật entry cũ thay vì thêm trùng.
+    let existing_id = providers::load(&dir)?
+        .providers
+        .iter()
+        .find(|entry| entry.provider == provider)
+        .map(|entry| entry.id.clone());
     let saved = providers::upsert(
         &dir,
         ProviderInput {
-            id: None,
+            id: existing_id.as_deref(),
             name: "",
-            provider: &args.provider,
+            provider: &provider,
             base_url: args.base_url.as_deref(),
             model: args.model.as_deref(),
             api_key: Some(&api_key),
@@ -399,11 +476,31 @@ async fn test_connection() -> anyhow::Result<()> {
     let saved = providers::active(&dir)?.ok_or_else(|| {
         anyhow::anyhow!("Chưa kết nối provider. Chạy: tez connect --provider groq")
     })?;
-    let api_key = providers::decrypt_key(&dir, &saved)?;
+    let mut api_key = providers::decrypt_key(&dir, &saved)?;
+    if api_key.trim().is_empty() {
+        // Key lưu rỗng (provider cũ) nhưng env có key: dùng env để test.
+        if let Some(key) = env_api_key(&saved.provider) {
+            api_key = key;
+        }
+    }
+    if api_key.trim().is_empty() && connection::requires_api_key(&saved.provider) {
+        anyhow::bail!(
+            "Chưa có API key cho '{}'. Chạy `tez connect --provider {}` \
+             hoặc đặt biến môi trường tương ứng.",
+            saved.provider,
+            saved.provider
+        );
+    }
     let provider = OpenAiCompatible::new(&saved.provider, &saved.base_url, &api_key);
 
     let started = Instant::now();
-    let reply = tez_llm::ping(&provider, &saved.model).await?;
+    let reply =
+        tez_llm::ping(&provider, &saved.model)
+            .await
+            .map_err(|error| match llm_error_hint(&error) {
+                Some(hint) => anyhow::anyhow!("{hint}\nNguyên nhân: {error}"),
+                None => anyhow::anyhow!(error),
+            })?;
     println!(
         "OK · {} · {} · {}ms · {}",
         saved.provider,
@@ -453,10 +550,10 @@ fn provider_remove(id: &str) -> anyhow::Result<()> {
     let dir = data_dir()?;
     if providers::remove(&dir, id)? {
         println!("Đã xóa provider {id}.");
+        Ok(())
     } else {
-        println!("Không tìm thấy provider {id}.");
+        anyhow::bail!("Không tìm thấy provider {id}.")
     }
-    Ok(())
 }
 
 fn skills_list() -> anyhow::Result<()> {
@@ -1019,7 +1116,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
             Err(error) => {
                 // Không để session rỗng hoặc kẹt 'active' khi lượt chat thất bại.
                 Store::open(dir.join("tez.db"))?.abandon_session(&session_id)?;
-                return Err(error);
+                return Err(with_llm_hint(error));
             }
         }
     } else if interactive {
@@ -1071,7 +1168,7 @@ async fn chat(args: ChatArgs) -> anyhow::Result<()> {
 
             match turn.run_turn(&mut conversation, input).await {
                 Ok(text) => last_summary = text,
-                Err(error) => eprintln!("[lỗi] {error}"),
+                Err(error) => eprintln!("[lỗi] {}", with_llm_hint(error)),
             }
             println!();
         }

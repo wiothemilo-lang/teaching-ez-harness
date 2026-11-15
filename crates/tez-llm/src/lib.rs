@@ -187,8 +187,13 @@ impl OpenAiCompatible {
         Self {
             name: name.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
-            client: reqwest::Client::new(),
+            api_key: api_key.into().trim().to_string(),
+            // Không để một provider treo làm kẹt cả agent loop.
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -233,7 +238,23 @@ impl LlmProvider for OpenAiCompatible {
             body["max_tokens"] = json!(max_tokens);
         }
 
-        let url = format!("{}/chat/completions", self.base_url);
+        // Giữ query string của base_url (vd Azure `?api-version=...`) ở cuối URL.
+        let (base, query) = match self.base_url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (self.base_url.as_str(), None),
+        };
+        let base = base.trim_end_matches('/');
+        let url = if base.ends_with("/chat/completions") {
+            match query {
+                Some(query) => format!("{base}?{query}"),
+                None => base.to_string(),
+            }
+        } else {
+            match query {
+                Some(query) => format!("{base}/chat/completions?{query}"),
+                None => format!("{base}/chat/completions"),
+            }
+        };
         let mut request = self.client.post(url);
         if !self.api_key.is_empty() {
             request = request.bearer_auth(&self.api_key);
@@ -243,9 +264,11 @@ impl LlmProvider for OpenAiCompatible {
         let status = response.status();
         let text = response.text().await?;
         if !status.is_success() {
+            // Giới hạn body để không flood UI/log và không lộ toàn bộ phản hồi.
+            let body: String = text.chars().take(500).collect();
             return Err(LlmError::Api {
                 status: status.as_u16(),
-                body: text,
+                body,
             });
         }
 
@@ -259,14 +282,28 @@ impl LlmProvider for OpenAiCompatible {
             .get("message")
             .ok_or_else(|| LlmError::Invalid("no message".into()))?;
 
-        let content = message
-            .get("content")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let calls: Vec<ToolCall> = message
-            .get("tool_calls")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        let content = match message.get("content") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            // Một số gateway trả content dạng mảng parts.
+            Some(Value::Array(parts)) => {
+                let text: String = parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            Some(other) => return Err(LlmError::Invalid(format!("content không hợp lệ: {other}"))),
+        };
+        let calls: Vec<ToolCall> = match message.get("tool_calls") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|e| LlmError::Invalid(format!("tool_calls không hợp lệ: {e}")))?,
+        };
         let usage = value
             .get("usage")
             .map(|u| Usage {
