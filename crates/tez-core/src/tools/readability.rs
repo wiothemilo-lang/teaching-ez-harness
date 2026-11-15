@@ -30,6 +30,8 @@ impl Tool for Readability {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("thiếu 'text'".into()))?;
 
+        super::check_input_bounds(text).map_err(ToolError::InvalidArgs)?;
+
         let sentences = text
             .chars()
             .filter(|c| matches!(c, '.' | '!' | '?'))
@@ -44,8 +46,9 @@ impl Tool for Readability {
         let syllables: usize = words.iter().map(|w| count_syllables(w)).sum();
         let syllable_count = syllables.max(1) as f64;
 
-        let score =
+        let raw_score =
             206.835 - 1.015 * (word_count / sentences) - 84.6 * (syllable_count / word_count);
+        let score = raw_score.clamp(0.0, 100.0);
         let level = match score {
             s if s >= 80.0 => "rất dễ",
             s if s >= 60.0 => "dễ",
@@ -81,6 +84,16 @@ fn count_syllables(word: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_oversized_text() {
+        let text = "word ".repeat(1000);
+        let error = Readability
+            .execute(json!({"text": text}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs(_)));
+    }
 
     #[tokio::test]
     async fn scores_simple_text() {

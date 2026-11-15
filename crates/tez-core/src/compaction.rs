@@ -171,7 +171,7 @@ impl Compactor {
             let Some(content) = message.content.clone() else {
                 continue;
             };
-            if content.len() <= self.settings.large_result_chars {
+            if content.chars().count() <= self.settings.large_result_chars {
                 continue;
             }
             let id = message
@@ -206,7 +206,7 @@ impl Compactor {
     fn persist_result(&self, id: &str, content: &str) -> Option<PathBuf> {
         let dir = self.artifact_dir.as_ref()?.join("tool-results");
         std::fs::create_dir_all(&dir).ok()?;
-        let name: String = id
+        let mut name: String = id
             .chars()
             .map(|ch| {
                 if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -217,8 +217,13 @@ impl Compactor {
             })
             .take(80)
             .collect();
-        let path = dir.join(format!("{name}.txt"));
-        std::fs::write(&path, content).ok()?;
+        if name.is_empty() {
+            name.push_str("result");
+        }
+        // Cùng tool_call_id có thể xuất hiện lại với nội dung khác: thêm hash
+        // để không ghi đè kết quả cũ.
+        let path = dir.join(format!("{name}-{:08x}.txt", content_hash(content) as u32));
+        write_atomic(&path, content).ok()?;
         Some(path)
     }
 
@@ -292,7 +297,7 @@ impl Compactor {
             let Some(content) = messages[index].content.clone() else {
                 continue;
             };
-            if content.len() <= 120 || content.starts_with("[Kết quả") {
+            if content.chars().count() <= 120 || content.starts_with("[Kết quả") {
                 continue;
             }
             let id = messages[index]
@@ -319,10 +324,11 @@ impl Compactor {
         active_request: Option<&str>,
     ) -> CompactReport {
         let transcript = self.write_transcript(messages);
-        let system = messages
+        let systems: Vec<Message> = messages
             .iter()
-            .find(|message| message.role == "system")
-            .cloned();
+            .filter(|message| message.role == "system")
+            .cloned()
+            .collect();
 
         let mut body = String::from("[Hội thoại đã được nén để tiết kiệm context]\n\n");
         if let Some(request) = active_request {
@@ -336,10 +342,7 @@ impl Compactor {
             body.push_str(&format!("\n\nTranscript đầy đủ: {}", path.display()));
         }
 
-        let mut next = Vec::new();
-        if let Some(system) = system {
-            next.push(system);
-        }
+        let mut next = systems;
         next.push(Message::user(body));
         *messages = next;
 
@@ -356,12 +359,36 @@ impl Compactor {
         std::fs::create_dir_all(&dir).ok()?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
+            .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         let path = dir.join(format!("{stamp}.json"));
         let json = serde_json::to_string_pretty(messages).ok()?;
-        std::fs::write(&path, json).ok()?;
+        write_atomic(&path, &json).ok()?;
         Some(path)
+    }
+}
+
+fn content_hash(content: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in content.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{suffix}", std::process::id()));
+    std::fs::write(&temp, content)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error)
+        }
     }
 }
 
@@ -435,9 +462,13 @@ mod tests {
         let content = messages[3].content.as_deref().unwrap();
         assert!(content.contains("đã lưu tại"));
         assert!(content.len() < 500);
-        let path = dir.path().join("tool-results").join("call_1.txt");
-        assert!(path.exists());
-        assert_eq!(std::fs::read_to_string(path).unwrap().len(), 5_000);
+        let entries: Vec<_> = std::fs::read_dir(dir.path().join("tool-results"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(std::fs::read_to_string(&entries[0]).unwrap().len(), 5_000);
     }
 
     #[test]
@@ -552,6 +583,50 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Kết quả cũ đã lưu")));
+    }
+
+    #[test]
+    fn persist_result_keeps_versions_for_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = Compactor::new(CompactSettings::default(), Some(dir.path().to_path_buf()));
+        let first = compactor.persist_result("call_1", "first").unwrap();
+        let second = compactor.persist_result("call_1", "second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
+    }
+
+    #[test]
+    fn large_result_threshold_counts_chars_not_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = Compactor::new(
+            CompactSettings {
+                large_result_chars: 100,
+                ..CompactSettings::default()
+            },
+            Some(dir.path().to_path_buf()),
+        );
+        let mut messages = vec![Message::tool("call_1", "ế".repeat(60))];
+        let report = compactor.prepare(&mut messages);
+        assert_eq!(report.persisted, 0);
+        assert!(messages[0].content.as_deref().unwrap().starts_with('ế'));
+    }
+
+    #[test]
+    fn applies_summary_keeps_all_system_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = Compactor::new(CompactSettings::default(), Some(dir.path().to_path_buf()));
+        let mut messages = vec![
+            Message::system("system one"),
+            Message::system("system two"),
+            Message::user("hello"),
+        ];
+        let report = compactor.apply_summary(&mut messages, "tóm tắt", None);
+        assert!(report.summarized);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content.as_deref(), Some("system one"));
+        assert_eq!(messages[1].content.as_deref(), Some("system two"));
+        assert_eq!(messages[2].role, "user");
     }
 
     #[test]
