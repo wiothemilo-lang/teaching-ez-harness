@@ -198,6 +198,7 @@ struct SessionRequest {
 struct StoredMessageInfo {
     role: String,
     content: String,
+    images: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1216,6 +1217,7 @@ fn load_session(request: SessionRequest) -> Result<SessionDetail, String> {
         .map(|message| StoredMessageInfo {
             role: message.role,
             content: message.content,
+            images: message.images,
         })
         .collect();
 
@@ -1265,6 +1267,19 @@ async fn chat_inner(
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ChatReply> {
     let stream_app = app.clone();
+    if request.images.len() > 4 {
+        anyhow::bail!("tối đa 4 ảnh mỗi lượt");
+    }
+    if request
+        .images
+        .iter()
+        .any(|image| !image.starts_with("data:image/"))
+    {
+        anyhow::bail!("ảnh phải là data URL image/*");
+    }
+    if request.images.iter().map(String::len).sum::<usize>() > 8 * 1024 * 1024 {
+        anyhow::bail!("tổng dung lượng ảnh vượt 8 MB");
+    }
     let dir = data_dir()?;
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
     let workspace = match mode {
@@ -1319,6 +1334,8 @@ async fn chat_inner(
                     .load_messages(id, 40)?
                     .into_iter()
                     .filter_map(|message| match message.role.as_str() {
+                        // Ảnh cũ vẫn hiện trong UI/resume nhưng không gửi lại
+                        // toàn bộ lịch sử để tránh request phình to.
                         "user" => Some(Message::user(message.content)),
                         "assistant" => Some(Message::assistant(message.content)),
                         _ => None,
@@ -1367,14 +1384,17 @@ async fn chat_inner(
         .map(|hit| format!("[{}] {}", hit.title, hit.snippet))
         .collect();
 
-    store.append_message(NewMessage {
-        session_id: &session_id,
-        role: "user",
-        content: &request.message,
-        model: None,
-        tokens_in: 0,
-        tokens_out: 0,
-    })?;
+    store.append_message_with_images(
+        NewMessage {
+            session_id: &session_id,
+            role: "user",
+            content: &request.message,
+            model: None,
+            tokens_in: 0,
+            tokens_out: 0,
+        },
+        &request.images,
+    )?;
     drop(store);
 
     let mut recent = history;

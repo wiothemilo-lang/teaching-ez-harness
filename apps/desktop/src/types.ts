@@ -203,7 +203,7 @@ export type SessionInfo = {
 
 export type SessionDetail = {
   id: string;
-  messages: { role: string; content: string }[];
+  messages: { role: string; content: string; images?: string[] }[];
   todos: TodoItem[];
 };
 

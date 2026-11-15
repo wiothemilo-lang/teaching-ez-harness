@@ -46,6 +46,16 @@ pub struct SkillRegistry {
     skills: Vec<Skill>,
 }
 
+fn source_rank(source: &str) -> u8 {
+    match source {
+        "project" => 0,
+        "user" => 1,
+        "plugin" => 2,
+        "builtin" => 3,
+        _ => 4,
+    }
+}
+
 impl SkillRegistry {
     /// Nạp skill của user và seed bộ skill mặc định nếu thư mục chưa có.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, SkillError> {
@@ -164,16 +174,26 @@ impl SkillRegistry {
     /// sắp theo id để prompt ổn định giữa các lần chạy.
     pub fn catalog_lines(&self, limit: usize) -> Vec<String> {
         let mut skills: Vec<&Skill> = self.skills.iter().collect();
-        skills.sort_by(|a, b| a.id.cmp(&b.id));
+        // Skill dự án đứng trước để model thấy ngữ cảnh cục bộ trước built-in.
+        skills.sort_by(|a, b| {
+            source_rank(&a.source)
+                .cmp(&source_rank(&b.source))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         skills
             .into_iter()
             .take(limit)
             .map(|skill| {
                 let description = truncate_chars(skill.description.trim(), 160);
-                if description.is_empty() {
-                    format!("- {} — {}", skill.id, skill.name)
+                let id = if skill.source == "project" {
+                    format!("[project] {}", skill.id)
                 } else {
-                    format!("- {} — {}: {}", skill.id, skill.name, description)
+                    skill.id.clone()
+                };
+                if description.is_empty() {
+                    format!("- {id} — {}", skill.name)
+                } else {
+                    format!("- {id} — {}: {}", skill.name, description)
                 }
             })
             .collect()

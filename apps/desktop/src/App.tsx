@@ -239,6 +239,7 @@ export default function App() {
               id: uid(),
               role: message.role === "user" ? ("user" as const) : ("assistant" as const),
               text: message.content,
+              images: message.images?.length ? message.images : undefined,
             })),
         );
         setLastUsage(null);

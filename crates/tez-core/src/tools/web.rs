@@ -1,6 +1,6 @@
 //! Tool `web_fetch`: tải và đọc nội dung HTTP(S) trong giới hạn an toàn.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_ERROR_PREVIEW_CHARS: usize = 500;
 const USER_AGENT: &str = "tez/0.1 (+local)";
+const MAX_REDIRECTS: usize = 5;
 
 /// Tải một URL http/https và trả về text đã làm sạch.
 pub struct WebFetchTool;
@@ -79,34 +80,71 @@ async fn fetch_url(
     max_chars: usize,
     allow_private: bool,
 ) -> Result<ToolOutput, ToolError> {
-    let url = validate_url(raw_url, allow_private).await?;
-    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error("quá nhiều redirect");
-        }
-        if !allow_private && forbidden_url_shape(attempt.url()).is_some() {
-            return attempt.error("redirect tới địa chỉ bị chặn");
-        }
-        attempt.follow()
-    });
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(20))
-        .redirect(redirect_policy)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|error| ToolError::Execution(format!("không tạo được HTTP client: {error}")))?;
+    let (mut url, mut pin) = validate_url(raw_url, allow_private).await?;
+    let mut response = None;
 
-    let mut response = match client.get(url).send().await {
-        Ok(response) => response,
-        Err(error) => return Ok(ToolOutput::error(format!("không tải được URL: {error}"))),
+    for _ in 0..=MAX_REDIRECTS {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(USER_AGENT);
+        if let Some((host, address)) = &pin {
+            builder = builder.resolve(host, *address);
+        }
+        let client = builder.build().map_err(|error| {
+            ToolError::Execution(format!("không tạo được HTTP client: {error}"))
+        })?;
+
+        let current = match client.get(url.clone()).send().await {
+            Ok(response) => response,
+            Err(error) => return Ok(ToolOutput::error(format!("không tải được URL: {error}"))),
+        };
+
+        if current.status().is_redirection() {
+            let Some(location) = current
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return Ok(ToolOutput::error(
+                    "redirect nhưng thiếu header Location".to_string(),
+                ));
+            };
+            let next = match url.join(location) {
+                Ok(next) => next,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!("redirect không hợp lệ: {error}")))
+                }
+            };
+            let (next, next_pin) = match validate_url(next.as_str(), allow_private).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "redirect tới địa chỉ bị chặn: {error}"
+                    )))
+                }
+            };
+            url = next;
+            pin = next_pin;
+            continue;
+        }
+
+        response = Some(current);
+        break;
+    }
+
+    let Some(mut response) = response else {
+        return Ok(ToolOutput::error(
+            "quá nhiều redirect (tối đa 5)".to_string(),
+        ));
     };
     let status = response.status();
     let final_url = response.url().to_string();
 
     if !status.is_success() {
         let body = match read_body_capped(&mut response, MAX_ERROR_BODY_BYTES).await {
-            Ok(body) => body,
+            Ok((body, _)) => body,
             Err(error) => {
                 return Ok(ToolOutput::error(format!(
                     "HTTP {status} (không đọc được body: {error})"
@@ -118,26 +156,28 @@ async fn fetch_url(
         return Ok(ToolOutput::error(format!("HTTP {status}\n\n{preview}")));
     }
 
-    let is_html = response
+    let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let is_html = content_type
+        .as_deref()
         .map(|value| value.to_ascii_lowercase().contains("html"))
         .unwrap_or(false);
 
-    let body = match read_body_capped(&mut response, MAX_BODY_BYTES).await {
+    let (body, body_truncated) = match read_body_capped(&mut response, MAX_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => return Ok(ToolOutput::error(format!("không đọc được body: {error}"))),
     };
-    let body = String::from_utf8_lossy(&body);
-    let text = if is_html {
-        strip_html(&body)
-    } else {
-        body.into_owned()
-    };
+    let body = decode_body(&body, content_type.as_deref());
+    let text = if is_html { strip_html(&body) } else { body };
     let (text, truncated) = truncate_chars(&text, max_chars);
 
     let mut content = format!("URL: {final_url}\nStatus: {}\n\n{text}", status.as_u16());
+    if body_truncated {
+        content.push_str("\n… (body đã cắt ở 512 KB)");
+    }
     if truncated {
         content.push_str("\n… (đã cắt bớt)");
     }
@@ -145,7 +185,10 @@ async fn fetch_url(
 }
 
 /// Kiểm tra scheme, userinfo và đích đến trước khi gửi request.
-async fn validate_url(raw: &str, allow_private: bool) -> Result<reqwest::Url, ToolError> {
+async fn validate_url(
+    raw: &str,
+    allow_private: bool,
+) -> Result<(reqwest::Url, Option<(String, SocketAddr)>), ToolError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(ToolError::InvalidArgs("URL rỗng".into()));
@@ -184,7 +227,7 @@ async fn validate_url(raw: &str, allow_private: bool) -> Result<reqwest::Url, To
                 "từ chối địa chỉ IP nội bộ: {ip}"
             )));
         }
-        return Ok(url);
+        return Ok((url, None));
     }
 
     if !allow_private && is_localhost_name(&host) {
@@ -193,7 +236,7 @@ async fn validate_url(raw: &str, allow_private: bool) -> Result<reqwest::Url, To
         )));
     }
     if allow_private {
-        return Ok(url);
+        return Ok((url, None));
     }
 
     let port = url.port_or_known_default().unwrap_or(80);
@@ -202,25 +245,28 @@ async fn validate_url(raw: &str, allow_private: bool) -> Result<reqwest::Url, To
         .map_err(|error| {
             ToolError::Execution(format!("không phân giải được host '{host}': {error}"))
         })?;
-    let mut resolved = false;
+    let mut pin = None;
     for address in addresses {
-        resolved = true;
         if is_forbidden_ip(address.ip()) {
             return Err(ToolError::InvalidArgs(format!(
                 "host '{host}' trỏ tới địa chỉ nội bộ ({})",
                 address.ip()
             )));
         }
+        if pin.is_none() {
+            pin = Some((host.clone(), address));
+        }
     }
-    if !resolved {
-        return Err(ToolError::Execution(format!(
+    match pin {
+        Some(pin) => Ok((url, Some(pin))),
+        None => Err(ToolError::Execution(format!(
             "không phân giải được host '{host}'"
-        )));
+        ))),
     }
-    Ok(url)
 }
 
-/// Kiểm tra hình dạng URL không cần DNS, dùng cho từng redirect.
+/// Kiểm tra hình dạng URL không cần DNS; dùng trong test redirect.
+#[cfg(test)]
 fn forbidden_url_shape(url: &reqwest::Url) -> Option<String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Some(format!("scheme '{}' không được phép", url.scheme()));
@@ -266,12 +312,23 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
 }
 
 fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_multicast()
+        // CGNAT 100.64.0.0/10.
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // "This network" 0.0.0.0/8.
+        || octets[0] == 0
+        // IETF protocol assignments 192.0.0.0/24.
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // Benchmarking 198.18.0.0/15.
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        // Reserved 240.0.0.0/4.
+        || octets[0] >= 240
 }
 
 fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
@@ -284,21 +341,40 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
             return true;
         }
     }
-    let first = ip.segments()[0];
+    let segments = ip.segments();
+    let first = segments[0];
     // fc00::/7 (unique local).
     if first & 0xfe00 == 0xfc00 {
         return true;
     }
     // fe80::/10 (link-local).
-    first & 0xffc0 == 0xfe80
+    if first & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // 2001:db8::/32 (documentation).
+    if first == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+    // 6to4 2002::/16: kiểm tra IPv4 nhúng.
+    if first == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        );
+        return is_forbidden_ipv4(embedded);
+    }
+    false
 }
 
 /// Đọc body theo chunk, dừng khi đạt `cap` byte.
 async fn read_body_capped(
     response: &mut reqwest::Response,
     cap: usize,
-) -> Result<Vec<u8>, reqwest::Error> {
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
     let mut body = Vec::new();
+    let mut truncated = false;
     while body.len() < cap {
         let Some(chunk) = response.chunk().await? else {
             break;
@@ -307,12 +383,22 @@ async fn read_body_capped(
             break;
         }
         let room = cap - body.len();
-        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if chunk.len() >= room {
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            truncated = true;
             break;
         }
+        body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    // Body đúng bằng cap vẫn có thể còn dữ liệu phía sau.
+    if !truncated && body.len() == cap {
+        if let Some(chunk) = response.chunk().await? {
+            if !chunk.is_empty() {
+                truncated = true;
+            }
+        }
+    }
+    Ok((body, truncated))
 }
 
 /// Bỏ `<script>...</script>` và `<style>...</style>` (không phân biệt hoa thường).
@@ -379,6 +465,21 @@ fn replace_tags_with_space(input: &str) -> String {
     out
 }
 
+/// Giải mã entity số (`&#123;`, `&#x1F;`), trả về ký tự và số byte đã dùng.
+fn numeric_entity(tail: &str) -> Option<(char, usize)> {
+    let body = tail.strip_prefix("&#")?;
+    let (digits, radix, prefix) = match body.strip_prefix(['x', 'X']) {
+        Some(hex) => (hex, 16, 1),
+        None => (body, 10, 0),
+    };
+    let end = digits.find(';')?;
+    if end == 0 || end > 8 {
+        return None;
+    }
+    let value = u32::from_str_radix(&digits[..end], radix).ok()?;
+    Some((char::from_u32(value)?, 2 + prefix + end + 1))
+}
+
 /// Decode một lượt các entity phổ biến, tránh giải mã lặp (`&amp;lt;`).
 fn decode_entities(input: &str) -> String {
     const ENTITIES: &[(&str, char)] = &[
@@ -396,6 +497,11 @@ fn decode_entities(input: &str) -> String {
     while let Some(position) = rest.find('&') {
         out.push_str(&rest[..position]);
         let tail = &rest[position..];
+        if let Some((value, consumed)) = numeric_entity(tail) {
+            out.push(value);
+            rest = &tail[consumed..];
+            continue;
+        }
         let mut matched = false;
         for (entity, value) in ENTITIES {
             if let Some(stripped) = tail.strip_prefix(entity) {
@@ -412,6 +518,58 @@ fn decode_entities(input: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Decode body theo charset trong Content-Type; mặc định UTF-8 lossy.
+fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+    let charset = content_type.and_then(|value| {
+        value.split(';').find_map(|part| {
+            let part = part.trim();
+            part.strip_prefix("charset=")
+                .map(|value| value.trim_matches('"').to_ascii_lowercase())
+        })
+    });
+    match charset.as_deref() {
+        Some("iso-8859-1" | "latin1" | "latin-1" | "windows-1252" | "cp1252") => {
+            bytes.iter().map(|byte| cp1252_char(*byte)).collect()
+        }
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// Windows-1252 cho 0x80–0x9F; phần còn lại trùng Unicode Latin-1.
+fn cp1252_char(byte: u8) -> char {
+    match byte {
+        0x80 => '€',
+        0x82 => '‚',
+        0x83 => 'ƒ',
+        0x84 => '„',
+        0x85 => '…',
+        0x86 => '†',
+        0x87 => '‡',
+        0x88 => 'ˆ',
+        0x89 => '‰',
+        0x8A => 'Š',
+        0x8B => '‹',
+        0x8C => 'Œ',
+        0x8E => 'Ž',
+        0x91 => '‘',
+        0x92 => '’',
+        0x93 => '“',
+        0x94 => '”',
+        0x95 => '•',
+        0x96 => '–',
+        0x97 => '—',
+        0x98 => '˜',
+        0x99 => '™',
+        0x9A => 'š',
+        0x9B => '›',
+        0x9C => 'œ',
+        0x9E => 'ž',
+        0x9F => 'Ÿ',
+        0x81 | 0x8D | 0x8F | 0x90 | 0x9D => '\u{FFFD}',
+        _ => byte as char,
+    }
 }
 
 /// Gộp khoảng trắng trong từng dòng và bỏ dòng trống.
@@ -530,6 +688,67 @@ mod tests {
         let (full, truncated) = truncate_chars("ngắn", 10);
         assert_eq!(full, "ngắn");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn blocks_special_ip_ranges() {
+        for ip in [
+            "100.64.0.1",
+            "0.0.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "2002:7f00:1::1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "{ip} phải bị chặn");
+        }
+        for ip in ["8.8.8.8", "2001:4860:4860::8888"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_forbidden_ip(ip), "{ip} không được chặn");
+        }
+    }
+
+    #[test]
+    fn decodes_numeric_entities() {
+        assert_eq!(decode_entities("A &#65; &#x42; &#x1F600;"), "A A B 😀");
+        assert_eq!(decode_entities("&#99999999;"), "&#99999999;");
+    }
+
+    #[test]
+    fn decodes_windows_1252_charset() {
+        let bytes = b"caf\xe9 \x93quote\x94";
+        let text = decode_body(bytes, Some("text/plain; charset=windows-1252"));
+        assert_eq!(text, "café “quote”");
+        let text = decode_body(bytes, Some("text/plain; charset=utf-8"));
+        assert!(text.contains("caf"));
+    }
+
+    #[tokio::test]
+    async fn follows_redirect_and_revalidates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nFinal"
+                    .to_string(),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let url = format!("http://{address}/start");
+        let output = fetch_url(&url, 20_000, true).await.unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("Final"), "{}", output.content);
+        server.await.unwrap();
     }
 
     #[tokio::test]

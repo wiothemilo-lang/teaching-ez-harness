@@ -198,7 +198,7 @@ tez doctor
 
 | Màn hình | Chức năng |
 |---|---|
-| **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh, preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
+| **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh (lưu vào SQLite để resume), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
 | **Code** | Workspace chip, `read_file`/`write_file`/`edit_file`/`list_files`/`glob`/`grep`/`run_command`, todo/context dock, approval modal |
 | **Approval modal** | Hiện lý do + tool + diff trước khi ghi (hoặc args JSON); từ chối hoặc cho phép; timeout 180 s thì từ chối |
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
