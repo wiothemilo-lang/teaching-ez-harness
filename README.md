@@ -3,7 +3,7 @@
 [![CodeRabbit Reviews](https://img.shields.io/badge/CodeRabbit-reviewed-FF570A?logo=coderabbit&logoColor=white)](https://coderabbit.ai)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Tests](https://img.shields.io/badge/tests-359%20passing-brightgreen)](#build--test)
+[![Tests](https://img.shields.io/badge/tests-362%20passing-brightgreen)](#build--test)
 [![Version](https://img.shields.io/badge/version-0.1.0-blue)](Cargo.toml)
 [![Local-first](https://img.shields.io/badge/local--first-BYOK-2F7D5B)](docs/DESKTOP-CLI.md)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20Windows-lightgrey?logo=linux&logoColor=black)](#desktop-tauri)
@@ -91,7 +91,7 @@ Chi tiết: [docs/WINDOWS.md](docs/WINDOWS.md).
 | Ngữ cảnh dự án: `AGENTS.md`/`CLAUDE.md`, `.tez/skills`, `.tez/mcp.json` | ✅ |
 | Web: tool `web_fetch` tải http/https, chặn host nội bộ/DNS rebinding, pin toàn bộ địa chỉ DNS, redirect kiểm tra lại (static), lọc HTML, cap 512 KB (static); `render: "browser"` tự fallback static khi thiếu/lỗi, resolver map toàn bộ địa chỉ, `--no-sandbox` chỉ khi `TEZ_BROWSER_NO_SANDBOX=1` | ✅ |
 | Ảnh: đính kèm PNG/JPEG/WebP/GIF (tối đa 4 ảnh, 5 MB/ảnh, tổng 8 MB/lượt), ghi file trong `images/<session>/`; SQLite giữ ref `tez-image:`; gửi lại tối đa 2 lượt user gần nhất | ✅ |
-| MCP client: stdio hoặc Streamable HTTP (`url` + headers), `initialize`, `tools/list`, `tools/call`, resources/prompts qua tool `mcp__<server>__extras`, tool trace; server/tool read-only dùng được trong Plan | ✅ |
+| MCP client: stdio hoặc Streamable HTTP (`url` + headers; header hỗ trợ `${VAR}` và `bearer_token_env`), `initialize`, `tools/list`, `tools/call`, resources/prompts qua tool `mcp__<server>__extras`, tool trace; server/tool read-only dùng được trong Plan | ✅ |
 | Plugin `plugin.json`: gói skills + MCP server, plugin mẫu, tạo bằng AI | ✅ |
 | Chat tương tác + resume session (`--session`) | ✅ |
 | RAG văn bản: ingest `.txt`/`.md`, chunk + FTS5, tự chèn 4 đoạn liên quan vào chat | ✅ |
@@ -233,7 +233,7 @@ Hiện hỗ trợ UTF-8 `.txt`/`.md`. PDF/DOCX sẽ thêm ở bước sau (cần
 ```
 
 - **Skill** là prompt pack Markdown. System prompt chỉ nhận catalog rút gọn theo nguồn (tối đa 12 id/nguồn); model gọi `skill` không kèm `name` để xem danh mục đầy đủ, hoặc kèm `name` để nạp toàn bộ nội dung (tối đa 12.000 ký tự). Môn học chỉ còn là bộ lọc tùy chọn cho RAG và preset CLI.
-- **MCP** là tool ngoài qua stdio JSON-RPC hoặc Streamable HTTP (`url`, `headers`, session `Mcp-Session-Id`, nhận JSON/SSE); tên tool có dạng `mcp__<server>__<tool>`. Server có thể đặt `read_only` (alias `readOnly`) hoặc tool khai báo `annotations.readOnlyHint`; chỉ các tool này được đăng ký trong Plan. Server có capability `resources`/`prompts` được cấp thêm tool read-only `mcp__<server>__extras` với các action `list_resources`, `read_resource`, `list_prompts`, `get_prompt`.
+- **MCP** là tool ngoài qua stdio JSON-RPC hoặc Streamable HTTP (`url`, `headers` hỗ trợ `${VAR}`, `bearer_token_env` đọc lúc connect, session `Mcp-Session-Id`, nhận JSON/SSE); tên tool có dạng `mcp__<server>__<tool>`. Server có thể đặt `read_only` (alias `readOnly`) hoặc tool khai báo `annotations.readOnlyHint`; chỉ các tool này được đăng ký trong Plan. Server có capability `resources`/`prompts` được cấp thêm tool read-only `mcp__<server>__extras` với các action `list_resources`, `read_resource`, `list_prompts`, `get_prompt`.
 - **Plugin** là gói `plugin.json` chứa skills + MCP server, không chạy code tùy ý.
 
 Plugin mẫu nằm ở `examples/plugins/study-toolkit/` (skill phòng thi + MCP `echo`/`add`). Trong desktop bấm **Cài đặt → Plugin → Cài plugin mẫu**.
@@ -326,7 +326,7 @@ Giao diện tối lấy cảm hứng từ Claude Code: nền than ấm, viền m
 - **Cài đặt → Agent:** chọn permission mode (chỉ đọc / nghiêm ngặt / tiêu chuẩn / tin cậy), viết **permission rule** dạng `allow|ask|deny <tool> <pattern>` (dòng trống và `#` comment được bỏ qua; lỗi hiện ngay và nút **Lưu** bị tắt khi rule chưa hợp lệ), giới hạn bước/token/temperature/top_p, output tool tối đa, số bước subagent, TTL và số mục approval đã nhớ (kèm nút xoá), system prompt bổ sung, ngôn ngữ trả lời, danh sách tool bị tắt, compaction, memory, hook shell và xoá bản ghi memory.
 - **Cài đặt → Model:** nhiều provider, key riêng, chuyển active, sửa, xóa, kiểm tra latency.
 - **Cài đặt → Kỹ năng:** xem skill, ngữ cảnh, từ khóa, nội dung Markdown, mở thư mục, hoặc **Tạo với AI** (mô tả → xem trước `SKILL.md` → lưu).
-- **Cài đặt → MCP:** thêm/sửa/xóa server stdio hoặc Streamable HTTP (`URL`, `headers`), env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; **Tạo với AI** sinh cấu hình stdio.
+- **Cài đặt → MCP:** thêm/sửa/xóa server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test và xem danh sách tool; đánh dấu **Chỉ đọc (cho phép trong Plan)**; **Tạo với AI** sinh cấu hình stdio.
 - **Cài đặt → Plugin:** cài plugin mẫu, xem skills/MCP đi kèm, mở thư mục; **Tạo với AI** sinh `plugin.json` + skill.
 - **Cài đặt → Cập nhật:** kiểm tra GitHub Releases, xem ghi chú, tải installer phù hợp, mở file đã tải.
 - **Cài đặt → Dữ liệu:** đường dẫn, số session, mở nhanh các thư mục cấu hình.
@@ -350,7 +350,7 @@ Chạy không cần FUSE:
 - `web_fetch` mặc định tải HTML tĩnh, không đảm bảo render đủ JavaScript. `render: "browser"` dùng Chromium/Chrome/Edge headless nếu có (`TEZ_CHROMIUM`, hoặc `chromium`/`chrome`/`msedge` trên `PATH`), timeout 25 s; nếu thiếu browser hoặc browser lỗi, tool tự fallback sang static và ghi rõ lý do. `--no-sandbox` chỉ bật khi `TEZ_BROWSER_NO_SANDBOX=1`. HTML parser vẫn đơn giản (comment/entity số/script tự đóng đã xử lý nhưng thẻ lỗi có thể còn sót); DNS được resolve và pin toàn bộ địa chỉ ở static; browser map toàn bộ địa chỉ qua `--host-resolver-rules` nhưng không revalidate từng redirect; charset UTF-8/Latin-1/Windows-1252; body static cap 512 KB; PDF/audio/video bị từ chối ở static và chưa được trích xuất.
 - Ảnh được ghi thành file trong `images/<session>/<message>-<index>.<ext>`; SQLite chỉ giữ ref `tez-image:` và `load_messages` giải mã lại thành data URL khi resume. DB nhỏ hơn nhiều so với lưu data URL, nhưng thư mục ảnh vẫn lớn dần. UI và backend giới hạn 4 ảnh mới/lượt; UI giới hạn 5 MB/ảnh, backend giới hạn tổng 8 MB/request. Khi gửi lại lịch sử, chỉ ảnh của tối đa 2 lượt user gần nhất được gửi, trong ngân sách 6 ảnh của cả request (ảnh hiện tại được ưu tiên). Ảnh cũ vẫn hiện trong UI/resume nhưng không được gửi lại toàn bộ; chưa hỗ trợ PDF/audio/video.
 - Vault dùng `master.key` trong thư mục dữ liệu, chưa chuyển sang OS keychain.
-- MCP hỗ trợ stdio và Streamable HTTP; server stdio spawn mỗi lượt chat, timeout 20 giây, chưa sandbox. HTTP dùng POST JSON-RPC + response JSON/SSE; resources/prompts đọc qua tool `mcp__<server>__extras`; chưa hỗ trợ GET stream server-initiated hay OAuth (header auth phải cấu hình tĩnh trong `headers`). Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
+- MCP hỗ trợ stdio và Streamable HTTP; server stdio spawn mỗi lượt chat, timeout 20 giây, chưa sandbox. HTTP dùng POST JSON-RPC + response JSON/SSE; resources/prompts đọc qua tool `mcp__<server>__extras`; chưa hỗ trợ GET stream server-initiated hay OAuth flow đầy đủ; header hỗ trợ `${VAR}` và `bearer_token_env`. Plan chỉ đăng ký tool MCP được khai báo read-only; app tin vào `readOnly`/`readOnlyHint` của server, không xác minh hành vi thực tế, và tool read-only vẫn có thể đọc dữ liệu ngoài workspace tùy server.
 - Plan lưu nguyên văn câu trả lời cuối vào `plans/<session>.md` (tối đa 200.000 ký tự); desktop chỉ nạp lại khi chuyển trực tiếp Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn). Kế hoạch có schema Markdown 6 mục (`Mục tiêu`, `Phạm vi`, `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`); desktop PlanDialog có form nhập từng mục bên cạnh Markdown đầy đủ, cảnh báo mục thiếu; **Lưu kế hoạch** chặn nếu chưa đủ, **Lưu nháp** cho phép giữ bản chưa hoàn chỉnh, CLI in cảnh báo ra stderr. Form giữ nguyên các mục Markdown khác ngoài 6 mục bắt buộc.
 - **Cho phép thao tác này trong phiên hiện tại** được lưu vào `approvals.json` trong data dir; TTL và số mục tối đa chỉnh trong **Cài đặt → Agent** (mặc định 7 ngày / 200 mục), có nút xoá toàn bộ approval đã nhớ. Khóa theo `session_id|tool|path/command|fingerprint(args)`, nên cùng đường dẫn nhưng nội dung hoặc tham số khác sẽ hỏi lại. File corrupt bị bỏ qua và ghi log.
 - Plugin là gói cấu hình; không có code plugin tùy ý ngoài MCP server do bạn khai báo.

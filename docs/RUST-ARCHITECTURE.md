@@ -278,7 +278,7 @@ báo schema và (nếu cần) timeout dài hơn mặc định.
   HTTP dùng POST JSON-RPC tới `url`, gửi `Accept: application/json,
   text/event-stream`, lưu `Mcp-Session-Id` từ response và gửi lại ở các request
   sau, đọc response JSON hoặc SSE (`data:` event), protocol `2025-03-26`;
-  `headers` cấu hình được dùng cho auth tĩnh. Cả hai đều gọi `initialize`,
+  `headers` hỗ trợ `${VAR}` và `bearer_token_env` (đọc lúc connect, không lưu token). Cả hai đều gọi `initialize`,
   `notifications/initialized`, `tools/list`; `tools/call` đi qua cùng trait.
   Nếu server khai báo capability `resources`/`prompts`, discovery tạo thêm tool
   read-only `mcp__<server>__extras` với action `list_resources`, `read_resource`,
@@ -738,7 +738,7 @@ tez update --check-only
 | Rủi ro | Biện pháp |
 |---|---|
 | Tool nguy hiểm | Code mode có `run_command` nhưng bị giới hạn trong workspace ở tầng ứng dụng, qua permission pipeline (deny → ask → allow) và audit/redaction; đây không phải sandbox OS |
-| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers tĩnh) |
+| MCP read-only trong Plan | Chỉ tool được server khai báo `read_only`/`readOnlyHint` mới vào Plan; tool `mcp__<server>__extras` (resources/prompts) luôn read-only. App tin khai báo, không xác minh hành vi. Transport: stdio + Streamable HTTP (JSON/SSE, session header, headers hỗ trợ ${VAR}/bearer_token_env) |
 | Prompt injection qua tài liệu/tool result | Coi là data; delimiter; không thực thi chỉ dẫn; tool allowlist |
 | Key rò rỉ | Keychain + AES-GCM; redaction; không trả secret |
 | Local server bị gọi trái phép | 127.0.0.1 + bearer token + Origin check |
@@ -757,12 +757,13 @@ tez update --check-only
   harness config sanitize; approval persistence TTL/corrupt file; store
   migration v5, `session_todos`, image file refs; web_fetch parser, DNS
   pinning, browser resolver/fallback; MCP HTTP config, JSON/SSE parsing,
-  session header and resources/prompts formatting; approval fingerprint.
+  session header, env header expansion/bearer env and resources/prompts
+  formatting; approval fingerprint.
 - **Integration:** mock provider + agent loop; tool call → result → final;
   permission denial; subagent trả text cuối; MCP stdio; MCP HTTP JSON/SSE +
-  session header + resources/prompts.
-- **Số test hiện tại:** `tez-core` 250 + 1 MCP stdio, `tez-auth` 32,
-  `tez-cli` 18, `tez-llm` 14, `tez-store` 28, `tez-update` 16; tổng 359.
+  session header + env headers/bearer + resources/prompts.
+- **Số test hiện tại:** `tez-core` 253 + 1 MCP stdio, `tez-auth` 32,
+  `tez-cli` 18, `tez-llm` 14, `tez-store` 28, `tez-update` 16; tổng 362.
   Desktop `cargo test` trong `apps/desktop/src-tauri` có 9 test. `cargo test
   --workspace` xanh.
 - **Lint/format:** `cargo clippy --all-targets -- -D warnings` và

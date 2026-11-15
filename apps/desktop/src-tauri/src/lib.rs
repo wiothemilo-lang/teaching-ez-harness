@@ -104,6 +104,8 @@ struct SaveMcpRequest {
     url: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
+    #[serde(default)]
+    bearer_token_env: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1217,6 +1219,7 @@ fn save_mcp_server(request: SaveMcpRequest) -> Result<(), String> {
             read_only: request.read_only,
             url,
             headers: request.headers,
+            bearer_token_env: request.bearer_token_env,
         },
     );
     mcp::save_config(&dir, &config).map_err(|error| error.to_string())
@@ -1469,6 +1472,8 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
             url: Option<String>,
             #[serde(default)]
             headers: HashMap<String, String>,
+            #[serde(default)]
+            bearer_token_env: Option<String>,
         }
 
         let file = request
@@ -1500,6 +1505,7 @@ fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> 
                 read_only: draft.read_only,
                 url,
                 headers: draft.headers,
+                bearer_token_env: draft.bearer_token_env,
             },
         );
         mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;

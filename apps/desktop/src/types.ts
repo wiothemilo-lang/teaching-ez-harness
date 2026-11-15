@@ -236,6 +236,7 @@ export type McpServerInfo = {
   read_only: boolean;
   url: string | null;
   headers: Record<string, string>;
+  bearer_token_env: string | null;
 };
 
 export type PluginInfo = {
@@ -308,6 +309,7 @@ export type SaveMcpPayload = {
   read_only: boolean;
   url: string | null;
   headers: Record<string, string>;
+  bearer_token_env: string | null;
 };
 
 export type ChatPayload = {

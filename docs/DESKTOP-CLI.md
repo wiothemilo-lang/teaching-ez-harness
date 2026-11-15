@@ -59,7 +59,7 @@
 
 - Cài đặt provider trong desktop dùng chung `tez_auth::providers` với CLI: cùng `providers.json`, cùng vault, cùng provider active; `connection.json` được đồng bộ để tương thích bản cũ.
 - Lịch sử phiên đọc trực tiếp từ SQLite; bấm một phiên để tải lại message.
-- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat đưa catalog rút gọn theo nguồn vào system prompt và đăng ký tool `skill` (không tên = danh mục đầy đủ, có tên = nội dung), cùng tool MCP trong một registry. MCP hỗ trợ stdio (`command`) hoặc Streamable HTTP (`url`, `headers`, session `Mcp-Session-Id`, response JSON/SSE). Server có capability `resources`/`prompts` được cấp thêm tool read-only `mcp__<server>__extras` (`list_resources`, `read_resource`, `list_prompts`, `get_prompt`). Plan chỉ đăng ký tool MCP read-only, gồm cả extras.
+- Skills, MCP server và plugin đọc từ `~/.local/share/teaching-ez/`; chat đưa catalog rút gọn theo nguồn vào system prompt và đăng ký tool `skill` (không tên = danh mục đầy đủ, có tên = nội dung), cùng tool MCP trong một registry. MCP hỗ trợ stdio (`command`) hoặc Streamable HTTP (`url`, `headers` hỗ trợ `${VAR}`, `bearer_token_env`, session `Mcp-Session-Id`, response JSON/SSE). Server có capability `resources`/`prompts` được cấp thêm tool read-only `mcp__<server>__extras` (`list_resources`, `read_resource`, `list_prompts`, `get_prompt`). Plan chỉ đăng ký tool MCP read-only, gồm cả extras.
 - Khi có workspace, chat nạp thêm `AGENTS.md`/`CLAUDE.md` (và bản trong `.tez/`), skill ở `.tez/skills/`, MCP ở `.tez/mcp.json`; server dự án thắng server toàn cục khi trùng tên.
 - Plan lưu văn bản cuối vào `plans/<session>.md` (cap 200.000 ký tự); desktop nạp lại khi chuyển Plan → Code, CLI nạp ở mỗi lượt Code (tối đa 20.000 ký tự khi chèn).
 - Đóng gói AppImage bằng `scripts/desktop.sh appimage` (release) hoặc `appimage-debug` (nhanh).
@@ -209,7 +209,7 @@ tez doctor
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
 | Settings → Providers | Nhiều provider, key riêng, test, active, sửa, xóa |
 | Settings → Skills | Danh sách skill, môn, từ khóa, nội dung Markdown |
-| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)** |
+| Settings → MCP | Server stdio hoặc Streamable HTTP (`URL`, `headers`, `Bearer token env`), env, cwd, test, danh sách tool; checkbox **Chỉ đọc (cho phép trong Plan)** |
 | Settings → Plugins | Plugin local, skills/MCP đi kèm, cài plugin mẫu |
 | **Settings → Harness** | Permission mode, permission rule dạng `allow\|ask\|deny <tool> <pattern>` (bỏ qua `#` comment/dòng trống, lỗi hiện inline và tắt **Lưu**), giới hạn agent, compaction, memory + xoá bản ghi, hook shell, đường dẫn config/audit |
 | Settings → Update | Kiểm tra GitHub Releases, ghi chú, tải asset, mở installer |
@@ -321,8 +321,8 @@ Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
 
 ## 13. Testing
 
-- Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode, MCP read-only), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, plan save/load + schema 6 mục + cap + sanitize tên file, approval fingerprint/TTL, image file storage + `tez-image:` refs, web browser resolver/fallback, MCP HTTP JSON/SSE + session header + resources/prompts formatting, store migration v5 và `session_todos`.
-- Integration: mock provider + agent loop; permission denial; subagent; MCP stdio + HTTP JSON/SSE + resources/prompts; artifact compaction (`sessions/<id>/tool-results|transcripts`).
+- Unit: vault, tool math/chemistry, permission pipeline (deny → ask → allow, bốn mode, MCP read-only), compaction 4 bước, memory save/search/forget, todo validation, hook block/redaction, harness sanitize, plan save/load + schema 6 mục + cap + sanitize tên file, approval fingerprint/TTL, image file storage + `tez-image:` refs, web browser resolver/fallback, MCP HTTP JSON/SSE + session header + resources/prompts formatting + env header expansion/bearer env, store migration v5 và `session_todos`.
+- Integration: mock provider + agent loop; permission denial; subagent; MCP stdio + HTTP JSON/SSE + env headers/bearer + resources/prompts; artifact compaction (`sessions/<id>/tool-results|transcripts`).
 - CLI e2e: `assert_cmd`; connect/chat/tools/context; `--yes`/`--permission`/`--max-steps`; `memory`, `harness`.
 - Desktop smoke: Tauri driver/Playwright (sau); preview mock hiện kiểm tra approval modal, Harness dock và Settings → Harness.
 - Frontend: `tsc --noEmit` + Vite build sạch.
