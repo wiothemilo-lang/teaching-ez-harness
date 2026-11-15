@@ -419,10 +419,7 @@ impl LlmProvider for OpenAiCompatible {
         'stream: while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
-            loop {
-                let Some(position) = buffer.find('\n') else {
-                    break;
-                };
+            while let Some(position) = buffer.find('\n') {
                 let line: String = buffer.drain(..=position).collect();
                 let line = line.trim_end_matches(['\r', '\n']);
                 let Some(data) = line.strip_prefix("data:") else {

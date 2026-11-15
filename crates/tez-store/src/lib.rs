@@ -248,10 +248,11 @@ impl Store {
         }
 
         let conn = Connection::open(&path)?;
+        // busy_timeout phải có hiệu lực trước khi đổi journal_mode.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA busy_timeout=5000;",
+             PRAGMA foreign_keys=ON;",
         )?;
 
         let store = Self { conn, path };
@@ -260,19 +261,36 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(SCHEMA)?;
-        self.add_column_if_missing("sessions", "subject", "TEXT")?;
-        self.add_column_if_missing("sessions", "mode", "TEXT NOT NULL DEFAULT 'chat'")?;
-        self.add_column_if_missing("documents", "subject", "TEXT")?;
-        self.ensure_fts_schema()?;
-        Ok(())
+        // BEGIN IMMEDIATE: hai process mở DB cùng lúc không thể cùng ALTER/CREATE.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), StoreError> {
+            self.conn.execute_batch(SCHEMA)?;
+            Self::add_column_if_missing(&self.conn, "sessions", "subject", "TEXT")?;
+            Self::add_column_if_missing(
+                &self.conn,
+                "sessions",
+                "mode",
+                "TEXT NOT NULL DEFAULT 'chat'",
+            )?;
+            Self::add_column_if_missing(&self.conn, "documents", "subject", "TEXT")?;
+            Self::ensure_fts_schema(&self.conn)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// FTS5 không hỗ trợ ALTER; nếu bảng cũ thiếu `search_text` thì tạo lại + reindex.
-    fn ensure_fts_schema(&self) -> Result<(), StoreError> {
-        let mut statement = self
-            .conn
-            .prepare("PRAGMA table_info(document_chunks_fts)")?;
+    fn ensure_fts_schema(conn: &Connection) -> Result<(), StoreError> {
+        let mut statement = conn.prepare("PRAGMA table_info(document_chunks_fts)")?;
         let columns: Vec<String> = statement
             .query_map([], |row| row.get(1))?
             .filter_map(Result::ok)
@@ -283,7 +301,7 @@ impl Store {
             return Ok(());
         }
 
-        self.conn.execute_batch(
+        conn.execute_batch(
             "DROP TABLE IF EXISTS document_chunks_fts;
              CREATE VIRTUAL TABLE document_chunks_fts USING fts5(
                 content,
@@ -295,16 +313,15 @@ impl Store {
         )?;
 
         let chunks: Vec<(String, String, String)> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT id, document_id, content FROM document_chunks")?;
+            let mut statement =
+                conn.prepare("SELECT id, document_id, content FROM document_chunks")?;
             let rows =
                 statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
             rows.filter_map(Result::ok).collect()
         };
 
         for (chunk_id, document_id, content) in chunks {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO document_chunks_fts (content, search_text, chunk_id, document_id)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -320,12 +337,12 @@ impl Store {
 
     /// SQLite không có `ADD COLUMN IF NOT EXISTS`; kiểm tra pragma trước.
     fn add_column_if_missing(
-        &self,
+        conn: &Connection,
         table: &str,
         column: &str,
         definition: &str,
     ) -> Result<(), StoreError> {
-        let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let exists = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(Result::ok)
@@ -333,7 +350,7 @@ impl Store {
         drop(statement);
 
         if !exists {
-            self.conn.execute_batch(&format!(
+            conn.execute_batch(&format!(
                 "ALTER TABLE {table} ADD COLUMN {column} {definition}"
             ))?;
         }
@@ -351,9 +368,17 @@ impl Store {
     /// Dung lượng file DB (gồm cả WAL nếu có).
     pub fn size_bytes(&self) -> u64 {
         let main = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        let wal_path = self.path.with_extension("db-wal");
-        let wal = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
+        let wal = std::fs::metadata(self.wal_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         main + wal
+    }
+
+    /// `tez.sqlite` -> `tez.sqlite-wal` (không thay phần mở rộng).
+    fn wal_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push("-wal");
+        PathBuf::from(name)
     }
 
     pub fn ensure_profile(&self, id: &str, name: &str) -> Result<(), StoreError> {
@@ -392,7 +417,8 @@ impl Store {
 
     pub fn append_message(&self, message: NewMessage<'_>) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO messages (id, session_id, role, content, model, tokens_in, tokens_out)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -405,6 +431,12 @@ impl Store {
                 message.tokens_out as i64,
             ],
         )?;
+        // Session có message đầu tiên không còn là "intake" nữa.
+        transaction.execute(
+            "UPDATE sessions SET state = 'active' WHERE id = ?1 AND state = 'intake'",
+            params![message.session_id],
+        )?;
+        transaction.commit()?;
         Ok(id)
     }
 
@@ -1027,12 +1059,72 @@ mod tests {
                 tokens_out: 0,
             })
             .unwrap();
-        // Session mới vẫn ở trạng thái intake khi lượt chat lỗi.
+        // append_message đã chuyển session sang active; lượt chat lỗi đánh dấu failed.
         store.abandon_session(&used).unwrap();
         let row = store.get_session(&used).unwrap().unwrap();
         assert_eq!(row.state, "failed");
         assert_eq!(row.messages, 1);
         assert!(row.ended_at.is_some());
+    }
+
+    #[test]
+    fn append_message_activates_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("tez.db")).unwrap();
+        store.ensure_profile("default", "Học sinh").unwrap();
+        let id = store
+            .create_session_mode("default", None, Some("general"), "chat")
+            .unwrap();
+        assert_eq!(store.get_session(&id).unwrap().unwrap().state, "intake");
+
+        store
+            .append_message(NewMessage {
+                session_id: &id,
+                role: "user",
+                content: "hello",
+                model: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            })
+            .unwrap();
+        assert_eq!(store.get_session(&id).unwrap().unwrap().state, "active");
+    }
+
+    #[test]
+    fn wal_path_keeps_original_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.sqlite");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.wal_path(), dir.path().join("tez.sqlite-wal"));
+    }
+
+    #[test]
+    fn concurrent_open_migrates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tez.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(path).map(|_| ()))
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .unwrap()
+                .expect("mở DB đồng thời phải thành công");
+        }
+
+        let store = Store::open(&path).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'mode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

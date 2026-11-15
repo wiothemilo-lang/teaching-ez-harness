@@ -78,9 +78,21 @@ impl MemoryStore {
 
     pub fn find(&self, name: &str) -> Option<MemoryRecord> {
         let target = slug(name);
-        self.records()
-            .into_iter()
-            .find(|record| slug(record.name.as_str()) == target)
+        let records = self.records();
+        // Ưu tiên khớp đúng tên để "C++" không bị nhầm với "C".
+        records
+            .iter()
+            .find(|record| record.name.eq_ignore_ascii_case(name.trim()))
+            .cloned()
+            .or_else(|| {
+                // Chỉ cho phép tra bằng slug khi input không chứa ký tự bị slug hoá mất
+                // (tránh "C++" rơi về nhầm bản ghi "C").
+                is_plain_slug(name).then(|| {
+                    records
+                        .into_iter()
+                        .find(|record| slug(record.name.as_str()) == target)
+                })?
+            })
     }
 
     pub fn save(
@@ -101,23 +113,38 @@ impl MemoryStore {
         if body.chars().count() > MAX_BODY_CHARS {
             return Err(format!("nội dung quá dài (tối đa {MAX_BODY_CHARS} ký tự)"));
         }
+        if name.contains(['\n', '\r']) {
+            return Err("tên bản ghi phải nằm trên một dòng".to_string());
+        }
         let kind = normalize_kind(kind);
         let description = if description.trim().is_empty() {
             first_line(body)
         } else {
             description.trim().to_string()
         };
+        if description.contains(['\n', '\r']) {
+            return Err("mô tả bản ghi phải nằm trên một dòng".to_string());
+        }
         let file_slug = slug(name);
         if file_slug.is_empty() {
             return Err("tên bản ghi không hợp lệ".to_string());
         }
 
         self.ensure_dir()?;
-        let path = self.dir.join(format!("{file_slug}.md"));
+        let mut path = self.dir.join(format!("{file_slug}.md"));
+        // Hai tên khác nhau có thể cùng slug ("C++" và "C"); giữ cả hai thay vì ghi đè.
+        if path.exists() {
+            if let Ok(existing) = parse_file(&path) {
+                if !existing.name.eq_ignore_ascii_case(name) {
+                    path = self
+                        .dir
+                        .join(format!("{file_slug}-{:08x}.md", name_hash(name)));
+                }
+            }
+        }
         let document =
             format!("---\nname: {name}\ndescription: {description}\ntype: {kind}\n---\n\n{body}\n");
-        std::fs::write(&path, document)
-            .map_err(|error| format!("không ghi được memory: {error}"))?;
+        write_atomic(&path, &document)?;
         self.rebuild_index()?;
 
         Ok(MemoryRecord {
@@ -130,15 +157,32 @@ impl MemoryStore {
     }
 
     pub fn forget(&self, name: &str) -> Result<bool, String> {
-        let slug = slug(name);
-        let path = self.dir.join(format!("{slug}.md"));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|error| format!("không xoá được memory: {error}"))?;
-            self.rebuild_index()?;
-            return Ok(true);
+        let target = slug(name);
+        let records = self.records();
+        let record = records
+            .iter()
+            .find(|record| record.name.eq_ignore_ascii_case(name.trim()))
+            .cloned()
+            .or_else(|| {
+                if !is_plain_slug(name) {
+                    return None;
+                }
+                let matches: Vec<&MemoryRecord> = records
+                    .iter()
+                    .filter(|record| slug(record.name.as_str()) == target)
+                    .collect();
+                // Chỉ xoá theo slug khi không có nhiều bản ghi trùng slug.
+                (matches.len() == 1).then(|| matches[0].clone())
+            });
+        match record {
+            Some(record) => {
+                std::fs::remove_file(&record.path)
+                    .map_err(|error| format!("không xoá được memory: {error}"))?;
+                self.rebuild_index()?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(false)
     }
 
     /// Chọn bản ghi liên quan bằng chấm điểm từ khoá, không gọi model.
@@ -196,7 +240,7 @@ impl MemoryStore {
                 ));
             }
         }
-        std::fs::write(self.dir.join("MEMORY.md"), index)
+        write_atomic(&self.dir.join("MEMORY.md"), &index)
             .map_err(|error| format!("không ghi được index memory: {error}"))
     }
 
@@ -219,6 +263,46 @@ fn first_line(body: &str) -> String {
         .find(|line| !line.trim().is_empty())
         .map(|line| line.trim().chars().take(160).collect())
         .unwrap_or_default()
+}
+
+/// Ghi file qua file tạm rồi rename để reader không thấy nội dung dở dang.
+fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut temp_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("memory")
+        .to_string();
+    temp_name.push_str(&format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = path.with_file_name(temp_name);
+    std::fs::write(&temp, content).map_err(|error| format!("không ghi được memory: {error}"))?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("không ghi được memory: {error}"));
+    }
+    Ok(())
+}
+
+/// FNV-1a 32-bit, đủ để tách các tên trùng slug.
+fn name_hash(value: &str) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn is_plain_slug(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 fn slug(value: &str) -> String {
@@ -539,5 +623,50 @@ mod tests {
             .await
             .unwrap();
         assert!(!output.is_error);
+    }
+
+    #[test]
+    fn keeps_body_that_contains_frontmatter_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        store
+            .save(
+                "Markdown",
+                "",
+                "project",
+                "Dòng đầu\n---\ntype: user\nDòng cuối",
+            )
+            .unwrap();
+
+        let record = store.find("Markdown").unwrap();
+        assert_eq!(record.kind, "project");
+        assert!(record.body.contains("type: user"), "{}", record.body);
+        assert!(record.body.contains("Dòng cuối"), "{}", record.body);
+    }
+
+    #[test]
+    fn rejects_multiline_name_and_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        assert!(store
+            .save("Tên\n---\ntype: user", "", "project", "x")
+            .is_err());
+        assert!(store.save("Tên", "Mô tả\n---", "project", "x").is_err());
+    }
+
+    #[test]
+    fn keeps_records_with_colliding_slugs_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        store.save("C++", "", "project", "ngôn ngữ C++").unwrap();
+        store.save("C", "", "project", "ngôn ngữ C").unwrap();
+
+        assert_eq!(store.records().len(), 2);
+        assert!(store.find("C++").unwrap().body.contains("C++"));
+        assert!(store.find("C").unwrap().body.ends_with('C'));
+
+        assert!(store.forget("C++").unwrap());
+        assert!(store.find("C++").is_none());
+        assert!(store.find("C").is_some());
     }
 }

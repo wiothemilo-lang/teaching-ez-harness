@@ -1410,6 +1410,7 @@ dependencies = [
  "async-trait",
  "evalexpr",
  "glob",
+ "libc",
  "regex",
  "serde",
  "serde_json",
