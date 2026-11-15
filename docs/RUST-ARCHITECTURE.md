@@ -142,10 +142,17 @@ wrapper không có session/artifact.
 
 ### 3.3 Streaming
 
-Bản hiện tại **chưa streaming**: provider trả một `ChatResponse` hoàn chỉnh,
-desktop/CLI hiển thị sau khi lượt chạy xong. Khi thêm streaming, `TextDelta`
-và tool-call delta sẽ đi qua cùng event channel của Tauri/CLI; các lớp
-permission, hook và compaction không phụ thuộc vào cách provider trả dữ liệu.
+Provider phát text theo từng đoạn qua
+`LlmProvider::chat_stream(req, Option<UnboundedSender<String>>)`.
+`OpenAiCompatible` gửi `stream: true`, đọc SSE `data:` cho đến `[DONE]`, đẩy
+`delta.content` vào sender và gom `delta.tool_calls` theo `index` thành
+`ToolCall` hoàn chỉnh. Provider không hỗ trợ streaming dùng default method:
+gọi `chat` rồi gửi toàn bộ text một lần.
+
+Desktop nối sender đó vào event `tez://chat-delta` (`{ session_id, text }`);
+frontend ghép dần vào một message tạm, rồi thay bằng message cuối khi lượt chạy
+xong. CLI hiện chưa stream. Permission, hook và compaction không phụ thuộc vào
+cách provider trả dữ liệu.
 
 ### 3.4 Kết thúc
 
@@ -153,7 +160,9 @@ Agent dừng khi:
 
 - Model trả câu trả lời cuối và hook `Stop` không yêu cầu tiếp.
 - Chạm `max_steps` → `StopReason::MaxSteps`, kèm text gợi ý chia nhỏ việc.
-- Người dùng hủy hoặc lỗi không phục hồi → `AgentError`.
+- Người dùng bấm dừng → `StopReason::Stopped` với outcome một phần (text và
+  tool đã chạy vẫn được giữ).
+- Lỗi không phục hồi → `AgentError`.
 
 ---
 
@@ -163,13 +172,12 @@ Agent dừng khi:
 
 | Nguồn | Nội dung | Ưu tiên |
 |---|---|---|
-| **System** | Vai trò, môn, lớp, ngôn ngữ, quy tắc sư phạm | Pinned |
-| **Subject pack** | Phong cách dạy, thuật ngữ, công thức, rubric | Pinned |
-| **Lesson** | Mục tiêu học tập, tài liệu, rubric, độ khó | Pinned |
-| **Session state** | Trạng thái (diagnose/practice/...), hint level, turn count | Pinned |
-| **RAG** | Top-k chunk liên quan, kèm citation | Cao |
-| **Student model** | Mastery, misconception, lịch sử gần đây | Cao |
-| **Summary** | Tóm tắt các lượt cũ | Trung bình |
+| **System** | Vai trò chat/code, ngôn ngữ, chỉ dẫn bổ sung của người dùng | Pinned |
+| **Skills** | Skill khớp từ khóa trong câu hỏi, render sẵn | Cao |
+| **Memory** | Memory recall theo từ khóa | Cao |
+| **Todos** | Kế hoạch hiện tại của phiên | Pinned |
+| **RAG** | Top-k chunk tài liệu liên quan, kèm citation | Cao |
+| **Summary** | Tóm tắt các lượt cũ khi compaction | Trung bình |
 | **Recent turns** | 6–10 lượt gần nhất nguyên văn | Cao |
 | **Tool specs** | Schema các tool được phép | Pinned |
 
@@ -179,7 +187,7 @@ Agent dừng khi:
 pub struct BudgetPolicy {
     pub total: usize,          // theo model
     pub system_pct: u8,        // 10
-    pub objectives_pct: u8,    // 10
+    pub instructions_pct: u8,  // 10
     pub retrieval_pct: u8,     // 30
     pub memory_pct: u8,        // 20
     pub conversation_pct: u8,  // 30
@@ -445,24 +453,21 @@ Cùng một agent loop; khác prompt, tool allowlist, policy.
 ```rust
 #[async_trait::async_trait]
 pub trait LlmProvider: Send + Sync {
-    fn capabilities(&self) -> Capabilities;
-    async fn chat(
+    fn name(&self) -> &str;
+    async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError>;
+    async fn chat_stream(
         &self,
         req: ChatRequest,
-        tools: &[ToolSpec],
+        tx: Option<UnboundedSender<String>>,
     ) -> Result<ChatResponse, LlmError>;
-    async fn stream(
-        &self,
-        req: ChatRequest,
-        tools: &[ToolSpec],
-    ) -> Result<ChatStream, LlmError>;
 }
 ```
 
-- `ChatRequest`: messages, model, temperature, max_tokens, tool choice.
+- `ChatRequest`: model, messages, tools, temperature, top_p, max_tokens.
 - `ChatResponse`: text hoặc tool calls + usage.
-- `ChatStream`: stream events (delta, tool call delta, usage, done).
-- Capability: context window, tool calling, vision, structured output, streaming.
+- `chat_stream`: phát text delta qua `tx`, trả `ChatResponse` cuối; tool call
+  được gom đủ theo `index` trước khi trả.
+- Chưa có capability descriptor; mỗi provider tự xử lý phần nó hỗ trợ.
 
 Chi tiết auth/BYOK: [PROVIDER-AUTH.md](PROVIDER-AUTH.md).
 
@@ -607,7 +612,8 @@ tez update --check-only
   `<data_dir>/memory`; `tez harness` in permission mode, giới hạn agent,
   compaction, memory, hook và đường dẫn audit.
 - Output hiện tại là văn bản cuối cùng; tool trace, cảnh báo permission và
-  thống kê nén đi ra stderr để pipe stdout vẫn sạch. Chưa có streaming token.
+  thống kê nén đi ra stderr để pipe stdout vẫn sạch. CLI chưa stream token;
+  desktop stream text qua event `tez://chat-delta`.
 - Lỗi trả exit code 1 kèm thông báo; `tez doctor` kiểm tra data dir, provider,
   DB, skill, MCP, plugin, harness và dung lượng.
 
@@ -672,7 +678,7 @@ tez update --check-only
 | Phase | Thời lượng | Nội dung | Kết quả |
 |---|---|---|---|
 | 0. Rust basics | 1–2 tuần | Ownership, Result, trait, async, serde, SQLite | Viết được CLI nhỏ |
-| 1. Core + CLI | 2–3 tuần | workspace, provider OpenAI-compatible, `tez chat` | Chat streaming |
+| 1. Core + CLI | 2–3 tuần | workspace, provider OpenAI-compatible, `tez chat` | Chat streaming (desktop) |
 | 2. Auth + store | 2 tuần | SQLite, keychain, vault, `tez connect/models` | BYOK hoạt động |
 | 3. Agent loop | 2–3 tuần | context builder, tool registry, 6 tool chung | Agent biết gọi tool |
 | 4. Subject packs | 2–3 tuần | 4 pack mỏng, RAG, evidence, eval | Dạy được 4 môn cơ bản |

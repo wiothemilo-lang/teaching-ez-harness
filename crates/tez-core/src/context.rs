@@ -3,18 +3,19 @@ use std::path::Path;
 use tez_llm::Message;
 
 use crate::modes::{code_system_prompt, Mode};
-use crate::subjects::SubjectPack;
 use crate::todo::TodoItem;
+
+/// Prompt system cho chế độ Chat: agent tổng quát, không gắn môn học hay lớp.
+const CHAT_SYSTEM_PROMPT: &str = "\
+Bạn là trợ lý AI local-first tên tez, chạy trên máy người dùng.\n\
+Bạn có thể trò chuyện, viết, lập kế hoạch, đọc tài liệu trong workspace và gọi tool khi cần.\n\
+Nguyên tắc: trả lời đúng trọng tâm; nói rõ khi không chắc; không bịa nguồn hoặc kết quả tool; \
+ưu tiên thay đổi nhỏ, có thể kiểm chứng; khi cần tính toán hoặc kiểm tra, dùng tool thay vì đoán.\n";
 
 /// Dữ liệu đầu vào để build context cho một lượt agent.
 pub struct ContextInput<'a> {
-    pub subject: &'a SubjectPack,
-    pub grade: &'a str,
-    pub objectives: &'a [String],
-    pub excerpts: &'a [String],
-    pub student_summary: Option<&'a str>,
-    pub state: &'a str,
     pub recent: &'a [Message],
+    pub excerpts: &'a [String],
     /// Skill đã render sẵn (xem [`crate::skills::render`]).
     pub skills: &'a [String],
     /// Memory liên quan đã render sẵn (xem [`crate::memory::render_recalled`]).
@@ -25,24 +26,25 @@ pub struct ContextInput<'a> {
     pub mode: Mode,
     /// Thư mục làm việc, chỉ dùng ở chế độ Code.
     pub workspace: Option<&'a str>,
+    /// Chỉ dẫn bổ sung của người dùng (harness `system_prompt`).
+    pub instructions: &'a str,
+    /// Ngôn ngữ trả lời: `vi` hoặc `en`.
+    pub language: &'a str,
 }
 
 impl<'a> ContextInput<'a> {
     /// Context chat tối thiểu, dùng trong test và các call site cũ.
-    pub fn chat(subject: &'a SubjectPack, grade: &'a str, recent: &'a [Message]) -> Self {
+    pub fn chat(recent: &'a [Message]) -> Self {
         Self {
-            subject,
-            grade,
-            objectives: &[],
-            excerpts: &[],
-            student_summary: None,
-            state: "chat",
             recent,
+            excerpts: &[],
             skills: &[],
             memory: &[],
             todos: &[],
             mode: Mode::Chat,
             workspace: None,
+            instructions: "",
+            language: "vi",
         }
     }
 }
@@ -54,47 +56,26 @@ pub struct ContextBuilder;
 
 impl ContextBuilder {
     pub fn build(&self, input: ContextInput<'_>) -> Vec<Message> {
-        let mut system = String::new();
-        match input.mode {
+        let mut system = match input.mode {
             Mode::Code => {
                 let workspace = input.workspace.unwrap_or(".");
-                system.push_str(&code_system_prompt(Path::new(workspace)));
-                system.push('\n');
+                code_system_prompt(Path::new(workspace))
             }
-            Mode::Chat if input.subject.is_general() => {
-                system.push_str(&input.subject.system_prompt());
-                system.push_str(
-                    "\nNguyên tắc chung: trả lời đúng trọng tâm, nói rõ khi không chắc, \
-                     không bịa nguồn. Khi cần tính toán hoặc kiểm tra, dùng tool thay vì tính nhẩm.\n",
-                );
-            }
-            Mode::Chat => {
-                system.push_str(&format!(
-                    "Bạn là gia sư môn {} cho học sinh lớp {}. Trả lời bằng tiếng Việt, ngắn gọn, đúng trình độ.\n",
-                    input.subject.name, input.grade
-                ));
-                system.push_str(
-                    "Nguyên tắc: hướng dẫn từng bước, hỏi lại khi cần, không đưa đáp án cuối trước khi học sinh thử. \
-                     Nếu dùng tài liệu, hãy trích dẫn nguồn. Nếu không chắc, nói rõ là không chắc. \
-                     Khi cần tính toán hoặc kiểm tra, hãy dùng tool thay vì tính nhẩm.\n",
-                );
-                system.push_str(&format!("\n{}\n", input.subject.system_prompt()));
-            }
+            Mode::Chat => CHAT_SYSTEM_PROMPT.to_string(),
+        };
+
+        if input.language == "en" {
+            system.push_str("\nRespond in English unless the user writes in another language.\n");
+        } else {
+            system.push_str(
+                "\nTrả lời bằng tiếng Việt; code và tên định danh giữ nguyên tiếng Anh.\n",
+            );
         }
 
-        if input.mode == Mode::Chat {
-            if !input.objectives.is_empty() {
-                system.push_str("\nMục tiêu bài học:\n");
-                for objective in input.objectives {
-                    system.push_str(&format!("- {objective}\n"));
-                }
-            }
-
-            system.push_str(&format!("\nTrạng thái phiên học: {}\n", input.state));
-
-            if let Some(summary) = input.student_summary {
-                system.push_str(&format!("\nHồ sơ học sinh:\n{summary}\n"));
-            }
+        if !input.instructions.trim().is_empty() {
+            system.push_str("\nChỉ dẫn bổ sung của người dùng:\n");
+            system.push_str(input.instructions.trim());
+            system.push('\n');
         }
 
         if !input.skills.is_empty() {
@@ -143,66 +124,68 @@ impl ContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subjects::{GENERAL, MATH};
 
     #[test]
-    fn includes_objectives_and_recent_turns() {
-        let objectives = vec!["Hiểu định lý Pythagore".to_string()];
+    fn includes_context_sections_and_recent_turns() {
         let excerpts = vec!["a^2 + b^2 = c^2".to_string()];
-        let recent = vec![Message::user("Em chưa hiểu")];
+        let recent = vec![Message::user("Giải thích giúp mình")];
+        let todos = vec![TodoItem {
+            content: "Đọc tài liệu".to_string(),
+            status: crate::todo::TodoStatus::Pending,
+        }];
 
         let messages = ContextBuilder.build(ContextInput {
-            subject: &MATH,
-            grade: "9",
-            objectives: &objectives,
-            excerpts: &excerpts,
-            student_summary: Some("Mastery 0.4"),
-            state: "practice",
             recent: &recent,
+            excerpts: &excerpts,
             skills: &["<skill name=\"test\">step</skill>".to_string()],
             memory: &["<memory name=\"style\">dùng tab</memory>".to_string()],
-            todos: &[],
+            todos: &todos,
             mode: Mode::Chat,
             workspace: None,
+            instructions: "Luôn nêu rủi ro trước khi sửa file.",
+            language: "vi",
         });
 
         assert_eq!(messages.len(), 2);
         let system = messages[0].content.as_deref().unwrap();
-        assert!(system.contains("Toán"));
-        assert!(system.contains("Pythagore"));
         assert!(system.contains("a^2 + b^2 = c^2"));
-        assert!(system.contains("socratic"));
         assert!(system.contains("<skill name=\"test\">"));
+        assert!(system.contains("<memory name=\"style\">"));
+        assert!(system.contains("Đọc tài liệu"));
+        assert!(system.contains("Luôn nêu rủi ro trước khi sửa file."));
+        assert!(system.contains("Trả lời bằng tiếng Việt"));
         assert_eq!(messages[1].role, "user");
     }
 
     #[test]
-    fn general_mode_does_not_force_a_subject() {
-        let messages = ContextBuilder.build(ContextInput::chat(
-            &GENERAL,
-            "10",
-            &[Message::user("Xin chào")],
-        ));
+    fn chat_mode_is_a_general_agent() {
+        let messages = ContextBuilder.build(ContextInput::chat(&[Message::user("Xin chào")]));
         let system = messages[0].content.as_deref().unwrap();
         assert!(!system.contains("gia sư môn"));
-        assert!(system.contains("trợ lý AI local-first"));
+        assert!(system.contains("local-first"));
+    }
+
+    #[test]
+    fn english_instruction_is_optional() {
+        let mut input = ContextInput::chat(&[]);
+        input.language = "en";
+        let messages = ContextBuilder.build(input);
+        let system = messages[0].content.as_deref().unwrap();
+        assert!(system.contains("Respond in English"));
     }
 
     #[test]
     fn code_mode_uses_workspace_prompt() {
         let messages = ContextBuilder.build(ContextInput {
-            subject: &GENERAL,
-            grade: "",
-            objectives: &[],
-            excerpts: &[],
-            student_summary: None,
-            state: "",
             recent: &[Message::user("Sửa lỗi build")],
+            excerpts: &[],
             skills: &[],
             memory: &[],
             todos: &[],
             mode: Mode::Code,
             workspace: Some("/tmp/demo-project"),
+            instructions: "",
+            language: "vi",
         });
         let system = messages[0].content.as_deref().unwrap();
         assert!(system.contains("/tmp/demo-project"));

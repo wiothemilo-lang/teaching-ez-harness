@@ -7,7 +7,7 @@
 
 ## 1. Skills — prompt pack Markdown
 
-Skill là một file `SKILL.md` chứa hướng dẫn sư phạm. Khi học sinh hỏi, tez khớp **môn học** và **từ khóa** rồi chèn tối đa 2 skill vào system prompt của lượt đó. Skill không chạy code và không có quyền truy cập dữ liệu.
+Skill là một file `SKILL.md` chứa hướng dẫn cho agent. Khi người dùng hỏi, tez khớp **ngữ cảnh** (`subjects`) và **từ khóa** rồi chèn tối đa 2 skill vào system prompt của lượt đó. Skill không chạy code và không có quyền truy cập dữ liệu.
 
 ### Vị trí
 
@@ -39,19 +39,19 @@ triggers: giải, bước, chứng minh, tính
 |---|---|
 | `name` | Tên hiển thị. Nếu thiếu `id`, tên thư mục được dùng làm id. |
 | `description` | Mô tả ngắn trong Cài đặt → Kỹ năng. |
-| `subjects` | Danh sách id môn, phân tách bằng dấu phẩy. `all` hoặc bỏ trống = mọi môn. |
-| `triggers` | Từ khóa xuất hiện trong câu hỏi (không phân biệt hoa thường). Bỏ trống = luôn khớp môn. |
+| `subjects` | Danh sách id ngữ cảnh, phân tách bằng dấu phẩy. `all` hoặc bỏ trống = mọi ngữ cảnh. |
+| `triggers` | Từ khóa xuất hiện trong câu hỏi (không phân biệt hoa thường). Bỏ trống = luôn khớp ngữ cảnh. |
 | `id` | Tùy chọn, dùng để đặt id ổn định. |
 
 Phần thân sau `---` được render thành `<skill name="…">…</skill>` và cắt ở 4KB.
 
 ### Skill mặc định
 
-| Id | Môn | Dùng khi |
+| Id | Ngữ cảnh | Dùng khi |
 |---|---|---|
 | `step-by-step` | Toán, Lý, Hóa | giải, bước, chứng minh, tính, bài tập |
 | `error-diagnosis` | Toán, Lý, Hóa | sai, nhầm, lỗi, kiểm tra bước, không ra |
-| `exam-review` | Mọi môn | ôn thi, ôn tập, đề, kiểm tra, thi |
+| `exam-review` | Mọi ngữ cảnh | ôn thi, ôn tập, đề, kiểm tra, thi |
 | `english-writing` | Tiếng Anh | viết, sửa, essay, paragraph, grammar |
 
 ### CLI
@@ -183,7 +183,26 @@ tez plugins
 
 ---
 
-## 4. Thứ tự ưu tiên và an toàn
+## 4. Tạo extension bằng AI
+
+Desktop có luồng **mô tả → xem trước → lưu** cho cả skill, MCP và plugin:
+
+1. Mở `Ctrl K` → **Tạo Skill/MCP server/Plugin bằng AI**, hoặc nút **Tạo với AI** trong tab tương ứng.
+2. Mô tả điều bạn muốn bằng ngôn ngữ tự nhiên.
+3. AI trả về JSON gồm danh sách file; app hiện từng file để xem trước.
+4. Bấm **Lưu vào máy** để ghi vào data dir.
+
+Backend dùng hai lệnh `draft_extension` và `save_extension`. Bản nháp chỉ được ghi trong phạm vi:
+
+- skill: `skills/<id>/SKILL.md`,
+- plugin: `plugins/<id>/...`,
+- MCP: thêm một entry vào `mcp.json`.
+
+Đường dẫn tuyệt đối, `..` và định dạng file sai bị từ chối. Nội dung vẫn là file local; bạn có thể sửa tay sau khi lưu. AI không được cấp quyền chạy lệnh hay đọc dữ liệu ngoài data dir trong luồng này.
+
+---
+
+## 5. Thứ tự ưu tiên và an toàn
 
 - Skill của user nằm trong `skills/`; skill từ plugin được nạp thêm và có thể ghi đè skill cùng id.
 - MCP server user thắng plugin khi trùng tên.

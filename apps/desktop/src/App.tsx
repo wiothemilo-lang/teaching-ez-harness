@@ -9,6 +9,7 @@ import type {
   ApprovalRequest,
   ChatMessage,
   CompactReport,
+  ExtensionKind,
   SettingsTab,
   SessionInfo,
   ToastItem,
@@ -19,17 +20,18 @@ import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
 import { CodeView } from "./components/CodeView";
 import { ApprovalDialog } from "./components/ApprovalDialog";
+import { CommandPalette } from "./components/CommandPalette";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Spinner } from "./components/ui";
 import { IconCheck, IconInfo, IconRefresh, IconX } from "./icons";
+
+const STREAM_MESSAGE_ID = "streaming";
 
 export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [mode, setMode] = useState<AppMode>("chat");
-  const [subject, setSubject] = useState("general");
-  const [grade, setGrade] = useState("10");
   const [workspace, setWorkspace] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -40,6 +42,8 @@ export default function App() {
   const [loadingSession, setLoadingSession] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("providers");
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [createRequest, setCreateRequest] = useState<ExtensionKind | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [todos, setTodos] = useState<TodoItem[]>([]);
@@ -53,6 +57,32 @@ export default function App() {
 
   const dismissToast = useCallback((id: string) => {
     setToasts((previous) => previous.filter((toast) => toast.id !== id));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<{ session_id: string; text: string }>("tez://chat-delta", (event) => {
+      if (disposed) return;
+      const text = event.payload.text;
+      if (!text) return;
+      setMessages((previous) => {
+        const index = previous.findIndex((message) => message.id === STREAM_MESSAGE_ID);
+        if (index === -1) {
+          return [...previous, { id: STREAM_MESSAGE_ID, role: "assistant", text }];
+        }
+        const next = previous.slice();
+        next[index] = { ...next[index], text: next[index].text + text };
+        return next;
+      });
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 
   const respondApproval = useCallback(
@@ -167,22 +197,27 @@ export default function App() {
         event.preventDefault();
         startNewSession();
       }
+      if (modifier && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setCommandOpen(true);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [openSettings, startNewSession]);
-
-  const handleSubject = (id: string) => {
-    if (busy || id === subject) return;
-    setSubject(id);
-    newSession();
-  };
 
   const handleMode = (next: AppMode) => {
     if (busy || next === mode) return;
     setMode(next);
     newSession();
   };
+
+  const openWorkspace = useCallback(() => {
+    api.openWorkspace(workspace || null).then(
+      (info) => setWorkspace(info.path),
+      (openError) => notify("error", "Không mở được workspace", errorMessage(openError)),
+    );
+  }, [workspace, notify]);
 
   const openSession = useCallback(
     async (id: string) => {
@@ -208,7 +243,6 @@ export default function App() {
         const found = sessions.find((session) => session.id === id);
         if (found) {
           setMode(found.mode === "code" ? "code" : "chat");
-          if (found.subject) setSubject(found.subject);
         }
       } catch (openError) {
         notify("error", "Không mở được buổi học", errorMessage(openError));
@@ -240,8 +274,6 @@ export default function App() {
 
     try {
       const reply = await api.chat({
-        subject: mode === "code" ? "general" : subject,
-        grade,
         message: text,
         session_id: sessionId,
         provider_id: status.connection.id,
@@ -250,7 +282,7 @@ export default function App() {
       });
       setSessionId(reply.session_id);
       setMessages((previous) => [
-        ...previous,
+        ...previous.filter((message) => message.id !== STREAM_MESSAGE_ID),
         { id: uid(), role: "assistant", text: reply.text, tools: reply.tools },
       ]);
       setLastUsage({ input: reply.input_tokens, output: reply.output_tokens });
@@ -261,12 +293,18 @@ export default function App() {
         notify(
           "info",
           "Đã chạm giới hạn bước",
-          "Agent dừng để tránh chạy quá lâu. Bạn có thể yêu cầu tiếp tục hoặc tăng giới hạn trong Harness.",
+          "Agent dừng để tránh chạy quá lâu. Bạn có thể yêu cầu tiếp tục hoặc tăng giới hạn trong Agent.",
         );
+      } else if (reply.stop_reason === "stopped") {
+        notify("info", "Đã dừng", "Agent dừng theo yêu cầu của bạn.");
       }
       void refresh(true);
     } catch (sendError) {
-      setMessages((previous) => previous.filter((message) => message.id !== optimisticId));
+      setMessages((previous) =>
+        previous.filter(
+          (message) => message.id !== optimisticId && message.id !== STREAM_MESSAGE_ID,
+        ),
+      );
       setInput(text);
       setError(errorMessage(sendError));
     } finally {
@@ -277,8 +315,6 @@ export default function App() {
     busy,
     loadingSession,
     status,
-    subject,
-    grade,
     sessionId,
     mode,
     workspace,
@@ -286,6 +322,12 @@ export default function App() {
     openSettings,
     notify,
   ]);
+
+  const stop = useCallback(() => {
+    void api.stopChat().catch((stopError) => {
+      notify("error", "Không dừng được agent", errorMessage(stopError));
+    });
+  }, [notify]);
 
   if (!status) {
     return (
@@ -296,7 +338,7 @@ export default function App() {
           </div>
           {statusError ? (
             <>
-              <h1>Không mở được bàn học</h1>
+              <h1>Không mở được agent</h1>
               <p>{statusError}</p>
               <button className="btn" onClick={() => void refresh()}>
                 <IconRefresh size={15} />
@@ -305,7 +347,7 @@ export default function App() {
             </>
           ) : (
             <>
-              <Spinner label="Đang mở bàn học…" />
+              <Spinner label="Đang mở agent…" />
               <p className="boot-note">Đọc dữ liệu local và nhà cung cấp đã lưu.</p>
             </>
           )}
@@ -314,25 +356,21 @@ export default function App() {
     );
   }
 
-  const subjectInfo = status.subjects.find((item) => item.id === subject);
-
   return (
     <div className="app">
       <Sidebar
         status={status}
         sessions={sessions}
         mode={mode}
-        subject={subject}
-        grade={grade}
         workspace={workspace}
         sessionId={sessionId}
         loadingSession={loadingSession}
         onMode={handleMode}
-        onSubject={handleSubject}
-        onGrade={setGrade}
         onNewSession={startNewSession}
         onOpenSession={(id) => void openSession(id)}
         onOpenSettings={openSettings}
+        onCommand={() => setCommandOpen(true)}
+        onOpenWorkspace={openWorkspace}
       />
 
       {mode === "code" ? (
@@ -341,6 +379,7 @@ export default function App() {
           messages={messages}
           input={input}
           busy={busy}
+          streaming={messages.some((message) => message.id === STREAM_MESSAGE_ID)}
           error={error}
           loadingSession={loadingSession}
           lastUsage={lastUsage}
@@ -350,26 +389,21 @@ export default function App() {
           denials={denials}
           workspace={workspace}
           onWorkspace={setWorkspace}
-          onOpenWorkspace={() => {
-            api.openWorkspace(workspace || null).then(
-              (info) => setWorkspace(info.path),
-              (openError) => notify("error", "Không mở được workspace", errorMessage(openError)),
-            );
-          }}
+          onOpenWorkspace={openWorkspace}
           onInput={setInput}
           onSend={() => void send()}
+          onStop={stop}
           onOpenSettings={() => openSettings("providers")}
           onOpenHarness={() => openSettings("harness")}
           onDismissError={() => setError(null)}
         />
       ) : (
         <ChatView
-          subject={subjectInfo}
-          grade={grade}
           connection={status.connection}
           messages={messages}
           input={input}
           busy={busy}
+          streaming={messages.some((message) => message.id === STREAM_MESSAGE_ID)}
           error={error}
           loadingSession={loadingSession}
           lastUsage={lastUsage}
@@ -379,11 +413,26 @@ export default function App() {
           denials={denials}
           onInput={setInput}
           onSend={() => void send()}
+          onStop={stop}
           onOpenSettings={() => openSettings("providers")}
           onOpenHarness={() => openSettings("harness")}
           onDismissError={() => setError(null)}
         />
       )}
+
+      <CommandPalette
+        open={commandOpen}
+        onClose={() => setCommandOpen(false)}
+        onNewSession={startNewSession}
+        onMode={handleMode}
+        onOpenSettings={openSettings}
+        onOpenWorkspace={openWorkspace}
+        onCreate={(kind) => {
+          setCommandOpen(false);
+          setCreateRequest(kind);
+          openSettings(kind === "skill" ? "skills" : kind === "mcp" ? "mcp" : "plugins");
+        }}
+      />
 
       <SettingsPanel
         open={settingsOpen}
@@ -393,6 +442,8 @@ export default function App() {
         onClose={closeSettings}
         onChanged={handleChanged}
         notify={notify}
+        createRequest={createRequest}
+        onCreateRequest={() => setCreateRequest(null)}
       />
 
       {approval && <ApprovalDialog request={approval} onRespond={respondApproval} />}

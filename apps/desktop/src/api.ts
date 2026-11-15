@@ -12,6 +12,9 @@ import type {
   ProviderInfo,
   SaveMcpPayload,
   SaveProviderPayload,
+  DraftFile,
+  DraftExtensionResult,
+  ExtensionKind,
   SessionDetail,
   SessionInfo,
   DownloadUpdateResult,
@@ -32,6 +35,10 @@ export function loadSession(sessionId: string): Promise<SessionDetail> {
 
 export function chat(payload: ChatPayload): Promise<ChatReply> {
   return invoke("chat", { request: payload });
+}
+
+export function stopChat(): Promise<boolean> {
+  return invoke("stop_chat");
 }
 
 export function respondApproval(id: string, approved: boolean): Promise<boolean> {
@@ -72,6 +79,17 @@ export function testProvider(id: string | null): Promise<ConnectionTest> {
 
 export function listExtensions(): Promise<ExtensionsInfo> {
   return invoke("list_extensions");
+}
+
+export function draftExtension(
+  kind: ExtensionKind,
+  prompt: string,
+): Promise<DraftExtensionResult> {
+  return invoke("draft_extension", { request: { kind, prompt } });
+}
+
+export function saveExtension(kind: ExtensionKind, files: DraftFile[]): Promise<string[]> {
+  return invoke("save_extension", { request: { kind, files } });
 }
 
 export function saveMcpServer(payload: SaveMcpPayload): Promise<void> {

@@ -9,6 +9,7 @@ import {
   IconFolder,
   IconKey,
   IconSliders,
+  IconStop,
   IconTerminal,
   IconX,
 } from "../icons";
@@ -21,6 +22,7 @@ type Props = {
   messages: ChatMessage[];
   input: string;
   busy: boolean;
+  streaming: boolean;
   error: string | null;
   loadingSession: boolean;
   lastUsage: { input: number; output: number } | null;
@@ -33,6 +35,7 @@ type Props = {
   onOpenWorkspace: () => void;
   onInput: (value: string) => void;
   onSend: () => void;
+  onStop: () => void;
   onOpenSettings: () => void;
   onOpenHarness: () => void;
   onDismissError: () => void;
@@ -43,6 +46,7 @@ export function CodeView({
   messages,
   input,
   busy,
+  streaming,
   error,
   loadingSession,
   lastUsage,
@@ -55,6 +59,7 @@ export function CodeView({
   onOpenWorkspace,
   onInput,
   onSend,
+  onStop,
   onOpenSettings,
   onOpenHarness,
   onDismissError,
@@ -204,7 +209,7 @@ export function CodeView({
             ))
           )}
 
-          {busy && messages.length > 0 && (
+          {busy && !streaming && messages.length > 0 && (
             <div className="msg msg-assistant is-pending">
               <div className="msg-role">tez</div>
               <div className="msg-body">
@@ -260,12 +265,12 @@ export function CodeView({
                 </span>
               )}
               <button
-                className="send"
-                onClick={onSend}
-                disabled={!input.trim() || busy || loadingSession}
-                aria-label="Gửi yêu cầu"
+                className={`send ${busy ? "is-stop" : ""}`}
+                onClick={busy ? onStop : onSend}
+                disabled={!busy && (!input.trim() || loadingSession)}
+                aria-label={busy ? "Dừng agent" : "Gửi yêu cầu"}
               >
-                <IconArrowUp size={18} />
+                {busy ? <IconStop size={16} /> : <IconArrowUp size={18} />}
               </button>
             </div>
           </div>

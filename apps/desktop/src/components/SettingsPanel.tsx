@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import * as api from "../api";
 import type {
   AppStatus,
+  ExtensionKind,
   ExtensionsInfo,
   McpServerInfo,
   McpTest,
@@ -26,11 +27,13 @@ import {
   IconPuzzle,
   IconRefresh,
   IconSliders,
+  IconSparkle,
   IconTerminal,
   IconTrash,
   IconX,
 } from "../icons";
 import { Callout, EmptyNote, Spinner, Tag } from "./ui";
+import { CreateWithAI } from "./CreateWithAI";
 import { HarnessPanel } from "./HarnessPanel";
 import { UpdatePanel } from "./UpdatePanel";
 
@@ -42,6 +45,8 @@ type Props = {
   onClose: () => void;
   onChanged: () => void | Promise<void>;
   notify: (kind: ToastKind, title: string, detail?: string) => void;
+  createRequest?: ExtensionKind | null;
+  onCreateRequest?: () => void;
 };
 
 type Preset = {
@@ -125,13 +130,13 @@ const PRESETS: Preset[] = [
 ];
 
 const TAB_META: { id: SettingsTab; label: string; icon: ReactNode }[] = [
-  { id: "providers", label: "Nhà cung cấp", icon: <IconKey size={16} /> },
+  { id: "providers", label: "Model", icon: <IconKey size={16} /> },
+  { id: "harness", label: "Agent", icon: <IconSliders size={16} /> },
   { id: "skills", label: "Kỹ năng", icon: <IconBook size={16} /> },
   { id: "mcp", label: "MCP", icon: <IconPlug size={16} /> },
   { id: "plugins", label: "Plugin", icon: <IconPuzzle size={16} /> },
-  { id: "harness", label: "Harness", icon: <IconSliders size={16} /> },
-  { id: "update", label: "Cập nhật", icon: <IconDownload size={16} /> },
   { id: "data", label: "Dữ liệu", icon: <IconDatabase size={16} /> },
+  { id: "update", label: "Cập nhật", icon: <IconDownload size={16} /> },
 ];
 
 const BUILTIN_SKILL_IDS = new Set([
@@ -147,7 +152,17 @@ function keyPlaceholder(provider: string): string {
   return "Dán API key vào đây…";
 }
 
-export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, notify }: Props) {
+export function SettingsPanel({
+  open,
+  tab,
+  status,
+  onTab,
+  onClose,
+  onChanged,
+  notify,
+  createRequest,
+  onCreateRequest,
+}: Props) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [extensions, setExtensions] = useState<ExtensionsInfo | null>(null);
   const [loading, setLoading] = useState(false);
@@ -162,6 +177,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
   const [mcpTests, setMcpTests] = useState<Record<string, McpTest | "loading">>({});
   const [confirmMcpDelete, setConfirmMcpDelete] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
+  const [createKind, setCreateKind] = useState<ExtensionKind | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(async () => {
@@ -183,6 +199,12 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
   useEffect(() => {
     if (open) void reload();
   }, [open, reload]);
+
+  useEffect(() => {
+    if (!open || !createRequest) return;
+    setCreateKind(createRequest);
+    onCreateRequest?.();
+  }, [open, createRequest, onCreateRequest]);
 
   useEffect(() => {
     if (!open) return;
@@ -715,14 +737,20 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
             <div>
               <h3>Kỹ năng</h3>
               <p>
-                Prompt pack Markdown được chèn vào context khi khớp môn học và từ khóa trong câu
-                hỏi.
+                Prompt pack Markdown được chèn vào context khi khớp ngữ cảnh và từ khóa trong câu
+                hỏi. Có thể tạo bằng AI rồi chỉnh lại file.
               </p>
             </div>
-            <button className="btn" onClick={() => void openPath("skills")}>
-              <IconFolder size={15} />
-              Mở thư mục
-            </button>
+            <div className="head-actions">
+              <button className="btn" onClick={() => void openPath("skills")}>
+                <IconFolder size={15} />
+                Mở thư mục
+              </button>
+              <button className="btn btn-primary" onClick={() => setCreateKind("skill")}>
+                <IconSparkle size={15} />
+                Tạo với AI
+              </button>
+            </div>
           </div>
 
           {extensions && extensions.skills.length === 0 ? (
@@ -751,7 +779,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
                     <div className="tag-row">
                       {(skill.subjects.length > 0 ? skill.subjects : ["all"]).map((subject) => (
                         <Tag key={subject} tone="muted">
-                          {subject === "all" ? "mọi môn" : subjectLabel(subject)}
+                          {subject === "all" ? "mọi ngữ cảnh" : subjectLabel(subject)}
                         </Tag>
                       ))}
                     </div>
@@ -798,10 +826,16 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
               </p>
             </div>
             {!mcpDraft && (
-              <button className="btn btn-primary" onClick={startAddMcp}>
-                <IconPlus size={15} />
-                Thêm server
-              </button>
+              <div className="head-actions">
+                <button className="btn btn-primary" onClick={startAddMcp}>
+                  <IconPlus size={15} />
+                  Thêm server
+                </button>
+                <button className="btn" onClick={() => setCreateKind("mcp")}>
+                  <IconSparkle size={15} />
+                  Tạo với AI
+                </button>
+              </div>
             )}
           </div>
 
@@ -1025,12 +1059,12 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
                 <IconFolder size={15} />
                 Mở thư mục
               </button>
-              <button
-                className="btn btn-primary"
-                onClick={() => void installSample()}
-                disabled={installing}
-              >
+              <button className="btn" onClick={() => void installSample()} disabled={installing}>
                 {installing ? "Đang cài…" : "Cài plugin mẫu"}
+              </button>
+              <button className="btn btn-primary" onClick={() => setCreateKind("plugin")}>
+                <IconSparkle size={15} />
+                Tạo với AI
               </button>
             </div>
           </div>
@@ -1076,7 +1110,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
         <div className="section-head">
           <div>
             <h3>Dữ liệu</h3>
-            <p>Mọi thứ nằm trên máy bạn. Không có server trung gian nào giữ lịch sử học.</p>
+            <p>Mọi thứ nằm trên máy bạn. Không có server trung gian nào giữ lịch sử phiên.</p>
           </div>
         </div>
 
@@ -1090,7 +1124,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
             <span>{status?.version ?? "…"}</span>
           </div>
           <div className="kv">
-            <span>Buổi học</span>
+            <span>Phiên</span>
             <span>{status?.sessions ?? 0}</span>
           </div>
           <div className="kv">
@@ -1158,7 +1192,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
               </span>
               <span className="settings-nav-title">tez</span>
             </div>
-            <p>Cài đặt bàn học</p>
+            <p>Cài đặt agent</p>
           </div>
           <div className="settings-tabs">
             {TAB_META.map((item) => (
@@ -1186,7 +1220,7 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
           <header className="settings-header">
             <div>
               <h2>Cài đặt</h2>
-              <p>Nhà cung cấp, kỹ năng và công cụ của bàn học.</p>
+              <p>Model, hành vi agent, kỹ năng, MCP và plugin.</p>
             </div>
             <button className="icon-button" onClick={onClose} aria-label="Đóng cài đặt">
               <IconX size={18} />
@@ -1195,6 +1229,17 @@ export function SettingsPanel({ open, tab, status, onTab, onClose, onChanged, no
           <div className="settings-content">{content()}</div>
         </div>
       </div>
+
+      <CreateWithAI
+        open={createKind !== null}
+        kind={createKind}
+        onClose={() => setCreateKind(null)}
+        onSaved={async () => {
+          await reload();
+          await onChanged();
+        }}
+        notify={notify}
+      />
     </div>
   );
 }

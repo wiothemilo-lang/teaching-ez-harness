@@ -4,36 +4,30 @@ import type {
   ChatMessage,
   CompactReport,
   ConnectionInfo,
-  SubjectInfo,
   TodoItem,
   ToolTrace,
 } from "../types";
-import {
-  STRATEGY_LABELS,
-  placeholderFor,
-  subjectTone,
-  suggestionsFor,
-} from "../lib";
+import { CHAT_SUGGESTIONS, placeholderFor } from "../lib";
 import {
   IconArrowRight,
   IconArrowUp,
   IconChevronDown,
   IconKey,
   IconSliders,
+  IconSparkle,
+  IconStop,
   IconTerminal,
   IconX,
-  subjectIcon,
 } from "../icons";
 import { OkMark, Spinner } from "./ui";
 import { HarnessDock } from "./HarnessDock";
 
 type Props = {
-  subject: SubjectInfo | undefined;
-  grade: string;
   connection: ConnectionInfo | null;
   messages: ChatMessage[];
   input: string;
   busy: boolean;
+  streaming: boolean;
   error: string | null;
   loadingSession: boolean;
   lastUsage: { input: number; output: number } | null;
@@ -43,18 +37,18 @@ type Props = {
   denials: number;
   onInput: (value: string) => void;
   onSend: () => void;
+  onStop: () => void;
   onOpenSettings: () => void;
   onOpenHarness: () => void;
   onDismissError: () => void;
 };
 
 export function ChatView({
-  subject,
-  grade,
   connection,
   messages,
   input,
   busy,
+  streaming,
   error,
   loadingSession,
   lastUsage,
@@ -64,14 +58,14 @@ export function ChatView({
   denials,
   onInput,
   onSend,
+  onStop,
   onOpenSettings,
   onOpenHarness,
   onDismissError,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const subjectId = subject?.id ?? "general";
-  const suggestions = suggestionsFor(subjectId, "chat");
-  const placeholder = placeholderFor(subjectId, "chat");
+  const suggestions = CHAT_SUGGESTIONS;
+  const placeholder = placeholderFor("general", "chat");
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -96,20 +90,14 @@ export function ChatView({
     <main className="chat">
       <header className="chat-header">
         <div className="chat-heading">
-          <div className="chat-eyebrow">
-            {!subject
-              ? "Hội thoại"
-              : subject.id === "general"
-                ? STRATEGY_LABELS[subject.strategy] ?? "Trợ lý tổng quát"
-                : `${STRATEGY_LABELS[subject.strategy] ?? subject.strategy} · Lớp ${grade}`}
-          </div>
-          <h1 className="chat-title">{subject?.name ?? "Hội thoại"}</h1>
+          <div className="chat-eyebrow">LOCAL AGENT</div>
+          <h1 className="chat-title">Chat</h1>
         </div>
         <div className="chat-header-actions">
           <button className="provider-chip" onClick={onOpenSettings} title="Quản lý nhà cung cấp">
             <span className={`status-dot ${connection ? "is-on" : ""}`} aria-hidden="true" />
             <span className="provider-chip-copy">
-              <span className="provider-chip-label">Nhà cung cấp</span>
+              <span className="provider-chip-label">Model</span>
               <span className="provider-chip-value">
                 {connection ? `${connection.name} · ${connection.model}` : "Chưa kết nối"}
               </span>
@@ -126,7 +114,7 @@ export function ChatView({
           {error && (
             <div className="error-banner" role="alert">
               <div className="error-copy">
-                <strong>Không gửi được câu hỏi</strong>
+                <strong>Không gửi được yêu cầu</strong>
                 <p>{error}</p>
               </div>
               <div className="error-actions">
@@ -142,24 +130,18 @@ export function ChatView({
 
           {loadingSession ? (
             <div className="thread-loading">
-              <Spinner label="Đang mở buổi học…" />
+              <Spinner label="Đang mở phiên…" />
             </div>
           ) : messages.length === 0 ? (
             <section className="welcome">
-              <div className={`welcome-mark ${subjectTone(subjectId)}`} aria-hidden="true">
-                {subjectIcon(subjectId, 22)}
+              <div className="welcome-mark tone-general" aria-hidden="true">
+                <IconSparkle size={22} />
               </div>
-              <div className="welcome-eyebrow">
-                {!subject
-                  ? "HỘI THOẠI"
-                  : subject.id === "general"
-                    ? "TRỢ LÝ TỔNG QUÁT"
-                    : `${subject.name.toUpperCase()} · LỚP ${grade}`}
-              </div>
+              <div className="welcome-eyebrow">TEZ AGENT</div>
               <h2 className="welcome-title">Bắt đầu từ bất cứ điều gì.</h2>
               <p className="welcome-copy">
-                tez không giới hạn môn học. Hỏi kiến thức, nhờ giải thích, lên kế hoạch hay dùng
-                công cụ để tính toán — mọi dữ liệu ở lại trên máy bạn.
+                Hỏi, viết, lập kế hoạch hoặc chuyển sang Code để đọc và sửa file. Mọi dữ liệu ở lại
+                trên máy bạn.
               </p>
 
               {!connection && (
@@ -169,7 +151,7 @@ export function ChatView({
                   </span>
                   <div className="connect-copy">
                     <strong>Chưa kết nối nhà cung cấp.</strong>
-                    <p>Thêm API key miễn phí của Groq, Gemini hoặc OpenRouter để bắt đầu.</p>
+                    <p>Thêm API key của Groq, Gemini, OpenRouter hoặc Ollama để bắt đầu.</p>
                   </div>
                   <button className="btn btn-primary btn-sm" onClick={onOpenSettings}>
                     Kết nối
@@ -206,7 +188,7 @@ export function ChatView({
             ))
           )}
 
-          {busy && messages.length > 0 && (
+          {busy && !streaming && messages.length > 0 && (
             <div className="msg msg-assistant is-pending">
               <div className="msg-role">tez</div>
               <div className="msg-body">
@@ -241,13 +223,13 @@ export function ChatView({
             onKeyDown={handleKeyDown}
             placeholder={placeholder}
             rows={1}
-            aria-label="Câu hỏi cho gia sư"
+            aria-label="Câu hỏi cho agent"
             disabled={loadingSession}
           />
           <div className="composer-foot">
             <div className="composer-hint">
               {busy ? (
-                <span>Đang xử lý câu trả lời…</span>
+                <span>Đang xử lý…</span>
               ) : (
                 <>
                   <kbd>Enter</kbd> để gửi <span className="hint-sep">·</span>{" "}
@@ -262,12 +244,12 @@ export function ChatView({
                 </span>
               )}
               <button
-                className="send"
-                onClick={onSend}
-                disabled={!input.trim() || busy || loadingSession}
-                aria-label="Gửi câu hỏi"
+                className={`send ${busy ? "is-stop" : ""}`}
+                onClick={busy ? onStop : onSend}
+                disabled={!busy && (!input.trim() || loadingSession)}
+                aria-label={busy ? "Dừng agent" : "Gửi câu hỏi"}
               >
-                <IconArrowUp size={18} />
+                {busy ? <IconStop size={16} /> : <IconArrowUp size={18} />}
               </button>
             </div>
           </div>

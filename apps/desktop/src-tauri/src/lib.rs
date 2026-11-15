@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,11 +15,13 @@ use tez_core::hooks::{self};
 use tez_core::mcp::{self, McpServerConfig};
 use tez_core::memory::{self, MemoryForget, MemorySave, MemorySearch, MemoryStore};
 use tez_core::modes::Mode;
-use tez_core::permission::{ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy};
+use tez_core::permission::{
+    ApprovalRequest, Approver, AutoApprover, PermissionMode, PermissionPolicy,
+};
 use tez_core::plugins;
 use tez_core::skills::{self, SkillRegistry};
 use tez_core::subagent::{SubagentRuntime, TaskTool};
-use tez_core::subjects::{self, SubjectPack};
+use tez_core::subjects;
 use tez_core::todo::{TodoItem, TodoState, TodoWrite};
 use tez_core::tools::balance_equation::BalanceEquation;
 use tez_core::tools::calculator::Calculator;
@@ -31,7 +33,9 @@ use tez_core::tools::physics_formula::PhysicsFormula;
 use tez_core::tools::plot_function::PlotFunction;
 use tez_core::tools::readability::Readability;
 use tez_core::tools::{code_registry, ToolRegistry};
-use tez_llm::{LlmProvider, Message, OpenAiCompatible};
+use tez_llm::{
+    ChatRequest as LlmChatRequest, ChatResponse, LlmProvider, Message, OpenAiCompatible,
+};
 use tez_store::{NewMessage, Store, UsageRecord};
 
 const SAMPLE_PLUGIN_JSON: &str =
@@ -85,6 +89,31 @@ struct SaveMcpRequest {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize)]
+struct DraftExtensionRequest {
+    kind: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DraftFile {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftExtensionResult {
+    kind: String,
+    files: Vec<DraftFile>,
+    notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveExtensionRequest {
+    kind: String,
+    files: Vec<DraftFile>,
 }
 
 struct ResolvedConnection {
@@ -145,10 +174,6 @@ struct AppStatus {
 
 #[derive(Debug, Deserialize)]
 struct ChatRequest {
-    #[serde(default)]
-    subject: String,
-    #[serde(default)]
-    grade: String,
     message: String,
     session_id: Option<String>,
     provider_id: Option<String>,
@@ -239,6 +264,41 @@ impl ApprovalBroker {
             pending.remove(id);
         }
     }
+}
+
+/// Cho phép UI dừng lượt agent đang chạy.
+#[derive(Default)]
+struct StopBroker {
+    current: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+}
+
+impl StopBroker {
+    fn register(&self) -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        if let Ok(mut current) = self.current.lock() {
+            *current = Some(tx);
+        }
+        rx
+    }
+
+    fn clear(&self) {
+        if let Ok(mut current) = self.current.lock() {
+            current.take();
+        }
+    }
+
+    fn stop(&self) -> bool {
+        match self.current.lock().ok().and_then(|current| current.as_ref().cloned()) {
+            Some(tx) => tx.send(true).is_ok(),
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct ChatDelta {
+    session_id: String,
+    text: String,
 }
 
 struct DesktopApprover {
@@ -454,10 +514,6 @@ fn full_registry() -> ToolRegistry {
     registry
 }
 
-fn registry_for(pack: &SubjectPack) -> ToolRegistry {
-    full_registry().filtered(pack.tools)
-}
-
 fn subject_infos() -> Vec<SubjectInfo> {
     subjects::ALL
         .iter()
@@ -613,8 +669,9 @@ async fn test_provider_inner(id: Option<&str>) -> anyhow::Result<ConnectionTest>
     let saved = resolve_connection(&dir, id)?;
     let provider = OpenAiCompatible::new(&saved.provider_id, &saved.base_url, &saved.api_key);
     let started = Instant::now();
-    let message = tez_llm::ping(&provider, &saved.model).await.map_err(|error| {
-        match &error {
+    let message = tez_llm::ping(&provider, &saved.model)
+        .await
+        .map_err(|error| match &error {
             tez_llm::LlmError::Api { status, .. } if *status == 401 || *status == 403 => {
                 anyhow::anyhow!(
                     "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt."
@@ -627,8 +684,7 @@ async fn test_provider_inner(id: Option<&str>) -> anyhow::Result<ConnectionTest>
                 anyhow::anyhow!("Provider không phản hồi kịp (timeout). Kiểm tra mạng/base_url.")
             }
             _ => anyhow::anyhow!(error),
-        }
-    })?;
+        })?;
     let latency_ms = started.elapsed().as_millis() as u64;
 
     Ok(ConnectionTest {
@@ -776,6 +832,234 @@ fn install_sample_plugin() -> Result<PluginInfo, String> {
     Ok(plugin_info(plugin))
 }
 
+fn extension_system_prompt(kind: &str) -> String {
+    match kind {
+        "skill" => r#"Bạn là chuyên gia viết skill cho AI agent local-first.
+Hãy tạo một skill Markdown ngắn gọn, có thể dùng ngay.
+Chỉ trả về JSON hợp lệ, không markdown, không giải thích:
+{"files":[{"path":"skills/<slug>/SKILL.md","content":"---\nname: <tên>\ndescription: <mô tả ngắn>\nsubjects: all\ntriggers: <từ khóa, phân tách bằng dấu phẩy>\n---\n<chỉ dẫn thực tế, 5-12 dòng>"}]}
+Quy tắc: slug chỉ gồm chữ thường, số và dấu gạch ngang; nội dung là chỉ dẫn cho agent, không phải lời chào; không bịa tool không tồn tại."#
+            .to_string(),
+        "mcp" => r#"Bạn là chuyên gia cấu hình MCP server.
+Hãy đề xuất một MCP server stdio thực tế, cài được bằng command phổ biến (npx, uvx, python3...).
+Chỉ trả về JSON hợp lệ, không markdown, không giải thích:
+{"name":"<tên ngắn>","command":"<lệnh>","args":["..."],"env":{},"cwd":null,"enabled":true}
+Không bịa package không tồn tại; nếu cần đường dẫn, dùng placeholder rõ ràng. Không đưa secret vào env."#
+            .to_string(),
+        "plugin" => r#"Bạn là chuyên gia đóng gói extension cho AI agent.
+Hãy tạo một plugin gồm manifest và một skill Markdown.
+Chỉ trả về JSON hợp lệ, không markdown, không giải thích:
+{"files":[
+  {"path":"plugins/<slug>/plugin.json","content":"{\"id\":\"<slug>\",\"name\":\"<tên>\",\"version\":\"0.1.0\",\"description\":\"<mô tả>\",\"skills\":[\"skills/<slug>\"],\"mcpServers\":{}}"},
+  {"path":"plugins/<slug>/skills/<slug>/SKILL.md","content":"---\nname: <tên>\ndescription: <mô tả>\nsubjects: all\ntriggers: <từ khóa>\n---\n<chỉ dẫn>"}
+]}
+Quy tắc: slug chỉ gồm chữ thường, số và dấu gạch ngang; manifest phải là JSON hợp lệ; không bịa tool."#
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn strip_code_fence(raw: &str) -> String {
+    let mut text = raw.trim();
+    if text.starts_with("```") {
+        if let Some(newline) = text.find('\n') {
+            text = &text[newline + 1..];
+        }
+        if let Some(end) = text.rfind("```") {
+            text = &text[..end];
+        }
+    }
+    text.trim().to_string()
+}
+
+fn parse_draft_files(raw: &str) -> Result<Vec<DraftFile>, String> {
+    let text = strip_code_fence(raw);
+    let start = text
+        .find(['{', '['])
+        .ok_or_else(|| "AI không trả về JSON. Thử lại với mô tả cụ thể hơn.".to_string())?;
+    let end = text
+        .rfind(['}', ']'])
+        .ok_or_else(|| "AI trả về JSON chưa hoàn chỉnh. Thử lại.".to_string())?;
+    let slice = &text[start..=end];
+
+    #[derive(Deserialize)]
+    struct Envelope {
+        files: Vec<DraftFile>,
+    }
+
+    if let Ok(envelope) = serde_json::from_str::<Envelope>(slice) {
+        if !envelope.files.is_empty() {
+            return Ok(envelope.files);
+        }
+    }
+    if let Ok(files) = serde_json::from_str::<Vec<DraftFile>>(slice) {
+        if !files.is_empty() {
+            return Ok(files);
+        }
+    }
+    if let Ok(file) = serde_json::from_str::<DraftFile>(slice) {
+        return Ok(vec![file]);
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(slice) {
+        if value.get("name").is_some() && value.get("command").is_some() {
+            return Ok(vec![DraftFile {
+                path: "mcp.json".to_string(),
+                content: serde_json::to_string_pretty(&value)
+                    .map_err(|error| format!("không serialize được MCP: {error}"))?,
+            }]);
+        }
+    }
+
+    Err("AI trả về JSON không đúng định dạng. Thử lại với mô tả ngắn và rõ hơn.".to_string())
+}
+
+fn safe_extension_path(kind: &str, raw: &str) -> Result<PathBuf, String> {
+    let path = Path::new(raw.trim());
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(format!("đường dẫn không hợp lệ: {raw}"));
+    }
+    let expected = match kind {
+        "skill" => "skills",
+        "plugin" => "plugins",
+        _ => return Err(format!("loại extension không hỗ trợ: {kind}")),
+    };
+    let mut components = path.components();
+    let first = match components.next() {
+        Some(Component::Normal(value)) => value.to_string_lossy().to_string(),
+        _ => return Err(format!("đường dẫn không hợp lệ: {raw}")),
+    };
+    if first != expected {
+        return Err(format!("file phải nằm trong {expected}/: {raw}"));
+    }
+    for component in components {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(format!("đường dẫn không được chứa '..': {raw}"));
+        }
+    }
+    if kind == "skill" && !path.ends_with("SKILL.md") {
+        return Err(format!("skill phải là file SKILL.md: {raw}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+#[tauri::command]
+async fn draft_extension(request: DraftExtensionRequest) -> Result<DraftExtensionResult, String> {
+    let kind = request.kind.trim().to_lowercase();
+    if !matches!(kind.as_str(), "skill" | "mcp" | "plugin") {
+        return Err(format!("loại extension không hỗ trợ: {kind}"));
+    }
+    let prompt = request.prompt.trim();
+    if prompt.is_empty() {
+        return Err("Hãy mô tả extension bạn muốn tạo.".into());
+    }
+
+    let dir = data_dir().map_err(friendly)?;
+    let connection = resolve_connection(&dir, None).map_err(friendly)?;
+    let provider = OpenAiCompatible::new(
+        &connection.provider_id,
+        &connection.base_url,
+        &connection.api_key,
+    );
+    let response = provider
+        .chat(LlmChatRequest {
+            model: connection.model.clone(),
+            messages: vec![
+                Message::system(extension_system_prompt(&kind)),
+                Message::user(prompt),
+            ],
+            tools: Vec::new(),
+            temperature: Some(0.3),
+            top_p: Some(0.95),
+            max_tokens: Some(4_096),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let content = match response {
+        ChatResponse::Text { content, .. } => content,
+        ChatResponse::ToolCalls { content, .. } => content.unwrap_or_default(),
+    };
+    let files = parse_draft_files(&content)?;
+    Ok(DraftExtensionResult {
+        kind,
+        files,
+        notes: "Bản nháp do AI tạo. Kiểm tra nội dung trước khi lưu.".to_string(),
+    })
+}
+
+#[tauri::command]
+fn save_extension(request: SaveExtensionRequest) -> Result<Vec<String>, String> {
+    let kind = request.kind.trim().to_lowercase();
+    if !matches!(kind.as_str(), "skill" | "mcp" | "plugin") {
+        return Err(format!("loại extension không hỗ trợ: {kind}"));
+    }
+    if request.files.is_empty() {
+        return Err("Không có file nào để lưu.".into());
+    }
+    if request.files.len() > 20 {
+        return Err("Quá nhiều file trong một lần lưu.".into());
+    }
+
+    let dir = data_dir().map_err(friendly)?;
+
+    if kind == "mcp" {
+        #[derive(Deserialize)]
+        struct DraftMcp {
+            name: String,
+            command: String,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default)]
+            env: HashMap<String, String>,
+            #[serde(default)]
+            cwd: Option<String>,
+            #[serde(default = "default_true")]
+            enabled: bool,
+        }
+
+        let file = request
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("mcp.json"))
+            .or_else(|| request.files.first())
+            .ok_or_else(|| "Thiếu file cấu hình MCP.".to_string())?;
+        let draft: DraftMcp = serde_json::from_str(&file.content)
+            .map_err(|error| format!("MCP JSON không hợp lệ: {error}"))?;
+        if draft.name.trim().is_empty() || draft.command.trim().is_empty() {
+            return Err("MCP cần có name và command.".into());
+        }
+        let mut config = mcp::load_config(&dir).map_err(|error| error.to_string())?;
+        config.servers.insert(
+            draft.name.trim().to_string(),
+            McpServerConfig {
+                command: draft.command.trim().to_string(),
+                args: draft.args,
+                env: draft.env,
+                cwd: draft.cwd.filter(|value| !value.trim().is_empty()),
+                enabled: draft.enabled,
+            },
+        );
+        mcp::save_config(&dir, &config).map_err(|error| error.to_string())?;
+        return Ok(vec![format!("mcp:{}", draft.name.trim())]);
+    }
+
+    let mut written = Vec::new();
+    for file in &request.files {
+        if file.content.chars().count() > 200_000 {
+            return Err(format!("file quá lớn: {}", file.path));
+        }
+        let relative = safe_extension_path(&kind, &file.path)?;
+        let full = dir.join(&relative);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("không tạo được thư mục: {error}"))?;
+        }
+        std::fs::write(&full, &file.content)
+            .map_err(|error| format!("không ghi được {}: {error}", full.display()))?;
+        written.push(full.display().to_string());
+    }
+    Ok(written)
+}
+
 #[tauri::command]
 fn open_extension_path(kind: String) -> Result<String, String> {
     let dir = data_dir().map_err(friendly)?;
@@ -876,11 +1160,13 @@ fn load_session(request: SessionRequest) -> Result<SessionDetail, String> {
 async fn chat(
     app: AppHandle,
     broker: State<'_, Arc<ApprovalBroker>>,
+    stop: State<'_, Arc<StopBroker>>,
     request: ChatRequest,
 ) -> Result<ChatReply, String> {
-    chat_inner(app, Arc::clone(&broker), request)
-        .await
-        .map_err(|error| match error.downcast_ref::<tez_llm::LlmError>() {
+    let cancel = stop.register();
+    let result = chat_inner(app, Arc::clone(&broker), request, cancel).await;
+    stop.clear();
+    result.map_err(|error| match error.downcast_ref::<tez_llm::LlmError>() {
             Some(tez_llm::LlmError::Api { status, .. }) if *status == 401 || *status == 403 => {
                 format!(
                     "API key bị provider từ chối (HTTP {status}). Kiểm tra lại key trong Cài đặt."
@@ -893,14 +1179,20 @@ async fn chat(
         })
 }
 
+#[tauri::command]
+fn stop_chat(stop: State<'_, Arc<StopBroker>>) -> bool {
+    stop.stop()
+}
+
 async fn chat_inner(
     app: AppHandle,
     broker: Arc<ApprovalBroker>,
     request: ChatRequest,
+    cancel: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<ChatReply> {
+    let stream_app = app.clone();
     let dir = data_dir()?;
     let mode = Mode::parse(request.mode.as_deref().unwrap_or("chat"));
-    let pack = subjects::resolve_or_general(&request.subject);
     let workspace = match mode {
         Mode::Code => Some(resolve_workspace(request.workspace.as_deref())?),
         Mode::Chat => None,
@@ -921,7 +1213,7 @@ async fn chat_inner(
     let memory_store = MemoryStore::new(dir.join("memory"));
 
     let store = Store::open(dir.join("tez.db"))?;
-    store.ensure_profile("default", "Học sinh")?;
+    store.ensure_profile("default", "Người dùng")?;
 
     let (session_id, history, todo_json, created) = match request.session_id.as_deref() {
         Some(id) => {
@@ -941,14 +1233,27 @@ async fn chat_inner(
             (id.to_string(), history, store.load_todos(id)?, false)
         }
         None => (
-            store.create_session_mode("default", None, Some(pack.id), mode.as_str())?,
+            store.create_session_mode("default", None, None, mode.as_str())?,
             Vec::new(),
             None,
             true,
         ),
     };
-    let mut session_guard = created.then(|| NewSessionGuard {
-        db: dir.join("tez.db"),
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let emitter_session = session_id.clone();
+    let emitter = tokio::spawn(async move {
+        while let Some(text) = delta_rx.recv().await {
+            let _ = stream_app.emit(
+                "tez://chat-delta",
+                ChatDelta {
+                    session_id: emitter_session.clone(),
+                    text,
+                },
+            );
+        }
+    });
+
+    let mut session_guard = created.then(|| NewSessionGuard {        db: dir.join("tez.db"),
         id: session_id.clone(),
         armed: true,
     });
@@ -960,12 +1265,7 @@ async fn chat_inner(
         }
     }
 
-    let subject_filter = if pack.is_general() {
-        None
-    } else {
-        Some(pack.id)
-    };
-    let hits = store.search_chunks(&request.message, subject_filter, 4)?;
+    let hits = store.search_chunks(&request.message, None, 4)?;
     let excerpts: Vec<String> = hits
         .iter()
         .map(|hit| format!("[{}] {}", hit.title, hit.snippet))
@@ -985,7 +1285,7 @@ async fn chat_inner(
     recent.push(Message::user(request.message.clone()));
 
     let registry = SkillRegistry::load_with_plugins(&dir)?;
-    let matched = registry.matching(pack.id, &request.message, 2);
+    let matched = registry.matching_query(&request.message, 2);
     let skill_snippets: Vec<String> = matched.iter().map(|skill| skills::render(skill)).collect();
 
     let recalled = if config.memory.enabled && config.memory.auto_recall {
@@ -996,24 +1296,20 @@ async fn chat_inner(
     };
     let todo_snapshot = todos.snapshot();
 
-    let objectives: Vec<String> = Vec::new();
     let workspace_label = workspace
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let messages = ContextBuilder.build(ContextInput {
-        subject: pack,
-        grade: &request.grade,
-        objectives: &objectives,
-        excerpts: &excerpts,
-        student_summary: None,
-        state: "practice",
         recent: &recent,
+        excerpts: &excerpts,
         skills: &skill_snippets,
         memory: &recalled,
         todos: &todo_snapshot,
         mode,
         workspace: Some(&workspace_label),
+        instructions: &config.system_prompt,
+        language: &config.language,
     });
 
     let provider: Arc<dyn LlmProvider> = Arc::new(OpenAiCompatible::new(
@@ -1024,7 +1320,7 @@ async fn chat_inner(
 
     let mut tools = match (&mode, workspace.as_deref()) {
         (Mode::Code, Some(root)) => code_registry(root)?,
-        _ => registry_for(pack),
+        _ => full_registry(),
     };
     tools.register(MemorySave::new(memory_store.clone()));
     tools.register(MemorySearch::new(memory_store.clone()));
@@ -1043,10 +1339,14 @@ async fn chat_inner(
             policy: Arc::clone(&policy),
             approver: Arc::clone(&approver),
             hooks: Arc::clone(&hooks),
-            max_steps: config.max_steps,
+            max_steps: config.subagent_max_steps,
             compaction: config.compaction.clone(),
         });
         tools.register(TaskTool::new(runtime));
+    }
+
+    if !config.disabled_tools.is_empty() {
+        tools = tools.without(&config.disabled_tools);
     }
 
     let artifact_dir = session_artifact_dir(&dir, &session_id);
@@ -1056,13 +1356,17 @@ async fn chat_inner(
             max_steps: config.max_steps,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
+            top_p: config.top_p,
+            max_tool_output: config.max_tool_output,
             ..AgentConfig::default()
         })
         .with_policy(Arc::clone(&policy))
         .with_approver(Arc::clone(&approver))
         .with_hooks(Arc::clone(&hooks))
         .with_compactor(compactor)
-        .with_todos(Arc::clone(&todos));
+        .with_todos(Arc::clone(&todos))
+        .with_stream(delta_tx)
+        .with_cancel(cancel);
     let started = Instant::now();
     let outcome = agent
         .run_with(
@@ -1071,6 +1375,8 @@ async fn chat_inner(
             RunContext::new(&session_id, Some(&artifact_dir), &request.message),
         )
         .await?;
+    drop(agent);
+    let _ = emitter.await;
     let latency_ms = started.elapsed().as_millis() as u64;
 
     let store = Store::open(dir.join("tez.db"))?;
@@ -1253,9 +1559,11 @@ fn open_workspace(path: Option<String>) -> Result<WorkspaceInfo, String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(Arc::new(ApprovalBroker::default()))
+        .manage(Arc::new(StopBroker::default()))
         .invoke_handler(tauri::generate_handler![
             app_status,
             chat,
+            stop_chat,
             respond_approval,
             get_harness,
             save_harness,
@@ -1273,6 +1581,8 @@ pub fn run() {
             delete_mcp_server,
             test_mcp_server,
             install_sample_plugin,
+            draft_extension,
+            save_extension,
             open_extension_path,
             check_update,
             download_update,

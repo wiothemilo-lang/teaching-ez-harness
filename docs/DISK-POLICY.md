@@ -6,7 +6,7 @@
 
 ## 1. Ngân sách dung lượng
 
-Máy hiện có ~131GB trống. Ngân sách cho dự án:
+Máy hiện tại (VPS, kiểm tra 2026-11-14): ổ 79GB, đã dùng ~24GB, còn ~51GB trống. Ngân sách cho dự án:
 
 | Hạng mục | Đường dẫn | Mềm | Cứng | Khi vượt |
 |---|---|---:|---:|---|
@@ -15,6 +15,7 @@ Máy hiện có ~131GB trống. Ngân sách cho dự án:
 | Cargo git | `~/.cargo/git` | 1GB | 2GB | Xóa checkout > 30 ngày |
 | Build artifacts | `target/` | 8GB | 12GB | Xóa `incremental`, rồi `cargo clean` |
 | Desktop build | `apps/desktop/src-tauri/target/` | 7GB | 9GB | Xóa `incremental`, rồi `cargo clean` |
+| **Rust build (tổng)** | rustup + cargo + 2 target | **24GB** | **30GB** | Dọn incremental + cache cũ, rồi `cargo clean` |
 | Node runtime | `~/.local/share/fnm` | 1GB | 2GB | Chỉ giữ một bản LTS |
 | pnpm store | `~/.local/share/pnpm/store` | 3GB | 5GB | `pnpm store prune` |
 | node_modules | `apps/*/node_modules` | 2GB | 3GB | Xóa cache/build tạm; cài lại khi cần |
@@ -27,7 +28,16 @@ Máy hiện có ~131GB trống. Ngân sách cho dự án:
 
 - Mềm = bắt đầu cảnh báo và dọn dẹp cơ hội.
 - Cứng = bắt buộc dọn trước khi build/install tiếp.
-- Tổng cứng 40GB, còn xa mức 131GB hiện có.
+- Rust build cứng **30GB**; tổng dự án cứng 40GB, còn ~51GB trống trên VPS.
+
+### Quy tắc Rust build ≤ 30GB
+
+`Rust build = ~/.rustup + ~/.cargo/registry + ~/.cargo/git + target/ + apps/desktop/src-tauri/target/`
+
+- **≥ 24GB (mềm):** xóa `incremental`, cache registry/git > 30 ngày.
+- **≥ 30GB (cứng):** bắt buộc `cargo clean` cả hai `target/`; nếu vẫn ≥ 30GB thì `auto` trả exit 1 để chặn build.
+- Không dọn khi `cargo`/`rustc` đang chạy (tránh phá build giữa chừng).
+- Được gọi tự động trước mỗi build (`scripts/build.sh`, `scripts/test.sh`, `scripts/desktop.sh`) và bởi cron mỗi 6 giờ.
 
 ---
 
@@ -140,9 +150,24 @@ scripts/test.sh    # disk guard + fmt + clippy + test
 ## 7. Khi nào chạy dọn dẹp
 
 - Trước mỗi lần build lớn.
+- Tự động mỗi 6 giờ qua cron (xem mục 8).
 - Mỗi tuần một lần (hoặc khi `disk-guard check` báo mềm).
 - Sau khi package installer.
 - Khi `tez doctor` báo > 80% hạn mức.
+
+---
+
+## 8. Tự động hóa trên VPS
+
+Cron chạy `disk-guard.sh auto` mỗi 6 giờ, ghi log vào `~/.local/share/teaching-ez/logs/disk-guard.log`:
+
+```cron
+17 */6 * * * /root/teaching-ez-harness/scripts/disk-guard.sh auto >> /root/.local/share/teaching-ez/logs/disk-guard.log 2>&1
+```
+
+- Có khóa `flock` để hai lần chạy không chồng nhau.
+- Tự bỏ qua nếu `cargo`/`rustc` đang chạy.
+- Gỡ tự động: `crontab -e` và xóa dòng trên.
 
 ---
 
