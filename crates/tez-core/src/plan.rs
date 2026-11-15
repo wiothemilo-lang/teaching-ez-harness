@@ -2,11 +2,15 @@
 //! phụ thuộc vào lịch sử chat hoặc todos.
 //!
 //! Mỗi phiên có một file `plans/<session>.md`. Tên file được làm sạch để không
-//! thể thoát khỏi thư mục plans.
+//! thể thoát khỏi thư mục plans. Chỉ lượt chạy kết thúc bình thường mới được
+//! ghi đè kế hoạch; Stop hoặc chạm giới hạn bước không được thay kế hoạch tốt
+//! bằng thông báo dừng.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::agent::{AgentOutcome, StopReason};
 
 /// Giới hạn kế hoạch để file và prompt không phình quá mức.
 pub const MAX_PLAN_CHARS: usize = 200_000;
@@ -36,6 +40,18 @@ pub fn save_plan(
     let capped: String = text.chars().take(MAX_PLAN_CHARS).collect();
     fs::write(&path, capped)?;
     Ok(Some(path))
+}
+
+/// Chỉ lưu khi lượt chạy hoàn thành bình thường.
+pub fn save_plan_if_completed(
+    dir: impl AsRef<Path>,
+    session_id: &str,
+    outcome: &AgentOutcome,
+) -> io::Result<Option<PathBuf>> {
+    if outcome.stop_reason != StopReason::Completed {
+        return Ok(None);
+    }
+    save_plan(dir, session_id, &outcome.text)
 }
 
 /// Đọc kế hoạch đã lưu; chưa có file thì trả `None`.
@@ -70,6 +86,14 @@ fn safe_name(session_id: &str) -> String {
 mod tests {
     use super::*;
 
+    fn outcome(stop_reason: StopReason, text: &str) -> AgentOutcome {
+        AgentOutcome {
+            text: text.to_string(),
+            stop_reason,
+            ..AgentOutcome::default()
+        }
+    }
+
     #[test]
     fn saves_and_loads_plan() {
         let dir = tempfile::tempdir().unwrap();
@@ -88,6 +112,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(save_plan(dir.path(), "sess-1", "   \n").unwrap().is_none());
         assert!(load_plan(dir.path(), "sess-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn stopped_turn_does_not_overwrite_good_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        save_plan(dir.path(), "sess-1", "Kế hoạch tốt\n- bước 1").unwrap();
+
+        let stopped = outcome(StopReason::Stopped, "Đã dừng theo yêu cầu.");
+        assert!(save_plan_if_completed(dir.path(), "sess-1", &stopped)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_plan(dir.path(), "sess-1").unwrap().unwrap(),
+            "Kế hoạch tốt\n- bước 1"
+        );
+
+        let max_steps = outcome(StopReason::MaxSteps, "Đã dừng sau 12 bước");
+        assert!(save_plan_if_completed(dir.path(), "sess-1", &max_steps)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_plan(dir.path(), "sess-1").unwrap().unwrap(),
+            "Kế hoạch tốt\n- bước 1"
+        );
+    }
+
+    #[test]
+    fn completed_turn_saves_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let completed = outcome(StopReason::Completed, "Kế hoạch mới");
+        let path = save_plan_if_completed(dir.path(), "sess-1", &completed)
+            .unwrap()
+            .unwrap();
+        assert!(path.ends_with("plans/sess-1.md"));
+        assert_eq!(
+            load_plan(dir.path(), "sess-1").unwrap().unwrap(),
+            "Kế hoạch mới"
+        );
     }
 
     #[test]
