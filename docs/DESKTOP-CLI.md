@@ -203,7 +203,7 @@ tez doctor
 | Màn hình | Chức năng |
 |---|---|
 | **Chat** | Trợ lý tổng quát (không bắt chọn môn), gửi kèm ảnh (file trong `images/<session>/`, DB giữ ref `tez-image:`; gửi lại tối đa 2 lượt user gần nhất), preset môn/lớp tùy chọn, tool trace, token usage, plan/context dock |
-| **Plan** | Chỉ đọc workspace, khảo sát và lưu kế hoạch vào `plans/<session>.md`; nút Kế hoạch mở PlanDialog để xem/sửa/lưu, cảnh báo nếu thiếu mục schema; chuyển sang Code nạp lại plan |
+| **Plan** | Chỉ đọc workspace, khảo sát và lưu kế hoạch vào `plans/<session>.md`; nút Kế hoạch mở PlanDialog để xem/sửa/lưu, cảnh báo và chặn **Lưu kế hoạch** nếu thiếu mục schema (**Lưu nháp** vẫn cho lưu); chuyển sang Code nạp lại plan |
 | **Code** | Workspace chip, `read_file`/`write_file`/`edit_file`/`list_files`/`glob`/`grep`/`run_command`, todo/context dock, approval modal |
 | **Approval modal** | Hiện lý do + tool + diff trước khi ghi (hoặc args JSON); checkbox **Cho phép thao tác này trong phiên hiện tại** (lưu trong `approvals.json`; TTL/max chỉnh trong Agent); từ chối hoặc cho phép; timeout 180 s thì từ chối |
 | **Harness dock** | Tiến độ todo, context meter, số lượt nén, số thao tác bị chặn, nút mở Settings → Harness |
@@ -260,7 +260,7 @@ Chi tiết: [PROVIDER-AUTH.md](PROVIDER-AUTH.md).
 - Migration hiện tại là schema version 5; `Store::migrate` chạy `SCHEMA` idempotent rồi thêm cột còn thiếu (`sessions.subject`, `sessions.mode`).
 - Bảng chính: `profiles`, `connections`, `lessons`, `sessions`, `messages`, `context_snapshots`, `tool_calls`, `session_todos`, `ai_usage`, `documents`, `document_chunks`, `document_chunks_fts`, `schema_migrations`.
 - `session_todos` giữ kế hoạch của phiên dưới dạng JSON array, khoá theo `session_id`; desktop/CLI nạp lại khi resume.
-- Plan đầy đủ nằm ngoài DB ở `plans/<session>.md` (cap 200.000 ký tự); desktop có PlanDialog để xem/sửa/lưu, CLI đọc file. Kế hoạch dùng schema Markdown 6 mục (`Mục tiêu`, `Phạm vi`, `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`); PlanDialog có form nhập từng mục bên cạnh Markdown đầy đủ, desktop cảnh báo mục thiếu, CLI in cảnh báo ra stderr nhưng vẫn lưu.
+- Plan đầy đủ nằm ngoài DB ở `plans/<session>.md` (cap 200.000 ký tự); desktop có PlanDialog để xem/sửa/lưu, CLI đọc file. Kế hoạch dùng schema Markdown 6 mục (`Mục tiêu`, `Phạm vi`, `File và thay đổi`, `Các bước`, `Rủi ro`, `Kiểm chứng`); PlanDialog có form nhập từng mục bên cạnh Markdown đầy đủ; desktop cảnh báo và chặn **Lưu kế hoạch** nếu thiếu mục (**Lưu nháp** vẫn cho lưu), CLI in cảnh báo ra stderr nhưng vẫn lưu.
 - Không multi-tenant; mỗi máy một DB.
 
 Chi tiết schema: [RUST-ARCHITECTURE.md](RUST-ARCHITECTURE.md#8-storage).
