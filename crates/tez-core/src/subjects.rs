@@ -49,7 +49,19 @@ pub const GENERAL: SubjectPack = SubjectPack {
 pub const MATH: SubjectPack = SubjectPack {
     id: "math",
     name: "Toán",
-    aliases: &["toan", "toán", "math", "mathematics"],
+    aliases: &[
+        "toan",
+        "toán",
+        "toan hoc",
+        "toán học",
+        "hinh hoc",
+        "hình học",
+        "dai so",
+        "đại số",
+        "math",
+        "mathematics",
+        "maths",
+    ],
     strategy: "socratic",
     tutor_prompt: "Hướng dẫn từng bước, hỏi học sinh trước khi chốt đáp án. \
         Khi học sinh làm sai, chỉ ra chỗ sai cụ thể thay vì đưa lời giải ngay. \
@@ -61,7 +73,22 @@ pub const MATH: SubjectPack = SubjectPack {
 pub const PHYSICS: SubjectPack = SubjectPack {
     id: "physics",
     name: "Vật lý",
-    aliases: &["ly", "lý", "vat ly", "vật lý", "physics", "physic"],
+    aliases: &[
+        "ly",
+        "lý",
+        "li",
+        "lí",
+        "vat ly",
+        "vật lý",
+        "vat li",
+        "vật lí",
+        "ly hoc",
+        "lý học",
+        "vat ly hoc",
+        "vật lý học",
+        "physics",
+        "physic",
+    ],
     strategy: "socratic",
     tutor_prompt: "Luôn kiểm tra đơn vị và đại lượng đã cho trước khi tính. \
         Viết công thức, thay số, rồi mới ra kết quả. Dùng convert_units khi đổi đơn vị \
@@ -77,7 +104,16 @@ pub const PHYSICS: SubjectPack = SubjectPack {
 pub const CHEMISTRY: SubjectPack = SubjectPack {
     id: "chemistry",
     name: "Hóa học",
-    aliases: &["hoa", "hóa", "hoa hoc", "hóa học", "chemistry", "chem"],
+    aliases: &[
+        "hoa",
+        "hóa",
+        "hoá",
+        "hoa hoc",
+        "hóa học",
+        "hoá học",
+        "chemistry",
+        "chem",
+    ],
     strategy: "socratic",
     tutor_prompt: "Cân bằng phương trình trước khi tính toán định lượng. \
         Dùng molar_mass để tính khối lượng mol và balance_equation để cân bằng phương trình. \
@@ -88,7 +124,15 @@ pub const CHEMISTRY: SubjectPack = SubjectPack {
 pub const ENGLISH: SubjectPack = SubjectPack {
     id: "english",
     name: "Tiếng Anh",
-    aliases: &["anh", "tieng anh", "tiếng anh", "english", "eng"],
+    aliases: &[
+        "anh",
+        "anh van",
+        "anh văn",
+        "tieng anh",
+        "tiếng anh",
+        "english",
+        "eng",
+    ],
     strategy: "coach",
     tutor_prompt: "Dạy tiếng Anh theo hướng giao tiếp và sửa lỗi nhẹ nhàng. \
         Khi học sinh viết, chỉ ra lỗi ngữ pháp/chính tả cụ thể, đưa câu sửa mẫu, \
@@ -103,9 +147,49 @@ pub const ALL: &[SubjectPack] = &[GENERAL, MATH, PHYSICS, CHEMISTRY, ENGLISH];
 /// Các pack môn học (không gồm pack tổng quát).
 pub const SUBJECTS: &[SubjectPack] = &[MATH, PHYSICS, CHEMISTRY, ENGLISH];
 
-/// Chuẩn hóa chuỗi để so khớp: chữ thường, bỏ khoảng trắng thừa.
+/// Chuẩn hóa chuỗi để so khớp: chữ thường, bỏ dấu tiếng Việt, gộp khoảng trắng.
+///
+/// Cách này xử lý cả NFC (`Toán`) và NFD (`Toa` + dấu sắc rời) vì dấu tổ hợp
+/// bị loại bỏ sau khi chữ cái gốc được giữ lại.
 fn normalize(input: &str) -> String {
-    input.trim().to_lowercase()
+    let folded: String = input
+        .trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(fold_char)
+        .collect();
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036f
+            | 0x1ab0..=0x1aff
+            | 0x1dc0..=0x1dff
+            | 0x20d0..=0x20ff
+            | 0xfe20..=0xfe2f
+    )
+}
+
+/// Bỏ dấu các nguyên âm tiếng Việt (đã ở dạng chữ thường).
+fn fold_char(ch: char) -> Option<char> {
+    if is_combining_mark(ch) {
+        return None;
+    }
+    let base = match ch {
+        'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ' | 'ắ' | 'ặ'
+        | 'ẳ' | 'ẵ' => 'a',
+        'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
+        'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
+        'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ' | 'ợ'
+        | 'ở' | 'ỡ' => 'o',
+        'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
+        'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
+        'đ' => 'd',
+        _ => ch,
+    };
+    Some(base)
 }
 
 /// Tìm pack theo id, tên tiếng Việt hoặc alias. Không phân biệt hoa thường.
@@ -140,9 +224,22 @@ mod tests {
         assert_eq!(resolve("math").unwrap().id, "math");
         assert_eq!(resolve("Toán").unwrap().id, "math");
         assert_eq!(resolve("toan").unwrap().id, "math");
+        assert_eq!(resolve("toán học").unwrap().id, "math");
         assert_eq!(resolve("Lý").unwrap().id, "physics");
+        assert_eq!(resolve("lí").unwrap().id, "physics");
+        assert_eq!(resolve("vật lý").unwrap().id, "physics");
         assert_eq!(resolve("hoa hoc").unwrap().id, "chemistry");
+        assert_eq!(resolve("hoá").unwrap().id, "chemistry");
         assert_eq!(resolve("English").unwrap().id, "english");
+        assert_eq!(resolve("tiếng anh").unwrap().id, "english");
+    }
+
+    #[test]
+    fn normalizes_decomposed_unicode() {
+        // "Toán", "Hoá học" và "Vật lí" ở dạng NFD (dấu tách rời).
+        assert_eq!(resolve("Toa\u{0301}n").unwrap().id, "math");
+        assert_eq!(resolve("Hoa\u{0301} ho\u{0323}c").unwrap().id, "chemistry");
+        assert_eq!(resolve("Va\u{0323}t li\u{0301}").unwrap().id, "physics");
     }
 
     #[test]

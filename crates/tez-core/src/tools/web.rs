@@ -2,12 +2,14 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tez_llm::ToolSpec;
+use tokio::io::AsyncReadExt;
 
 use super::{Tool, ToolError, ToolOutput};
 
@@ -17,6 +19,8 @@ const MAX_MAX_CHARS: u64 = 200_000;
 const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_ERROR_PREVIEW_CHARS: usize = 500;
+/// `--dump-dom` có thể trả về DOM rất lớn; chặn trước khi đưa vào bộ nhớ.
+const MAX_BROWSER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const USER_AGENT: &str = "tez/0.1 (+local)";
 const MAX_REDIRECTS: usize = 5;
 
@@ -276,33 +280,71 @@ async fn run_browser(
         .arg(&profile)
         .arg("--dump-dom")
         .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = match tokio::time::timeout(Duration::from_secs(25), command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
             let _ = std::fs::remove_dir_all(&profile);
             return Ok(ToolOutput::error(format!(
                 "không chạy được browser: {error}"
             )));
         }
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&profile);
-            return Ok(ToolOutput::error("browser quá thời gian (25s)".to_string()));
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = std::fs::remove_dir_all(&profile);
+        return Ok(ToolOutput::error(
+            "không mở được stdout của browser".to_string(),
+        ));
+    };
+
+    let mut html = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(25), async {
+        // Đọc tối đa cap + 1 byte để biết output có vượt trần hay không.
+        let mut limited = (&mut stdout).take((MAX_BROWSER_OUTPUT_BYTES + 1) as u64);
+        limited.read_to_end(&mut html).await
+    })
+    .await;
+    let _ = child.start_kill();
+    let status = child.wait().await;
+    let _ = std::fs::remove_dir_all(&profile);
+
+    match read {
+        Err(_) => return Ok(ToolOutput::error("browser quá thời gian (25s)".to_string())),
+        Ok(Err(error)) => {
+            return Ok(ToolOutput::error(format!(
+                "không đọc được output browser: {error}"
+            )))
+        }
+        Ok(Ok(_)) => {}
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            return Ok(ToolOutput::error(format!(
+                "không lấy được trạng thái browser: {error}"
+            )))
         }
     };
-    let _ = std::fs::remove_dir_all(&profile);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let preview: String = stderr.chars().take(MAX_ERROR_PREVIEW_CHARS).collect();
-        return Ok(ToolOutput::error(format!(
-            "browser thoát với lỗi {}: {preview}",
-            output.status
-        )));
+    let output_truncated = html.len() > MAX_BROWSER_OUTPUT_BYTES;
+    // Khi output vượt trần, chính ta đã kill browser nên status có thể là signal.
+    if !output_truncated && !status.success() {
+        return Ok(ToolOutput::error(format!("browser thoát với lỗi {status}")));
     }
-    let html = String::from_utf8_lossy(&output.stdout);
+
+    if output_truncated {
+        html.truncate(MAX_BROWSER_OUTPUT_BYTES);
+    }
+    let html = String::from_utf8_lossy(&html);
     let text = strip_html(&html);
     let (text, truncated) = truncate_chars(&text, max_chars);
     let mut content = format!("URL: {url}\nStatus: browser\n\n{text}");
+    if output_truncated {
+        content.push_str("\n… (DOM đã cắt ở 2 MB)");
+    }
     if truncated {
         content.push_str("\n\n… (đã cắt bớt)");
     }
@@ -375,7 +417,7 @@ async fn validate_url(
     if raw.is_empty() {
         return Err(ToolError::InvalidArgs("URL rỗng".into()));
     }
-    let url = reqwest::Url::parse(raw)
+    let mut url = reqwest::Url::parse(raw)
         .map_err(|error| ToolError::InvalidArgs(format!("URL không hợp lệ: {error}")))?;
 
     match url.scheme() {
@@ -395,12 +437,21 @@ async fn validate_url(
 
     let host = url
         .host_str()
-        .ok_or_else(|| ToolError::InvalidArgs("URL thiếu host".into()))?;
+        .ok_or_else(|| ToolError::InvalidArgs("URL thiếu host".into()))?
+        .to_string();
     // `host_str` trả IPv6 kèm dấu ngoặc vuông; bỏ dấu cuối để so khớp.
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() {
+    // Dấu chấm cuối (FQDN) phải bị cắt ở cả URL gửi đi và khóa pin DNS, nếu
+    // không `resolve_to_addrs` sẽ không khớp host và reqwest tự phân giải lại.
+    let trimmed_host = host.trim_end_matches('.');
+    if trimmed_host.is_empty() {
         return Err(ToolError::InvalidArgs("URL thiếu host".into()));
     }
+    if trimmed_host != host.as_str() {
+        url.set_host(Some(trimmed_host)).map_err(|error| {
+            ToolError::InvalidArgs(format!("host không hợp lệ sau khi chuẩn hóa: {error}"))
+        })?;
+    }
+    let host = trimmed_host.to_ascii_lowercase();
     let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
 
     if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
@@ -533,6 +584,24 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
     }
     // 2001:db8::/32 (documentation).
     if first == 0x2001 && segments[1] == 0x0db8 {
+        return true;
+    }
+    // Teredo 2001::/32 (IPv6 tunnel qua IPv4).
+    if first == 0x2001 && segments[1] == 0 {
+        return true;
+    }
+    // NAT64 64:ff9b::/96: IPv4 nhúng có thể trỏ vào mạng nội bộ.
+    if first == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        return true;
+    }
+    // NAT64 local-use 64:ff9b:1::/48 (RFC 8215).
+    if first == 0x0064 && segments[1] == 0xff9b && segments[2] == 1 {
         return true;
     }
     // 6to4 2002::/16: kiểm tra IPv4 nhúng.
@@ -682,15 +751,21 @@ fn remove_tag_blocks(input: &str, tag: &str) -> String {
             cursor = input.len();
             break;
         };
-        if is_self_closing(&lower[start..open_end]) {
-            // Thẻ tự đóng không có nội dung: chỉ bỏ thẻ, giữ phần còn lại.
-            out.push_str(&input[cursor..start]);
-            out.push(' ');
-            cursor = open_end + 1;
-            continue;
-        }
+        let self_closing = is_self_closing(&lower[start..open_end]);
 
         let Some(close_relative) = lower[open_end..].find(&close) else {
+            if self_closing {
+                // `<script src="x"/>` không có nội dung: chỉ bỏ thẻ, giữ phần
+                // sau. Nhưng nếu ngay sau thẻ là text (không phải thẻ khác),
+                // coi đó là script chưa đóng để không lộ nội dung.
+                let next = input[open_end + 1..].chars().find(|ch| !ch.is_whitespace());
+                if next.is_none_or(|ch| ch == '<') {
+                    out.push_str(&input[cursor..start]);
+                    out.push(' ');
+                    cursor = open_end + 1;
+                    continue;
+                }
+            }
             // Không có thẻ đóng: bỏ phần còn lại để tránh lộ nội dung script/style.
             out.push_str(&input[cursor..start]);
             cursor = input.len();
@@ -955,6 +1030,22 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn trims_trailing_dot_from_request_url_and_pin_key() {
+        let (url, pin) = validate_url("http://Example.COM./path", true)
+            .await
+            .unwrap();
+        assert_eq!(url.host_str(), Some("example.com"));
+        assert_eq!(url.as_str(), "http://example.com/path");
+        assert!(pin.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_trailing_dot_localhost() {
+        let result = validate_url("http://localhost./", false).await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn strip_html_removes_scripts_styles_and_decodes_entities() {
         let html = "<html><head><style>body { color: red; }</style></head>\
@@ -994,6 +1085,20 @@ mod tests {
         let text = strip_html(html);
         assert!(text.contains("After script"), "{text}");
         assert!(text.contains("After style"), "{text}");
+    }
+
+    #[test]
+    fn self_closing_script_does_not_leak_content() {
+        for html in [
+            "<p>before</p><script/>alert('secret')</script><p>after</p>",
+            "<p>before</p><script src=\"app.js\"/>alert('secret')</script><p>after</p>",
+            "<p>before</p><script/>alert('secret')",
+        ] {
+            let text = strip_html(html);
+            assert!(text.contains("before"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+            assert!(!text.contains("alert"), "{text}");
+        }
     }
 
     #[test]
@@ -1037,6 +1142,10 @@ mod tests {
             "240.0.0.1",
             "2001:db8::1",
             "2002:7f00:1::1",
+            "2001::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::1",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(ip), "{ip} phải bị chặn");
@@ -1217,6 +1326,34 @@ mod tests {
             "{}",
             output.content
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caps_browser_dump_dom_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-browser");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nhead -c 3145728 /dev/zero | tr '\\0' 'x'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let output = run_browser(&script, "https://example.com/", None, &[], 20_000)
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("DOM đã cắt ở 2 MB"),
+            "{}",
+            output.content
+        );
+        assert!(output.content.len() < 30_000, "{}", output.content.len());
     }
 
     #[test]

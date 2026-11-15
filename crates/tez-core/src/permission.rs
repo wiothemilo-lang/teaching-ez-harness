@@ -246,8 +246,8 @@ impl PermissionPolicy {
         self
     }
 
-    /// Các tool MCP được server khai báo chỉ đọc. Chúng được phép ngay cả
-    /// trong chế độ ReadOnly, nhưng vẫn chịu deny-list và rule deny của người dùng.
+    /// Tool MCP mà **user** đã cấu hình `read_only`. Đây là nguồn duy nhất
+    /// được tin; `readOnlyHint` do server khai báo không được đưa vào đây.
     pub fn with_read_only_tools(mut self, tools: Vec<String>) -> Self {
         self.read_only_tools = tools.into_iter().collect();
         self
@@ -1458,6 +1458,30 @@ mod tests {
             policy.evaluate("write_file", &json!({"path": "a", "content": "x"})),
             PermissionDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn trusted_user_read_only_mcp_tool_is_allowed_in_read_only_mode() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_read_only_tools(vec!["mcp__demo__echo".to_string()]);
+
+        assert!(policy.evaluate("mcp__demo__echo", &json!({})).is_allowed());
+        assert!(matches!(
+            policy.evaluate("mcp__demo__write", &json!({})),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn untrusted_mcp_tool_still_needs_approval() {
+        // Mô phỏng server tự khai báo readOnlyHint: không có tên nào được đưa
+        // vào read_only_tools, nên tool vẫn bị hỏi duyệt.
+        let policy = PermissionPolicy::default();
+        assert!(matches!(
+            policy.evaluate("mcp__demo__write", &json!({})),
+            PermissionDecision::Ask { .. }
+        ));
+        assert!(policy.read_only_tools().is_empty());
     }
 
     #[test]

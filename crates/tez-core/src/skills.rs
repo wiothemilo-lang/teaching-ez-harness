@@ -20,6 +20,9 @@ use thiserror::Error;
 
 /// Giới hạn kích thước một file skill để không nuốt cả file lớn vào prompt.
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
+/// Id và tên hiển thị cũng cần trần để prompt/catalog không bị một skill chiếm hết.
+const MAX_SKILL_ID_CHARS: usize = 64;
+const MAX_SKILL_NAME_CHARS: usize = 120;
 
 #[derive(Debug, Error)]
 pub enum SkillError {
@@ -61,8 +64,18 @@ impl SkillRegistry {
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, SkillError> {
         let dir = dir.as_ref();
         let skills_dir = dir.join("skills");
-        if !skills_dir.exists() {
-            seed_builtin(&skills_dir)?;
+        match std::fs::symlink_metadata(&skills_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Không đi qua symlink ở cấp thư mục gốc: nó có thể trỏ ra
+                // ngoài dữ liệu user và biến mọi file lạ thành skill.
+                eprintln!(
+                    "[skills] bỏ qua '{}': thư mục skills là symlink",
+                    skills_dir.display()
+                );
+                return Ok(Self::default());
+            }
+            Ok(_) => {}
+            Err(_) => seed_builtin(&skills_dir)?,
         }
         let mut registry = Self::default();
         registry.load_dir(&skills_dir, "user")?;
@@ -103,22 +116,40 @@ impl SkillRegistry {
             if metadata.is_dir() {
                 self.load_dir(path, source)?;
             } else if metadata.is_file() {
-                if let Some(skill) = load_file(path, source)? {
-                    self.upsert(skill);
-                }
+                self.load_into(path, source);
             }
         }
         Ok(())
     }
 
+    /// Nạp một file skill; lỗi ở một file chỉ cảnh báo và bỏ qua file đó.
+    fn load_into(&mut self, path: &Path, source: &str) {
+        match load_file(path, source) {
+            Ok(Some(skill)) => self.upsert(skill),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[skills] bỏ qua '{}': {error}", path.display());
+            }
+        }
+    }
+
     fn load_dir(&mut self, dir: &Path, source: &str) -> Result<(), SkillError> {
-        if !dir.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+            return Ok(());
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Ok(());
         }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect();
+        let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect(),
+            Err(error) => {
+                eprintln!("[skills] bỏ qua '{}': {error}", dir.display());
+                return Ok(());
+            }
+        };
         entries.sort();
 
         for entry in entries {
@@ -133,16 +164,12 @@ impl SkillRegistry {
             if file_type.is_dir() {
                 let candidate = entry.join("SKILL.md");
                 if candidate.is_file() {
-                    if let Some(skill) = load_file(&candidate, source)? {
-                        self.upsert(skill);
-                    }
+                    self.load_into(&candidate, source);
                 }
             } else if file_type.is_file()
                 && entry.extension().and_then(|value| value.to_str()) == Some("md")
             {
-                if let Some(skill) = load_file(&entry, source)? {
-                    self.upsert(skill);
-                }
+                self.load_into(&entry, source);
             }
         }
         Ok(())
@@ -374,6 +401,11 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     out
 }
 
+/// Cắt cứng theo số ký tự, không thêm dấu, dùng cho id/name.
+fn cap_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
 fn load_file(path: &Path, source: &str) -> Result<Option<Skill>, SkillError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
@@ -408,8 +440,21 @@ fn load_file(path: &Path, source: &str) -> Result<Option<Skill>, SkillError> {
     let id = meta_value(&meta, "id")
         .map(|value| slug(&value))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| slug(fallback_id));
-    let name = meta_value(&meta, "name").unwrap_or_else(|| fallback_id.to_string());
+        .unwrap_or_else(|| slug(fallback_id))
+        .chars()
+        .take(MAX_SKILL_ID_CHARS)
+        .collect::<String>();
+    let id = if id.is_empty() {
+        "skill".to_string()
+    } else {
+        id
+    };
+    let name = cap_chars(
+        meta_value(&meta, "name")
+            .unwrap_or_else(|| fallback_id.to_string())
+            .trim(),
+        MAX_SKILL_NAME_CHARS,
+    );
     let description = meta_value(&meta, "description").unwrap_or_default();
     let subjects = meta_list(&meta, "subjects");
     let triggers = meta_list(&meta, "triggers");
@@ -709,15 +754,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_skill_file() {
+    fn skips_oversized_skill_file_but_loads_others() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("skills").join("big");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let body = format!("---\nname: Big\n---\n{}", "x".repeat(256 * 1024));
         std::fs::write(skill_dir.join("SKILL.md"), body).unwrap();
 
-        let error = SkillRegistry::load(dir.path()).unwrap_err();
-        assert!(matches!(error, SkillError::Invalid(_)));
+        let good_dir = dir.path().join("skills").join("good");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.md"),
+            "---\nname: Good\n---\nNội dung tốt.",
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        assert!(registry.find("big").is_none());
+        assert_eq!(registry.find("good").unwrap().body, "Nội dung tốt.");
+    }
+
+    #[test]
+    fn skips_non_utf8_skill_file_but_loads_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_dir = dir.path().join("skills").join("bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("SKILL.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let good_dir = dir.path().join("skills").join("good");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("SKILL.md"),
+            "---\nname: Good\n---\nNội dung tốt.",
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        assert!(registry.find("bad").is_none());
+        assert!(registry.find("good").is_some());
+    }
+
+    #[test]
+    fn caps_skill_id_and_name_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("long");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let long_id = "a".repeat(200);
+        let long_name = "Tên".repeat(100);
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nid: {long_id}\nname: {long_name}\n---\nBody"),
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        let skill = registry.all().first().unwrap();
+        assert_eq!(skill.id.chars().count(), MAX_SKILL_ID_CHARS);
+        assert_eq!(skill.name.chars().count(), MAX_SKILL_NAME_CHARS);
     }
 
     #[test]
@@ -790,5 +883,79 @@ mod tests {
 
         let registry = SkillRegistry::load(dir.path()).unwrap();
         assert!(registry.find("escape").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_top_level_skills_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_skills = outside.path().join("skills");
+        let escape = outside_skills.join("escape");
+        std::fs::create_dir_all(&escape).unwrap();
+        std::fs::write(escape.join("SKILL.md"), "---\nname: Escape\n---\nsecret").unwrap();
+        symlink(&outside_skills, dir.path().join("skills")).unwrap();
+
+        let registry = SkillRegistry::load(dir.path()).unwrap();
+        assert!(registry.all().is_empty());
+    }
+
+    #[test]
+    fn malformed_plugin_manifest_does_not_drop_valid_plugin_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("plugins").join("a-broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("plugin.json"), "{ not json").unwrap();
+
+        let plugin_dir = dir.path().join("plugins").join("b-valid");
+        let skill_dir = plugin_dir.join("skills").join("plugin-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"valid","name":"Valid","skills":["skills/plugin-skill"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Plugin Skill\n---\nTừ plugin.",
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::load_with_plugins(dir.path()).unwrap();
+        let skill = registry.find("plugin-skill").unwrap();
+        assert_eq!(skill.source, "valid");
+    }
+
+    #[test]
+    fn plugin_id_cannot_spoof_user_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_skill = dir.path().join("skills").join("shared");
+        std::fs::create_dir_all(&user_skill).unwrap();
+        std::fs::write(
+            user_skill.join("SKILL.md"),
+            "---\nname: User\n---\nuser body",
+        )
+        .unwrap();
+
+        let plugin_dir = dir.path().join("plugins").join("spoof");
+        let plugin_skill = plugin_dir.join("skills").join("shared");
+        std::fs::create_dir_all(&plugin_skill).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"id":"user","name":"Spoof","skills":["skills/shared"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_skill.join("SKILL.md"),
+            "---\nname: Plugin\n---\nplugin body",
+        )
+        .unwrap();
+
+        let registry = SkillRegistry::load_with_plugins(dir.path()).unwrap();
+        let skill = registry.find("shared").unwrap();
+        assert_eq!(skill.source, "user");
+        assert_eq!(skill.body, "user body");
     }
 }

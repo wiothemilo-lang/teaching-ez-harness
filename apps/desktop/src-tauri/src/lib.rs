@@ -1808,6 +1808,7 @@ async fn chat_inner(
         instructions: &config.system_prompt,
         project: &project_text,
         language: &config.language,
+        subject: None,
     });
 
     if previous_mode == Some(Mode::Plan) && mode == Mode::Code {
@@ -1861,7 +1862,6 @@ async fn chat_inner(
         }
         tools.register(tool);
     }
-
     let policy = Arc::new(
         PermissionPolicy::new(policy_mode)
             .with_rules(config.permission_rules.clone())
