@@ -99,6 +99,15 @@ impl CompactReport {
     }
 }
 
+/// Tin nhắn assistant có yêu cầu gọi tool (cần đi kèm tool result).
+fn assistant_has_tool_calls(message: &Message) -> bool {
+    message.role == "assistant"
+        && message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+}
+
 pub struct Compactor {
     settings: CompactSettings,
     artifact_dir: Option<PathBuf>,
@@ -218,7 +227,17 @@ impl Compactor {
             return 0;
         }
 
-        let head_end = messages.len().min(3);
+        let mut head_end = messages.len().min(3);
+
+        // Không để phần đầu kết thúc giữa assistant(tool_calls) và tool result.
+        while head_end < messages.len()
+            && messages[head_end].role == "tool"
+            && (assistant_has_tool_calls(&messages[head_end - 1])
+                || messages[head_end - 1].role == "tool")
+        {
+            head_end += 1;
+        }
+
         let target = self.settings.target_messages;
         if target <= head_end + 1 {
             return 0;
@@ -459,6 +478,42 @@ mod tests {
             .position(|message| message.role == "tool")
             .unwrap();
         assert_eq!(messages[tool_position - 1].role, "assistant");
+    }
+
+    #[test]
+    fn snip_keeps_tool_pair_at_head_boundary() {
+        let compactor = Compactor::new(
+            CompactSettings {
+                trigger_messages: 10,
+                target_messages: 6,
+                ..CompactSettings::default()
+            },
+            None,
+        );
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("đọc file"),
+            Message::assistant_tool_calls(
+                vec![ToolCall {
+                    id: "call_head".into(),
+                    kind: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                None,
+            ),
+            tool_message("call_head", "kết quả"),
+        ];
+        messages.extend(conversation(10).into_iter().skip(1));
+
+        let report = compactor.prepare(&mut messages);
+        assert!(report.snipped > 0);
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_head"));
     }
 
     #[test]
