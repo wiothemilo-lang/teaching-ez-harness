@@ -1365,10 +1365,12 @@ async fn update(args: UpdateArgs) -> anyhow::Result<()> {
     }
 
     if args.download && !args.check_only {
-        if let Some(asset) = tez_update::pick_asset(&info, std::env::consts::OS) {
+        if !info.available {
+            println!("\nKhông có bản mới để tải.");
+        } else if let Some(asset) = tez_update::pick_asset(&info, std::env::consts::OS) {
             let dir = data_dir()?.join("updates");
             println!("\nĐang tải {}…", asset.name);
-            let path = tez_update::download(asset, &dir).await?;
+            let path = tez_update::download(asset, &info.assets, &dir).await?;
             println!("Đã tải: {}", path.display());
             println!(
                 "Mở file trên để cài đặt (Windows: chạy installer; Linux: cài gói tương ứng)."

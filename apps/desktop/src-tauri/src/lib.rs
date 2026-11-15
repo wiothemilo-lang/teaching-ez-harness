@@ -1904,7 +1904,7 @@ async fn download_update() -> Result<DownloadUpdateResult, String> {
     let asset = tez_update::pick_asset(&info, std::env::consts::OS)
         .ok_or_else(|| "Bản phát hành không có file phù hợp với hệ điều hành này.".to_string())?;
     let dir = data_dir().map_err(friendly)?.join("updates");
-    let path = tez_update::download(asset, &dir)
+    let path = tez_update::download(asset, &info.assets, &dir)
         .await
         .map_err(|error| error.to_string())?;
     Ok(DownloadUpdateResult {
